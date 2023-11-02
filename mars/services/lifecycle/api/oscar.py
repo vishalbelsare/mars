@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Union
+from typing import Dict, List
 
 from .... import oscar as mo
 from ....lib.aio import alru_cache
@@ -24,7 +24,7 @@ class LifecycleAPI(AbstractLifecycleAPI):
     def __init__(
         self,
         session_id: str,
-        lifecycle_tracker_ref: Union[LifecycleTrackerActor, mo.ActorRef],
+        lifecycle_tracker_ref: mo.ActorRefType[LifecycleTrackerActor],
     ):
         self._session_id = session_id
         self._lifecycle_tracker_ref = lifecycle_tracker_ref
@@ -73,7 +73,9 @@ class LifecycleAPI(AbstractLifecycleAPI):
             tracks.append(self._lifecycle_tracker_ref.track.delay(*args, **kwargs))
         return await self._lifecycle_tracker_ref.track.batch(*tracks)
 
-    async def incref_tileables(self, tileable_keys: List[str]):
+    async def incref_tileables(
+        self, tileable_keys: List[str], counts: List[int] = None
+    ):
         """
         Incref tileables.
 
@@ -81,10 +83,16 @@ class LifecycleAPI(AbstractLifecycleAPI):
         ----------
         tileable_keys : list
              List of tileable keys.
+        counts: list
+            List of ref count.
         """
-        return await self._lifecycle_tracker_ref.incref_tileables(tileable_keys)
+        return await self._lifecycle_tracker_ref.incref_tileables(
+            tileable_keys, counts=counts
+        )
 
-    async def decref_tileables(self, tileable_keys: List[str]):
+    async def decref_tileables(
+        self, tileable_keys: List[str], counts: List[int] = None
+    ):
         """
         Decref tileables.
 
@@ -92,6 +100,8 @@ class LifecycleAPI(AbstractLifecycleAPI):
         ----------
         tileable_keys : list
             List of tileable keys.
+        counts: list
+            List of ref count.
         """
         return await self._lifecycle_tracker_ref.decref_tileables(tileable_keys)
 
@@ -111,7 +121,7 @@ class LifecycleAPI(AbstractLifecycleAPI):
         """
         return await self._lifecycle_tracker_ref.get_tileable_ref_counts(tileable_keys)
 
-    async def incref_chunks(self, chunk_keys: List[str]):
+    async def incref_chunks(self, chunk_keys: List[str], counts: List[int] = None):
         """
         Incref chunks.
 
@@ -119,10 +129,14 @@ class LifecycleAPI(AbstractLifecycleAPI):
         ----------
         chunk_keys : list
             List of chunk keys.
+        counts: list
+            List of ref count.
         """
-        return await self._lifecycle_tracker_ref.incref_chunks(chunk_keys)
+        return await self._lifecycle_tracker_ref.incref_chunks(
+            chunk_keys, counts=counts
+        )
 
-    async def decref_chunks(self, chunk_keys: List[str]):
+    async def decref_chunks(self, chunk_keys: List[str], counts: List[int] = None):
         """
         Decref chunks
 
@@ -130,8 +144,12 @@ class LifecycleAPI(AbstractLifecycleAPI):
         ----------
         chunk_keys : list
             List of chunk keys.
+        counts: list
+            List of ref count.
         """
-        return await self._lifecycle_tracker_ref.decref_chunks(chunk_keys)
+        return await self._lifecycle_tracker_ref.decref_chunks(
+            chunk_keys, counts=counts
+        )
 
     async def get_chunk_ref_counts(self, chunk_keys: List[str]) -> List[int]:
         """

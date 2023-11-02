@@ -16,6 +16,7 @@
 
 import io
 import os
+import re
 import sys
 import tempfile
 from collections import namedtuple
@@ -32,7 +33,6 @@ except ImportError:  # pragma: no cover
 from .. import tensor as mt
 from .. import dataframe as md
 from .. import remote as mr
-from .._version import __version__ as mars_version
 from ..config import option_context
 from ..deploy.utils import load_service_config_file
 from ..session import execute, fetch, fetch_log
@@ -48,6 +48,8 @@ def setup():
     sess = new_test_session(address="127.0.0.1", init_local=True, default=True)
     with option_context({"show_progress": False}):
         try:
+            from .. import __version__ as mars_version
+
             assert sess.get_cluster_versions() == [mars_version]
             yield sess
         finally:
@@ -186,7 +188,7 @@ def test_array_protocol(setup):
 
     arr2 = mt.ones((10, 20))
 
-    result = np.asarray(arr2, mt.bool_)
+    result = np.asarray(arr2, mt.bool)
     np.testing.assert_array_equal(result, np.ones((10, 20), dtype=np.bool_))
 
     arr3 = mt.ones((10, 20)).sum()
@@ -208,6 +210,7 @@ def test_without_fuse(setup):
     np.testing.assert_array_equal(r1, r2)
 
 
+@pytest.mark.ray_dag
 def test_fetch_slices(setup):
     arr1 = mt.random.rand(10, 8, chunk_size=3)
     r1 = arr1.execute().fetch()
@@ -480,3 +483,50 @@ def test_align_series(setup):
     r = df[0] != df.sort_index()[0].shift(-1)
     expected = pdf[0] != pdf.sort_index()[0].shift(-1)
     pd.testing.assert_series_equal(r.execute().fetch(), expected)
+
+
+def test_cache_tileable(setup):
+    raw = np.random.rand(10, 3)
+    t = mt.tensor(raw)
+    t.cache = True
+    t2 = t + 1
+    result = t2.execute().fetch()
+    np.testing.assert_array_equal(result, raw + 1)
+    np.testing.assert_array_equal(t.fetch(), raw)
+
+    with option_context({"warn_duplicated_execution": True}):
+        t = mt.tensor(raw)
+        with pytest.warns(
+            RuntimeWarning,
+            match=re.escape(f"Tileable {repr(t)} has been submitted before"),
+        ):
+            (t + 1).execute()
+            (t + 2).execute()
+
+        # should have no warning
+        t = mt.tensor(raw)
+        with pytest.raises(BaseException, match="DID NOT WARN"):
+            with pytest.warns(
+                RuntimeWarning,
+                match=re.escape(f"Tileable {repr(t)} has been submitted before"),
+            ):
+                (t + 1).execute()
+
+
+@pytest.mark.parametrize("method", ["shuffle", "broadcast", None])
+@pytest.mark.parametrize("auto_merge", ["after", "before"])
+def test_merge_groupby(setup, method, auto_merge):
+    rs = np.random.RandomState(0)
+    raw1 = pd.DataFrame({"a": rs.randint(3, size=100), "b": rs.rand(100)})
+    raw2 = pd.DataFrame({"a": rs.randint(3, size=10), "c": rs.rand(10)})
+    df1 = md.DataFrame(raw1, chunk_size=10).execute()
+    df2 = md.DataFrame(raw2, chunk_size=10).execute()
+    # do not trigger auto merge
+    df3 = df1.merge(
+        df2, on="a", auto_merge_threshold=8, method=method, auto_merge=auto_merge
+    )
+    df4 = df3.groupby("a").sum()
+
+    result = df4.execute().fetch()
+    expected = raw1.merge(raw2, on="a").groupby("a").sum()
+    pd.testing.assert_frame_equal(result, expected)

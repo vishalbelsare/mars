@@ -31,7 +31,7 @@ class TensorGetShape(TensorOperand, TensorOperandMixin):
 
     def __init__(self, pure_depends=None, a=None, ndim=None, dtype=None, **kw):
         super().__init__(
-            _dtype=dtype, _a=a, _ndim=ndim, _pure_depends=pure_depends, **kw
+            dtype=dtype, _a=a, _ndim=ndim, _pure_depends=pure_depends, **kw
         )
 
     @property
@@ -73,6 +73,8 @@ class TensorGetShape(TensorOperand, TensorOperandMixin):
         a = op.a
         outs = op.outputs
 
+        yield a.chunks
+
         chunk_op = TensorGetShape(pure_depends=[True] * len(a.chunks), ndim=op.ndim)
         chunk_kws = []
         for out in outs:
@@ -92,13 +94,7 @@ class TensorGetShape(TensorOperand, TensorOperandMixin):
 
     @classmethod
     def execute(cls, ctx, op):
-        chunk_idx_to_chunk_shapes = {
-            c.index: cm["shape"]
-            for c, cm in zip(
-                op.inputs,
-                ctx.get_chunks_meta([c.key for c in op.inputs], fields=["shape"]),
-            )
-        }
+        chunk_idx_to_chunk_shapes = dict((c.index, c.shape) for c in op.inputs)
         nsplits = calc_nsplits(chunk_idx_to_chunk_shapes)
         shape = tuple(sum(ns) for ns in nsplits)
         for o, s in zip(op.outputs, shape):

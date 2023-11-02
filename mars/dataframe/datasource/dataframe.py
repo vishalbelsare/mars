@@ -14,11 +14,14 @@
 
 import itertools
 
+import pandas as pd
+
 from ... import opcodes as OperandDef
 from ...config import options
 from ...core import OutputType
 from ...serialization.serializables import DataFrameField, SeriesField
 from ...tensor.utils import get_chunk_slices
+from ...utils import estimate_pandas_size
 from ..utils import decide_dataframe_chunk_sizes, parse_index, is_cudf
 from ..operands import DataFrameOperand, DataFrameOperandMixin
 
@@ -32,10 +35,6 @@ class DataFrameDataSource(DataFrameOperand, DataFrameOperandMixin):
 
     data = DataFrameField("data")
     dtypes = SeriesField("dtypes")
-
-    def _tokenize_output(self, output_idx: int, **kw):
-        # make sure all necessary arguments tokenized
-        return None
 
     def __init__(self, data=None, dtypes=None, gpu=None, **kw):
         if dtypes is None and data is not None:
@@ -65,7 +64,10 @@ class DataFrameDataSource(DataFrameOperand, DataFrameOperandMixin):
         df = op.outputs[0]
         raw_df = op.data
 
-        memory_usage = raw_df.memory_usage(index=False, deep=True)
+        # estimate column memory usage instead of calling df.memory_usage(deep=True)
+        memory_usage = pd.Series(
+            {c: estimate_pandas_size(s) for c, s in raw_df.items()}
+        )
         chunk_size = df.extra_params.raw_chunk_size or options.chunk_size
         chunk_size = decide_dataframe_chunk_sizes(df.shape, chunk_size, memory_usage)
         chunk_size_idxes = (range(len(size)) for size in chunk_size)
@@ -122,6 +124,6 @@ class DataFrameDataSource(DataFrameOperand, DataFrameOperandMixin):
         ctx[op.outputs[0].key] = op.data
 
 
-def from_pandas(data, chunk_size=None, gpu=False, sparse=False):
+def from_pandas(data, chunk_size=None, gpu=None, sparse=False):
     op = DataFrameDataSource(data=data, gpu=gpu, sparse=sparse)
     return op(data.shape, chunk_size=chunk_size)

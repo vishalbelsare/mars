@@ -17,11 +17,10 @@ import asyncio
 import pytest
 
 from .... import oscar as mo
-from ...._version import __version__ as mars_version
 from ....utils import get_next_port
 from ... import NodeRole
 from ...web.supervisor import WebSupervisorService
-from ..api import MockClusterAPI, WebClusterAPI
+from ..api import ClusterAPI, MockClusterAPI, WebClusterAPI
 from ..api.web import web_handlers
 from ..core import NodeStatus
 
@@ -29,9 +28,8 @@ from ..core import NodeStatus
 @pytest.fixture
 async def actor_pool():
     pool = await mo.create_actor_pool("127.0.0.1", n_process=0)
-    await pool.start()
-    yield pool
-    await pool.stop()
+    async with pool:
+        yield pool
 
 
 class TestActor(mo.Actor):
@@ -115,14 +113,12 @@ async def test_web_api(actor_pool):
     assert await web_api.get_supervisors() == [pool_addr]
 
     assert len(await web_api.get_all_bands(statuses={NodeStatus.READY})) > 0
-    assert (
-        len(
-            await web_api.get_nodes_info(
-                role=NodeRole.WORKER, statuses={NodeStatus.READY}
-            )
-        )
-        > 0
+    nodes = await web_api.get_nodes_info(
+        role=NodeRole.WORKER, statuses={NodeStatus.READY}
     )
+    assert len(nodes) > 0
+
+    from .... import __version__ as mars_version
 
     assert await web_api.get_mars_versions() == [mars_version]
 
@@ -135,4 +131,37 @@ async def test_web_api(actor_pool):
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(wait_async_gen(web_api.watch_all_bands()), timeout=0.1)
 
+    proc_info = await web_api.get_node_pool_configs(pool_addr)
+    assert len(proc_info) > 0
+    stacks = await web_api.get_node_thread_stacks(pool_addr)
+    assert len(stacks) > 0
+
     await MockClusterAPI.cleanup(pool_addr)
+
+
+@pytest.mark.asyncio
+async def test_no_supervisor(actor_pool):
+    pool_addr = actor_pool.external_address
+
+    from ..supervisor.locator import SupervisorPeerLocatorActor
+    from ..uploader import NodeInfoUploaderActor
+
+    await mo.create_actor(
+        SupervisorPeerLocatorActor,
+        "fixed",
+        [],
+        uid=SupervisorPeerLocatorActor.default_uid(),
+        address=pool_addr,
+    )
+    await mo.create_actor(
+        NodeInfoUploaderActor,
+        NodeRole.WORKER,
+        interval=1,
+        band_to_resource=None,
+        use_gpu=False,
+        uid=NodeInfoUploaderActor.default_uid(),
+        address=pool_addr,
+    )
+    api = await ClusterAPI.create(address=pool_addr)
+    with pytest.raises(mo.ActorNotExist):
+        await api.get_supervisor_refs(["KEY"])

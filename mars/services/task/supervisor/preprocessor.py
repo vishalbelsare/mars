@@ -16,19 +16,17 @@
 import asyncio
 import logging
 from functools import partial
-from typing import Callable, Dict, List, Iterable, Set, Tuple
+from typing import Callable, Dict, List, Iterable, Set
 
 from ....config import Config
-from ....core import TileableGraph, ChunkGraph, ChunkGraphBuilder
-from ....core.graph.builder.chunk import Tiler, tile_gen_type
-from ....core.operand import Fetch
-from ....typing import TileableType, ChunkType
-from ....optimization.logical.chunk import optimize as optimize_chunk_graph
-from ....optimization.logical.tileable import optimize as optimize_tileable_graph
-from ....typing import BandType
-from ...subtask import SubtaskGraph
+from ....core import TileableGraph, ChunkGraph, ChunkGraphBuilder, TileContext
+from ....core.graph.builder.chunk import Tiler, _TileableHandler
+from ....core.operand import Fetch, ShuffleFetchType
+from ....resource import Resource
+from ....typing import BandType, TileableType, ChunkType
+from ...subtask import Subtask, SubtaskGraph
 from ..analyzer import GraphAnalyzer
-from ..core import Task
+from ..core import Task, MapReduceInfo
 
 logger = logging.getLogger(__name__)
 
@@ -37,40 +35,41 @@ class CancellableTiler(Tiler):
     def __init__(
         self,
         tileable_graph: TileableGraph,
-        tile_context: Dict[TileableType, TileableType],
-        processed_chunks: Set[ChunkType],
+        tile_context: TileContext,
+        processed_chunks: Set[str],
+        chunk_to_fetch: Dict[ChunkType, ChunkType],
         add_nodes: Callable,
         cancelled: asyncio.Event = None,
+        check_duplicated_submission: bool = False,
     ):
-        super().__init__(tileable_graph, tile_context, processed_chunks, add_nodes)
+        super().__init__(
+            tileable_graph, tile_context, processed_chunks, chunk_to_fetch, add_nodes
+        )
         self._cancelled = cancelled
+        self._check_duplicated_submission = check_duplicated_submission
 
     @property
     def cancelled(self):
         return self._cancelled.is_set()
 
-    def _gen_tileable_handlers(
-        self, next_tileable_handlers: List[Tuple[TileableType, tile_gen_type]]
-    ):
-        for tileable, tile_handler in super()._gen_tileable_handlers(
-            next_tileable_handlers
-        ):
+    def _gen_tileable_handlers(self, next_tileable_handlers: List[_TileableHandler]):
+        for tile_handler in super()._gen_tileable_handlers(next_tileable_handlers):
             if not self.cancelled:
-                yield tileable, tile_handler
+                yield tile_handler
             else:
                 break
 
     def _gen_result_chunks(
         self,
         chunk_graph: ChunkGraph,
-        next_tileable_handlers: List[Tuple[TileableType, tile_gen_type]],
+        next_tileable_handlers: List[_TileableHandler],
     ):
         if not self.cancelled:
             return super()._gen_result_chunks(chunk_graph, next_tileable_handlers)
         else:
             return
 
-    def __iter__(self):
+    def _iter_without_check(self):
         while self._tileable_handlers:
             to_update_tileables = self._iter()
             if not self.cancelled:
@@ -80,6 +79,27 @@ class CancellableTiler(Tiler):
                     t.refresh_params()
             else:
                 break
+
+    def _iter_with_check(self):
+        chunk_set = set()
+        chunk_graphs = []
+        for chunk_graph in self._iter_without_check():
+            chunk_graphs.append(chunk_graph)
+            chunks = []
+            for chunk in chunk_graph:
+                if isinstance(chunk.op, Fetch):
+                    continue
+                if chunk in chunk_set:
+                    raise RuntimeError(f"chunk {chunk} submitted repeatedly")
+                chunks.append(chunk)
+            chunk_set.update(chunks)
+            yield chunk_graph
+
+    def __iter__(self):
+        if not self._check_duplicated_submission:
+            return self._iter_without_check()
+        else:
+            return self._iter_with_check()
 
 
 class TaskPreprocessor:
@@ -92,14 +112,16 @@ class TaskPreprocessor:
         "chunk_optimization_records_list",
         "_cancelled",
         "_done",
+        "map_reduce_id_to_infos",
     )
 
-    tile_context: Dict[TileableType, TileableType]
+    tile_context: TileContext
+    map_reduce_id_to_infos: Dict[int, MapReduceInfo]
 
     def __init__(
         self,
         task: Task,
-        tiled_context: Dict[TileableType, TileableType] = None,
+        tiled_context: TileContext = None,
         config: Config = None,
     ):
         self._task = task
@@ -109,6 +131,7 @@ class TaskPreprocessor:
         self.tile_context = tiled_context
         self.tileable_optimization_records = None
         self.chunk_optimization_records_list = []
+        self.map_reduce_id_to_infos = dict()
 
         self._cancelled = asyncio.Event()
         self._done = asyncio.Event()
@@ -122,6 +145,10 @@ class TaskPreprocessor:
         optimized_graph: TileableGraph
 
         """
+        from ....optimization.logical.tileable import (
+            optimize as optimize_tileable_graph,
+        )
+
         if self._config.optimize_tileable_graph:
             # enable optimization
             self.tileable_optimization_records = optimize_tileable_graph(
@@ -136,6 +163,17 @@ class TaskPreprocessor:
                 t._chunks = tiled.chunks
                 t._nsplits = tiled.nsplits
 
+    def _get_tiler_cls(self) -> Callable:
+        extra_config = self._task.extra_config or dict()
+        check_duplicated_submission = extra_config.get(
+            "check_duplicated_submission", False
+        )
+        return partial(
+            CancellableTiler,
+            cancelled=self._cancelled,
+            check_duplicated_submission=check_duplicated_submission,
+        )
+
     def tile(self, tileable_graph: TileableGraph) -> Iterable[ChunkGraph]:
         """
         Generate chunk graphs
@@ -145,33 +183,55 @@ class TaskPreprocessor:
         chunk_graph_generator: Generator
              Chunk graphs.
         """
+        from ....optimization.logical.chunk import optimize as optimize_chunk_graph
+
         self._fill_fetch_tileable_with_chunks(tileable_graph)
         # iterative chunk graph builder
         chunk_graph_builder = ChunkGraphBuilder(
             tileable_graph,
             fuse_enabled=self._task.fuse_enabled,
             tile_context=self.tile_context,
-            tiler_cls=partial(CancellableTiler, cancelled=self._cancelled),
+            tiler_cls=self._get_tiler_cls(),
         )
         optimize = self._config.optimize_chunk_graph
-        meta_updated = set()
+        for t in tileable_graph:
+            if hasattr(t.op, "logic_key") and t.op.logic_key is None:
+                t.op.logic_key = t.op.get_logic_key()
         for chunk_graph in chunk_graph_builder.build():
+            if len(chunk_graph) == 0:
+                continue
             # optimize chunk graph
             if optimize:
                 self.chunk_optimization_records_list.append(
                     optimize_chunk_graph(chunk_graph)
                 )
             yield chunk_graph
-            # update tileables' meta
-            self._update_tileables_params(tileable_graph, meta_updated)
+
+    def post_chunk_graph_execution(self):  # pylint: disable=no-self-use
+        """Post calling after execution of current chunk graph"""
 
     def analyze(
-        self, chunk_graph: ChunkGraph, available_bands: Dict[BandType, int]
+        self,
+        chunk_graph: ChunkGraph,
+        chunk_to_subtasks: Dict[ChunkType, Subtask],
+        available_bands: Dict[BandType, Resource],
+        stage_id: str = None,
+        op_to_bands: Dict[str, BandType] = None,
+        shuffle_fetch_type: ShuffleFetchType = None,
     ) -> SubtaskGraph:
         logger.debug("Start to gen subtask graph for task %s", self._task.task_id)
         task = self._task
-        analyzer = GraphAnalyzer(chunk_graph, available_bands, task)
-        graph = analyzer.gen_subtask_graph()
+        analyzer = GraphAnalyzer(
+            chunk_graph,
+            available_bands,
+            task,
+            self._config,
+            chunk_to_subtasks,
+            stage_id=stage_id,
+            shuffle_fetch_type=shuffle_fetch_type,
+            map_reduce_id_to_infos=self.map_reduce_id_to_infos,
+        )
+        graph = analyzer.gen_subtask_graph(op_to_bands)
         logger.debug(
             "Generated subtask graph of %s subtasks for task %s",
             len(graph),
@@ -197,22 +257,8 @@ class TaskPreprocessor:
         tileable = tileable.data if hasattr(tileable, "data") else tileable
         return self.tile_context[tileable]
 
-    def _update_tileable_params(
-        self, tileable: TileableType, tiled: TileableType  # pylint: disable=no-self-use
-    ):
-        tiled.refresh_params()
-        tileable.params = tiled.params
-
-    def _update_tileables_params(
-        self, tileable_graph: TileableGraph, updated: Set[TileableType]
-    ):
-        for tileable in tileable_graph:
-            if tileable in updated:
-                continue
-            tiled_tileable = self.tile_context.get(tileable)
-            if tiled_tileable is not None:
-                self._update_tileable_params(tileable, tiled_tileable)
-                updated.add(tileable)
+    def get_map_reduce_info(self, map_reduce_id: int) -> MapReduceInfo:
+        return self.map_reduce_id_to_infos[map_reduce_id]
 
     def __await__(self):
         return self._done.wait().__await__()

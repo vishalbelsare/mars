@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import wraps
-from typing import Dict
+from typing import Dict, Tuple, Type
 
 from ..serialization.serializables import Serializable, StringField
 from ..serialization.serializables.core import SerializableSerializer
@@ -24,7 +23,7 @@ class Base(Serializable):
     _no_copy_attrs_ = {"_id"}
     _init_update_key_ = True
 
-    _key = StringField("key")
+    _key = StringField("key", default=None)
     _id = StringField("id")
 
     def __init__(self, *args, **kwargs):
@@ -54,16 +53,21 @@ class Base(Serializable):
             return getattr(cls, member)
         except AttributeError:
             slots = sorted(
-                f.attr_name
-                for k, f in self._FIELDS.items()
-                if k not in self._no_copy_attrs_
+                f.name for k, f in self._FIELDS.items() if k not in self._no_copy_attrs_
             )
             setattr(cls, member, slots)
             return slots
 
     @property
     def _values_(self):
-        return [self._FIELD_VALUES.get(k) for k in self._copy_tags_]
+        values = []
+        fields = self._FIELDS
+        for k in self._copy_tags_:
+            try:
+                values.append(fields[k].get(self))
+            except AttributeError:
+                values.append(None)
+        return values
 
     def __mars_tokenize__(self):
         try:
@@ -89,18 +93,18 @@ class Base(Serializable):
     def copy(self):
         return self.copy_to(type(self)(_key=self.key))
 
-    def copy_to(self, target):
-        for attr in self._FIELDS:
-            if (
-                attr.startswith("__") and attr.endswith("__")
-            ) or attr in self._no_copy_attrs_:
-                # we don't copy id to identify that the copied one is new
+    def copy_to(self, target: "Base"):
+        target_fields = target._FIELDS
+        no_copy_attrs = self._no_copy_attrs_
+        for k, field in self._FIELDS.items():
+            if k in no_copy_attrs:
                 continue
             try:
-                attr_val = getattr(self, attr)
+                # Slightly faster than getattr.
+                value = field.__get__(self, k)
+                target_fields[k].set(target, value)
             except AttributeError:
                 continue
-            setattr(target, attr, attr_val)
 
         return target
 
@@ -115,28 +119,21 @@ class Base(Serializable):
     def id(self):
         return self._id
 
-
-def buffered(func):
-    @wraps(func)
-    def wrapped(self, obj: Base, context: Dict):
-        obj_id = (obj.key, obj.id)
-        if obj_id in context:
-            return {
-                "id": id(context[obj_id]),
-                "serializer": "ref",
-                "buf_num": 0,
-            }, []
-        else:
-            context[obj_id] = obj
-            return func(self, obj, context)
-
-    return wrapped
+    def to_kv(self, exclude_fields: Tuple[str], accept_value_types: Tuple[Type]):
+        fields = self._FIELDS
+        kv = {}
+        no_value = object()
+        for name, field in fields.items():
+            if name not in exclude_fields:
+                value = getattr(self, name, no_value)
+                if value is not no_value and isinstance(value, accept_value_types):
+                    kv[field.tag] = value
+        return kv
 
 
 class BaseSerializer(SerializableSerializer):
-    @buffered
-    def serialize(self, obj: Serializable, context: Dict):
-        return (yield from super().serialize(obj, context))
+    def serial(self, obj: Base, context: Dict):
+        return super().serial(obj, context)
 
 
 BaseSerializer.register(Base)
@@ -144,3 +141,9 @@ BaseSerializer.register(Base)
 
 class MarsError(Exception):
     pass
+
+
+class ExecutionError(MarsError):
+    def __init__(self, nested_error: BaseException):
+        super().__init__(nested_error)
+        self.nested_error = nested_error

@@ -52,10 +52,9 @@ async def fault_cluster(request):
     ray_config.update(FAULT_INJECTION_CONFIG)
     ray_config.update(param.get("config", {}))
     client = await new_cluster(
-        "test_cluster",
         worker_num=2,
         worker_cpu=2,
-        worker_mem=1 * 1024 ** 3,
+        worker_mem=1 * 1024**3,
         config=ray_config,
     )
     async with client:
@@ -70,6 +69,7 @@ async def fault_cluster(request):
             FaultType.Exception,
             {FaultPosition.ON_EXECUTE_OPERAND: 1},
             pytest.raises(FaultInjectionError, match="Fault Injection"),
+            True,
         ],
         [
             FaultType.UnhandledException,
@@ -77,22 +77,25 @@ async def fault_cluster(request):
             pytest.raises(
                 FaultInjectionUnhandledError, match="Fault Injection Unhandled"
             ),
+            True,
         ],
         [
             FaultType.ProcessExit,
             {FaultPosition.ON_EXECUTE_OPERAND: 1},
             pytest.raises(ServerClosed),
+            False,  # The ServerClosed raised from current process directly.
         ],
         [
             FaultType.Exception,
             {FaultPosition.ON_RUN_SUBTASK: 1},
             pytest.raises(FaultInjectionError, match="Fault Injection"),
+            True,
         ],
     ],
 )
 @pytest.mark.asyncio
 async def test_fault_inject_subtask_processor(
-    ray_start_regular, fault_cluster, fault_and_exception
+    ray_start_regular_shared, fault_cluster, fault_and_exception
 ):
     await test_fault_injection.test_fault_inject_subtask_processor(
         fault_cluster, fault_and_exception
@@ -124,7 +127,7 @@ async def test_fault_inject_subtask_processor(
     ],
 )
 @pytest.mark.asyncio
-async def test_rerun_subtask(ray_start_regular, fault_cluster, fault_config):
+async def test_rerun_subtask(ray_start_regular_shared, fault_cluster, fault_config):
     await test_fault_injection.test_rerun_subtask(fault_cluster, fault_config)
 
 
@@ -144,7 +147,9 @@ async def test_rerun_subtask(ray_start_regular, fault_cluster, fault_config):
     ],
 )
 @pytest.mark.asyncio
-async def test_rerun_subtask_describe(ray_start_regular, fault_cluster, fault_config):
+async def test_rerun_subtask_describe(
+    ray_start_regular_shared, fault_cluster, fault_config
+):
     await test_fault_injection.test_rerun_subtask_describe(fault_cluster, fault_config)
 
 
@@ -152,9 +157,28 @@ async def test_rerun_subtask_describe(ray_start_regular, fault_cluster, fault_co
 @pytest.mark.parametrize(
     "fault_cluster", [{"config": SUBTASK_RERUN_CONFIG}], indirect=True
 )
+@pytest.mark.parametrize(
+    "fault_config",
+    [
+        [
+            FaultType.UnhandledException,
+            {FaultPosition.ON_EXECUTE_OPERAND: 1},
+            pytest.raises(FaultInjectionUnhandledError),
+            ["_UnhandledException", "handle_fault"],
+        ],
+        [
+            FaultType.Exception,
+            {FaultPosition.ON_EXECUTE_OPERAND: 100},
+            pytest.raises(FaultInjectionError),
+            ["_ExceedMaxRerun", "handle_fault"],
+        ],
+    ],
+)
 @pytest.mark.asyncio
-async def test_rerun_subtask_unhandled(ray_start_regular, fault_cluster):
-    await test_fault_injection.test_rerun_subtask_unhandled(fault_cluster)
+async def test_rerun_subtask_fail(
+    ray_start_regular_shared, fault_cluster, fault_config
+):
+    await test_fault_injection.test_rerun_subtask_fail(fault_cluster, fault_config)
 
 
 @require_ray
@@ -167,15 +191,17 @@ async def test_rerun_subtask_unhandled(ray_start_regular, fault_cluster):
         [
             FaultType.Exception,
             {FaultPosition.ON_EXECUTE_OPERAND: 1},
-            pytest.raises(FaultInjectionError, match="Fault Injection"),
+            pytest.raises(FaultInjectionError, match="RemoteFunction"),
+            ["_UnretryableException", "handle_fault"],
         ],
         [
             FaultType.ProcessExit,
             {FaultPosition.ON_EXECUTE_OPERAND: 1},
             pytest.raises(ServerClosed),
+            ["_UnretryableException", "*"],
         ],
     ],
 )
 @pytest.mark.asyncio
-async def test_retryable(ray_start_regular, fault_cluster, fault_config):
+async def test_retryable(ray_start_regular_shared, fault_cluster, fault_config):
     await test_fault_injection.test_retryable(fault_cluster, fault_config)

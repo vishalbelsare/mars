@@ -70,8 +70,8 @@ class DataFrameQuantile(DataFrameOperand, DataFrameOperandMixin):
             _axis=axis,
             _numeric_only=numeric_only,
             _dtype=dtype,
-            _gpu=gpu,
             _output_types=output_types,
+            gpu=gpu,
             **kw
         )
 
@@ -272,7 +272,7 @@ class DataFrameQuantile(DataFrameOperand, DataFrameOperandMixin):
                 stack_op = TensorStack(axis=0, dtype=dtype)
                 tr = stack_op(ts)
                 r = series_from_tensor(
-                    tr, index=df.index_value.to_pandas(), name=np.asscalar(ts[0].op.q)
+                    tr, index=df.index_value.to_pandas(), name=ts[0].op.q.item()
                 )
             else:
                 assert op.axis == 1
@@ -286,8 +286,7 @@ class DataFrameQuantile(DataFrameOperand, DataFrameOperandMixin):
                     interpolation=op.interpolation,
                     handle_non_numeric=not op.numeric_only,
                 )
-                r = series_from_tensor(tr, name=np.asscalar(tr.op.q))
-                r._index_value = op.input.index_value
+                r = series_from_tensor(tr, index=op.input.index, name=tr.op.q.item())
         else:
             assert df.ndim == 2
             if op.axis == 0:

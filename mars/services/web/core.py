@@ -20,11 +20,12 @@ import re
 import sys
 import urllib.parse
 from collections import defaultdict
-from typing import Callable, Dict, List, NamedTuple, Optional, Union
+from typing import Callable, Dict, List, NamedTuple, Optional, Type, Union
 
 from tornado import httpclient, web
-from tornado.simple_httpclient import HTTPTimeoutError
+from tornado.simple_httpclient import HTTPRequest, HTTPTimeoutError
 
+from ...lib.aio import alru_cache
 from ...utils import serialize_serializable, deserialize_serializable
 
 if sys.version_info[:2] == (3, 6):
@@ -48,7 +49,10 @@ class _WebApiDef(NamedTuple):
 
 
 def web_api(
-    sub_pattern: str, method: Union[str, List[str]], arg_filter: Optional[Dict] = None
+    sub_pattern: str,
+    method: Union[str, List[str]],
+    arg_filter: Optional[Dict] = None,
+    cache_blocking: bool = False,
 ):
     if not sub_pattern.endswith("$"):  # pragma: no branch
         sub_pattern += "$"
@@ -56,12 +60,19 @@ def web_api(
 
     def wrapper(func):
         @functools.wraps(func)
-        async def wrapped(self, *args, **kwargs):
+        async def wrapped(self: "MarsServiceWebAPIHandler", *args, **kwargs):
             try:
-                res = func(self, *args, **kwargs)
-                if inspect.isawaitable(res):
-                    res = await res
+                if not inspect.iscoroutinefunction(func):
+                    return func(self, *args, **kwargs)
+                elif not cache_blocking or self.request.method.lower() != "get":
+                    res = await func(self, *args, **kwargs)
+                else:
+                    res = await self._create_or_get_url_future(
+                        func, self, *args, **kwargs
+                    )
                 return res
+            except GeneratorExit:
+                raise
             except:  # noqa: E722  # nosec  # pylint: disable=bare-except
                 exc_type, exc, tb = sys.exc_info()
                 err_msg = (
@@ -81,13 +92,58 @@ def web_api(
     return wrapper
 
 
+@alru_cache(cache_exceptions=False)
+async def _get_cluster_api(address: str):
+    from ..cluster import ClusterAPI
+
+    return await ClusterAPI.create(address)
+
+
+@alru_cache(cache_exceptions=False)
+async def _get_api_by_key(
+    api_cls: Type, session_id: str, address: str, with_key_arg: bool = True
+):
+    cluster_api = await _get_cluster_api(address)
+    [address] = await cluster_api.get_supervisors_by_keys([session_id])
+    if with_key_arg:
+        return await api_cls.create(session_id, address)
+    else:
+        return await api_cls.create(address)
+
+
 class MarsServiceWebAPIHandler(MarsRequestHandler):
-    _root_pattern = None
-    _method_to_handlers = None
+    _root_pattern: str = None
+    _method_to_handlers: Dict[str, Dict[Callable, _WebApiDef]] = None
+    _uri_to_futures: Dict[str, asyncio.Task] = None
 
     def __init__(self, *args, **kwargs):
         self._collect_services()
         super().__init__(*args, **kwargs)
+
+    def _get_api_by_key(
+        self, api_cls: Type, session_id: str, with_key_arg: bool = True
+    ):
+        return _get_api_by_key(
+            api_cls,
+            session_id,
+            address=self._supervisor_addr,
+            with_key_arg=with_key_arg,
+        )
+
+    def _create_or_get_url_future(self, func, *args, **kw):
+        if self._uri_to_futures is None:
+            type(self)._uri_to_futures = dict()
+
+        uri = self.request.uri
+        if uri in self._uri_to_futures:
+            return self._uri_to_futures[uri]
+
+        def _future_remover(_fut):
+            self._uri_to_futures.pop(uri, None)
+
+        task = self._uri_to_futures[uri] = asyncio.create_task(func(*args, **kw))
+        task.add_done_callback(_future_remover)
+        return task
 
     @classmethod
     def _collect_services(cls):
@@ -105,15 +161,16 @@ class MarsServiceWebAPIHandler(MarsRequestHandler):
             for api_def in web_api_defs:
                 cls._method_to_handlers[api_def.method.lower()][handle_func] = api_def
 
+    def prepare(self):
+        self.set_header("Content-Type", "application/octet-stream")
+
     @classmethod
     def get_root_pattern(cls):
         return cls._root_pattern + "(?:/(?P<sub_path>.*)$|$)"
 
     @functools.lru_cache(100)
     def _route_sub_path(self, http_method: str, sub_path: str):
-        handlers = self._method_to_handlers[
-            http_method.lower()
-        ]  # type: Dict[Callable, _WebApiDef]
+        handlers = self._method_to_handlers[http_method.lower()]
         method, kwargs = None, None
         for handler_method, web_api_def in handlers.items():
             match = web_api_def.sub_pattern_compiled.match(sub_path)
@@ -170,9 +227,13 @@ class MarsWebAPIClientMixin:
             self._client_obj = httpclient.AsyncHTTPClient()
             return self._client_obj
 
-    def __del__(self):
-        if hasattr(self, "_client_obj"):
-            self._client_obj.close()
+    @property
+    def request_rewriter(self) -> Callable:
+        return getattr(self, "_request_rewriter", None)
+
+    @request_rewriter.setter
+    def request_rewriter(self, value: Callable):
+        self._request_rewriter = value
 
     async def _request_url(self, method, path, **kwargs):
         self._running_loop = asyncio.get_running_loop()
@@ -190,9 +251,10 @@ class MarsWebAPIClientMixin:
             path += path_connector + url_params
 
         try:
-            res = await self._client.fetch(
-                path, method=method, raise_error=False, **kwargs
-            )
+            request = HTTPRequest(path, method=method, **kwargs)
+            if self.request_rewriter:
+                request = self.request_rewriter(request)
+            res = await self._client.fetch(request, raise_error=False)
         except HTTPTimeoutError as ex:
             raise TimeoutError(str(ex)) from None
 

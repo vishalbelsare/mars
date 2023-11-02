@@ -42,7 +42,7 @@ class RunPyTorch(RunScript):
             _master_port=master_port,
             _master_addr=master_addr,
             _init_method=init_method,
-            _gpu=gpu,
+            gpu=gpu,
             **kw
         )
 
@@ -95,7 +95,7 @@ class RunPyTorch(RunScript):
 
     @classmethod
     def execute(cls, ctx, op):
-        assert ctx.current_address.split(":")[0] == op.expect_worker.split(":")[0]
+        assert ctx.local_address.split(":")[0] == op.expect_worker.split(":")[0]
 
         super().execute(ctx, op)
 

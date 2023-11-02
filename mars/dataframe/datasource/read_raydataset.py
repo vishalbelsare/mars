@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import functools
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -35,8 +36,8 @@ from .core import (
 ray = lazy_import("ray")
 # Ray Datasets is available in early preview at ray.data with Ray 1.6+
 # (and ray.experimental.data in Ray 1.5)
-ray_dataset = lazy_import("ray.data")
-ray_exp_dataset = lazy_import("ray.experimental.data")
+ray_dataset = lazy_import("ray.data", rename="ray_dataset")
+ray_exp_dataset = lazy_import("ray.experimental.data", rename="ray_exp_dataset")
 real_ray_dataset = ray_dataset or ray_exp_dataset
 
 
@@ -45,33 +46,10 @@ class DataFrameReadRayDataset(
 ):
     _op_type_ = OperandDef.READ_RAYDATASET
 
-    _refs = AnyField("refs")
-    _columns = ListField("columns")
-    _incremental_index = BoolField("incremental_index")
-    _nrows = Int64Field("nrows")
-
-    def __init__(
-        self, refs=None, columns=None, incremental_index=None, nrows=None, **kw
-    ):
-        super().__init__(
-            _refs=refs,
-            _columns=columns,
-            _incremental_index=incremental_index,
-            _nrows=nrows,
-            **kw,
-        )
-
-    @property
-    def refs(self):
-        return self._refs
-
-    @property
-    def columns(self):
-        return self._columns
-
-    @property
-    def incremental_index(self):
-        return self._incremental_index
+    refs = AnyField("refs", default=None)
+    columns = ListField("columns", default=None)
+    incremental_index = BoolField("incremental_index", default=None)
+    nrows = Int64Field("nrows", default=None)
 
     @classmethod
     def _tile_partitioned(cls, op: "DataFrameReadRayDataset"):
@@ -131,35 +109,66 @@ class DataFrameReadRayDataset(
         )
 
 
-def read_raydataset(ds, columns=None, incremental_index=False, **kwargs):
+def read_ray_dataset(ds, columns=None, incremental_index=False, **kwargs):
     assert isinstance(ds, real_ray_dataset.Dataset)
     refs = ds.to_pandas_refs()
-    dtypes = ds.schema().empty_table().to_pandas().dtypes
+    schema = ds.schema()
+
+    import pyarrow as pa
+
+    try:
+        from ray.data._internal.pandas_block import PandasBlockSchema
+    except ImportError:
+        try:
+            from ray.data.impl.pandas_block import PandasBlockSchema
+        except ImportError:  # pragma: no cover
+            PandasBlockSchema = type(None)
+    try:
+        from ray.data.dataset import Schema as RayDatasetSchema
+    except ImportError:
+        RayDatasetSchema = type(None)
+
+    if isinstance(schema, PandasBlockSchema):
+        dtypes = pd.Series(schema.types, index=schema.names)
+    elif isinstance(schema, RayDatasetSchema):
+        dtypes = pd.Series(
+            [
+                t.to_pandas_dtype() if t is not object else np.dtype("O")
+                for t in schema.types
+            ],
+            index=schema.names,
+        )
+    elif isinstance(schema, pa.Schema):
+        dtypes = schema.empty_table().to_pandas().dtypes
+    else:
+        raise NotImplementedError(f"Unsupported format of schema {schema}")
+
     index_value = parse_index(pd.RangeIndex(-1))
     columns_value = parse_index(dtypes.index, store_data=True)
-
     op = DataFrameReadRayDataset(
         refs=refs, columns=columns, incremental_index=incremental_index
     )
     return op(index_value=index_value, columns_value=columns_value, dtypes=dtypes)
 
 
+# keep it for back compatibility
+@functools.wraps(read_ray_dataset)
+def read_raydataset(*args, **kwargs):
+    warnings.warn(
+        "read_raydataset has been renamed to read_ray_dataset",
+        DeprecationWarning,
+    )
+    return read_ray_dataset(*args, **kwargs)
+
+
 class DataFrameReadMLDataset(HeadOptimizedDataSource):
     _op_type_ = OperandDef.READ_MLDATASET
-    _mldataset = ReferenceField("mldataset", "ray.util.data.MLDataset")
-    _columns = ListField("columns")
 
-    def __init__(self, mldataset=None, columns=None, **kw):
-        super().__init__(
-            _mldataset=mldataset,
-            _columns=columns,
-            _output_types=[OutputType.dataframe],
-            **kw,
-        )
+    mldataset = ReferenceField("mldataset", "ray.util.data.MLDataset", default=None)
+    columns = ListField("columns", default=None)
 
-    @property
-    def mldataset(self):
-        return self._mldataset
+    def __init__(self, **kw):
+        super().__init__(_output_types=[OutputType.dataframe], **kw)
 
     def _update_key(self):
         """We can't direct generate token for mldataset when we use

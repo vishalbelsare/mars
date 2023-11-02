@@ -12,19 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+import logging
 from typing import List, Dict, Union
 
+from ...oscar import ServerClosed
+from ...resource import Resource
 from ...services import start_services, stop_services, NodeRole
-from ..utils import load_service_config_file
 
-
-def load_config(filename=None):
-    # use default config
-    if not filename:  # pragma: no cover
-        d = os.path.dirname(os.path.abspath(__file__))
-        filename = os.path.join(d, "config.yml")
-    return load_service_config_file(filename)
+logger = logging.getLogger(__name__)
 
 
 async def start_supervisor(
@@ -34,8 +29,7 @@ async def start_supervisor(
     config: Dict = None,
     web: Union[str, bool] = "auto",
 ):
-    if not config or isinstance(config, str):
-        config = load_config(config)
+    logger.debug("Starting Mars supervisor at %s", address)
     lookup_address = lookup_address or address
     backend = config["cluster"].get("backend", "fixed")
     if backend == "fixed" and config["cluster"].get("lookup_address") is None:
@@ -47,12 +41,14 @@ async def start_supervisor(
         config["modules"] = modules
     try:
         await start_services(NodeRole.SUPERVISOR, config, address=address)
+        logger.debug("Mars supervisor started at %s", address)
     except ImportError:
         if web == "auto":
             config["services"] = [
                 service for service in config["services"] if service != "web"
             ]
             await start_services(NodeRole.SUPERVISOR, config, address=address)
+            logger.debug("Mars supervisor started at %s", address)
             return False
         else:  # pragma: no cover
             raise
@@ -61,28 +57,28 @@ async def start_supervisor(
 
 
 async def stop_supervisor(address: str, config: Dict = None):
-    if not config or isinstance(config, str):
-        config = load_config(config)
-    await stop_services(NodeRole.SUPERVISOR, address=address, config=config)
+    try:
+        await stop_services(NodeRole.SUPERVISOR, address=address, config=config)
+    except (ConnectionRefusedError, ServerClosed):  # pragma: no cover
+        pass
 
 
 async def start_worker(
     address: str,
     lookup_address: str,
-    band_to_slots: Dict[str, int],
+    band_to_resource: Dict[str, Resource],
     modules: Union[List, str, None] = None,
     config: Dict = None,
     mark_ready: bool = True,
 ):
-    if not config or isinstance(config, str):
-        config = load_config(config)
+    logger.debug("Starting Mars worker at %s", address)
     backend = config["cluster"].get("backend", "fixed")
     if backend == "fixed" and config["cluster"].get("lookup_address") is None:
         config["cluster"]["lookup_address"] = lookup_address
     if config["cluster"].get("resource") is None:
-        config["cluster"]["resource"] = band_to_slots
+        config["cluster"]["resource"] = band_to_resource
     if any(
-        band_name.startswith("gpu-") for band_name in band_to_slots
+        band_name.startswith("gpu-") for band_name in band_to_resource
     ):  # pragma: no cover
         if "cuda" not in config["storage"]["backends"]:
             config["storage"]["backends"].append("cuda")
@@ -91,9 +87,11 @@ async def start_worker(
     await start_services(
         NodeRole.WORKER, config, address=address, mark_ready=mark_ready
     )
+    logger.debug("Mars worker started at %s", address)
 
 
 async def stop_worker(address: str, config: Dict = None):
-    if not config or isinstance(config, str):
-        config = load_config(config)
-    await stop_services(NodeRole.WORKER, address=address, config=config)
+    try:
+        await stop_services(NodeRole.WORKER, address=address, config=config)
+    except (ConnectionRefusedError, ServerClosed):  # pragma: no cover
+        pass

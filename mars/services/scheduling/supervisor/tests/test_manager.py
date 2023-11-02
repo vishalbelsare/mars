@@ -14,7 +14,7 @@
 
 import asyncio
 from collections import defaultdict
-from typing import List, Tuple
+from typing import List, Tuple, Set
 
 import pytest
 
@@ -26,7 +26,7 @@ from ....task.supervisor.manager import TaskManagerActor
 from ...supervisor import (
     SubtaskQueueingActor,
     SubtaskManagerActor,
-    GlobalSlotManagerActor,
+    GlobalResourceManagerActor,
 )
 from ...worker import SubtaskExecutionActor
 
@@ -47,7 +47,13 @@ class MockSubtaskQueueingActor(mo.Actor):
         self._subtasks = dict()
         self._error = None
 
-    def add_subtasks(self, subtasks: List[Subtask], priorities: List[Tuple]):
+    def add_subtasks(
+        self,
+        subtasks: List[Subtask],
+        priorities: List[Tuple],
+        exclude_bands: Set[Tuple] = None,
+        random_when_unavailable: bool = True,
+    ):
         if self._error is not None:
             raise self._error
         for subtask, priority in zip(subtasks, priorities):
@@ -105,8 +111,8 @@ async def actor_pool():
             address=pool.external_address,
         )
         slots_ref = await mo.create_actor(
-            GlobalSlotManagerActor,
-            uid=GlobalSlotManagerActor.default_uid(),
+            GlobalResourceManagerActor,
+            uid=GlobalResourceManagerActor.default_uid(),
             address=pool.external_address,
         )
         task_manager_ref = await mo.create_actor(
@@ -126,10 +132,11 @@ async def actor_pool():
             address=pool.external_address,
         )
 
-        yield pool, session_id, execution_ref, submitter_ref, queue_ref, task_manager_ref
-
-        await mo.destroy_actor(slots_ref)
-        await MockClusterAPI.cleanup(pool.external_address)
+        try:
+            yield pool, session_id, execution_ref, submitter_ref, queue_ref, task_manager_ref
+        finally:
+            await mo.destroy_actor(slots_ref)
+            await MockClusterAPI.cleanup(pool.external_address)
 
 
 @pytest.mark.asyncio

@@ -109,6 +109,7 @@ def test_store_tiledb_execution(setup):
 
 
 @pytest.mark.skipif(h5py is None, reason="h5py not installed")
+@pytest.mark.ray_dag
 def test_store_hdf5_execution(setup):
     raw = np.random.RandomState(0).rand(10, 20)
 
@@ -223,7 +224,7 @@ def test_vineyard_execution(setup):
         "check_shape": False,
     }
 
-    with vineyard.deploy.local.start_vineyardd() as (_, vineyard_socket):
+    with vineyard.deploy.local.start_vineyardd() as (_, vineyard_socket, _):
         a = tensor(raw, chunk_size=15)
         a.execute()  # n.b.: pre-execute
 

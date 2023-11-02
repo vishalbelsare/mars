@@ -14,27 +14,35 @@
 
 import asyncio
 import concurrent.futures as futures
-import contextlib
 import itertools
 import logging
+import multiprocessing
 import os
 import threading
-import multiprocessing
+import traceback
 from abc import ABC, ABCMeta, abstractmethod
 from typing import Dict, List, Type, TypeVar, Coroutine, Callable, Union, Optional
 
+from ...core.entrypoints import init_extension_entrypoints
+from ...metrics import init_metrics
 from ...utils import implements, to_binary
-from ...utils import lazy_import, register_asyncio_task_timeout_detector
+from ...utils import lazy_import, register_asyncio_task_timeout_detector, TypeDispatcher
 from ..api import Actor
-from ..core import ActorRef
+from ..core import ActorRef, register_local_pool
 from ..debug import record_message_trace, debug_async_timeout
-from ..errors import ActorAlreadyExist, ActorNotExist, ServerClosed, CannotCancelTask
+from ..errors import (
+    ActorAlreadyExist,
+    ActorNotExist,
+    ServerClosed,
+    CannotCancelTask,
+    SendMessageFailed,
+)
 from ..utils import create_actor_ref
 from .allocate_strategy import allocated_type, AddressSpecified
 from .communication import Channel, Server, get_server_type, gen_local_address
 from .communication.errors import ChannelClosed
 from .config import ActorPoolConfig
-from .core import result_message_type, ActorCaller
+from .core import ResultMessageType, ActorCaller
 from .message import (
     _MessageBase,
     new_message_id,
@@ -57,9 +65,12 @@ from .router import Router
 logger = logging.getLogger(__name__)
 ray = lazy_import("ray")
 
+DEFAULT_MODULES = ["mars.tensor", "mars.dataframe", "mars.learn", "mars.remote"]
+
 
 class _ErrorProcessor:
-    def __init__(self, message_id: bytes, protocol):
+    def __init__(self, address: str, message_id: bytes, protocol):
+        self._address = address
         self._message_id = message_id
         self._protocol = protocol
         self.result = None
@@ -70,7 +81,13 @@ class _ErrorProcessor:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.result is None:
             self.result = ErrorMessage(
-                self._message_id, exc_type, exc_val, exc_tb, protocol=self._protocol
+                self._message_id,
+                self._address,
+                os.getpid(),
+                exc_type,
+                exc_val,
+                exc_tb,
+                protocol=self._protocol,
             )
             return True
 
@@ -119,6 +136,9 @@ class AbstractActorPool(ABC):
         config: ActorPoolConfig,
         servers: List[Server],
     ):
+        # register local pool for local actor lookup.
+        # The pool is weakrefed, so we don't need to unregister it.
+        register_local_pool(external_address, self)
         self.process_index = process_index
         self.label = label
         self.external_address = external_address
@@ -141,13 +161,19 @@ class AbstractActorPool(ABC):
         self._asyncio_task_timeout_detector_task = (
             register_asyncio_task_timeout_detector()
         )
+        # load third party extensions.
+        init_extension_entrypoints()
+        # init metrics
+        metric_configs = self._config.get_metric_configs()
+        metric_backend = metric_configs.get("backend")
+        init_metrics(metric_backend, config=metric_configs.get(metric_backend))
 
     @property
     def router(self):
         return self._router
 
     @abstractmethod
-    async def create_actor(self, message: CreateActorMessage) -> result_message_type:
+    async def create_actor(self, message: CreateActorMessage) -> ResultMessageType:
         """
         Create an actor.
 
@@ -179,7 +205,7 @@ class AbstractActorPool(ABC):
         """
 
     @abstractmethod
-    async def destroy_actor(self, message: DestroyActorMessage) -> result_message_type:
+    async def destroy_actor(self, message: DestroyActorMessage) -> ResultMessageType:
         """
         Destroy an actor.
 
@@ -195,7 +221,7 @@ class AbstractActorPool(ABC):
         """
 
     @abstractmethod
-    async def actor_ref(self, message: ActorRefMessage) -> result_message_type:
+    async def actor_ref(self, message: ActorRefMessage) -> ResultMessageType:
         """
         Get an actor's ref.
 
@@ -211,7 +237,7 @@ class AbstractActorPool(ABC):
         """
 
     @abstractmethod
-    async def send(self, message: SendMessage) -> result_message_type:
+    async def send(self, message: SendMessage) -> ResultMessageType:
         """
         Send a message to some actor.
 
@@ -227,7 +253,7 @@ class AbstractActorPool(ABC):
         """
 
     @abstractmethod
-    async def tell(self, message: TellMessage) -> result_message_type:
+    async def tell(self, message: TellMessage) -> ResultMessageType:
         """
         Tell message to some actor.
 
@@ -243,7 +269,7 @@ class AbstractActorPool(ABC):
         """
 
     @abstractmethod
-    async def cancel(self, message: CancelMessage) -> result_message_type:
+    async def cancel(self, message: CancelMessage) -> ResultMessageType:
         """
         Cancel message that sent
 
@@ -258,9 +284,19 @@ class AbstractActorPool(ABC):
             result or error message
         """
 
+    def _sync_pool_config(self, actor_pool_config: ActorPoolConfig):
+        self._config = actor_pool_config
+        # remove router from global one
+        global_router = Router.get_instance()
+        global_router.remove_router(self._router)
+        # update router
+        self._router.set_mapping(actor_pool_config.external_to_internal_address_map)
+        # update global router
+        global_router.add_router(self._router)
+
     async def handle_control_command(
         self, message: ControlMessage
-    ) -> result_message_type:
+    ) -> ResultMessageType:
         """
         Handle control command.
 
@@ -275,23 +311,13 @@ class AbstractActorPool(ABC):
             result or error message.
         """
         with _ErrorProcessor(
-            message.message_id, protocol=message.protocol
+            self.external_address, message.message_id, protocol=message.protocol
         ) as processor:
             content = True
             if message.control_message_type == ControlMessageType.stop:
                 await self.stop()
             elif message.control_message_type == ControlMessageType.sync_config:
-                actor_pool_config: ActorPoolConfig = message.content
-                self._config = actor_pool_config
-                # remove router from global one
-                global_router = Router.get_instance()
-                global_router.remove_router(self._router)
-                # update router
-                self._router.set_mapping(
-                    actor_pool_config.external_to_internal_address_map
-                )
-                # update global router
-                global_router.add_router(self._router)
+                self._sync_pool_config(message.content)
             elif message.control_message_type == ControlMessageType.get_config:
                 if message.content == "main_pool_address":
                     main_process_index = self._config.get_process_indexes()[0]
@@ -311,37 +337,68 @@ class AbstractActorPool(ABC):
 
         return processor.result
 
-    @contextlib.contextmanager
-    def _run_coro(self, message_id: bytes, coro: Coroutine):
-        future = asyncio.create_task(coro)
-        self._process_messages[message_id] = future
+    async def _run_coro(self, message_id: bytes, coro: Coroutine):
+        self._process_messages[message_id] = asyncio.tasks.current_task()
         try:
-            yield future
+            return await coro
         finally:
             self._process_messages.pop(message_id, None)
 
-    async def process_message(self, message: _MessageBase, channel: Channel):
-        handler = self._message_handler[message.message_type]
-        with _ErrorProcessor(message.message_id, message.protocol) as processor:
-            with debug_async_timeout(
-                "process_message_timeout",
-                "Process message %s of channel %s timeout.",
-                message,
-                channel,
-            ):
-                with self._run_coro(
-                    message.message_id, handler(self, message)
-                ) as future:
-                    processor.result = await future
+    async def _send_channel(
+        self, result: _MessageBase, channel: Channel, resend_failure: bool = True
+    ):
         try:
-            await channel.send(processor.result)
+            await channel.send(result)
         except (ChannelClosed, ConnectionResetError):
             if not self._stopped.is_set():
                 raise
+        except Exception as ex:
+            logger.exception(
+                "Error when sending message %s from %s to %s",
+                result.message_id.hex(),
+                channel.local_address,
+                channel.dest_address,
+            )
+            if not resend_failure:  # pragma: no cover
+                raise
 
-    async def call(
-        self, dest_address: str, message: _MessageBase
-    ) -> result_message_type:
+            with _ErrorProcessor(
+                self.external_address, result.message_id, result.protocol
+            ) as processor:
+                error_msg = (
+                    f"Error when sending message {result.message_id.hex()}. "
+                    f"Caused by {ex!r}. "
+                )
+                if isinstance(result, ErrorMessage):
+                    format_tb = "\n".join(traceback.format_tb(result.traceback))
+                    error_msg += (
+                        f"\nOriginal error: {result.error!r}"
+                        f"Traceback: \n{format_tb}"
+                    )
+                else:
+                    error_msg += "See server logs for more details"
+                raise SendMessageFailed(error_msg) from None
+            await self._send_channel(processor.result, channel, resend_failure=False)
+
+    async def process_message(self, message: _MessageBase, channel: Channel):
+        handler = self._message_handler[message.message_type]
+        with _ErrorProcessor(
+            self.external_address, message.message_id, message.protocol
+        ) as processor:
+            # use `%.500` to avoid print too long messages
+            with debug_async_timeout(
+                "process_message_timeout",
+                "Process message %.500s of channel %s timeout.",
+                message,
+                channel,
+            ):
+                processor.result = await self._run_coro(
+                    message.message_id, handler(self, message)
+                )
+
+        await self._send_channel(processor.result, channel)
+
+    async def call(self, dest_address: str, message: _MessageBase) -> ResultMessageType:
         return await self._caller.call(self._router, dest_address, message)
 
     @staticmethod
@@ -402,7 +459,9 @@ class AbstractActorPool(ABC):
     async def stop(self):
         try:
             # clean global router
-            Router.get_instance().remove_router(self._router)
+            router = Router.get_instance()
+            if router is not None:
+                router.remove_router(self._router)
             stop_tasks = []
             # stop all servers
             stop_tasks.extend([server.stop() for server in self._servers])
@@ -449,20 +508,21 @@ class ActorPoolBase(AbstractActorPool, metaclass=ABCMeta):
     __slots__ = ()
 
     @implements(AbstractActorPool.create_actor)
-    async def create_actor(self, message: CreateActorMessage) -> result_message_type:
-        with _ErrorProcessor(message.message_id, message.protocol) as processor:
+    async def create_actor(self, message: CreateActorMessage) -> ResultMessageType:
+        with _ErrorProcessor(
+            self.external_address, message.message_id, message.protocol
+        ) as processor:
             actor_id = message.actor_id
             if actor_id in self._actors:
                 raise ActorAlreadyExist(
-                    f"Actor {actor_id} already exist, " f"cannot create"
+                    f"Actor {actor_id} already exist, cannot create"
                 )
 
             actor = message.actor_cls(*message.args, **message.kwargs)
             actor.uid = actor_id
             actor.address = address = self.external_address
             self._actors[actor_id] = actor
-            with self._run_coro(message.message_id, actor.__post_create__()) as future:
-                await future
+            await self._run_coro(message.message_id, actor.__post_create__())
 
             result = ActorRef(address, actor_id)
             # ensemble result message
@@ -475,21 +535,22 @@ class ActorPoolBase(AbstractActorPool, metaclass=ABCMeta):
     async def has_actor(self, message: HasActorMessage) -> ResultMessage:
         result = ResultMessage(
             message.message_id,
-            to_binary(message.actor_ref.uid) in self._actors,
+            message.actor_ref.uid in self._actors,
             protocol=message.protocol,
         )
         return result
 
     @implements(AbstractActorPool.destroy_actor)
-    async def destroy_actor(self, message: DestroyActorMessage) -> result_message_type:
-        with _ErrorProcessor(message.message_id, message.protocol) as processor:
+    async def destroy_actor(self, message: DestroyActorMessage) -> ResultMessageType:
+        with _ErrorProcessor(
+            self.external_address, message.message_id, message.protocol
+        ) as processor:
             actor_id = message.actor_ref.uid
             try:
                 actor = self._actors[actor_id]
             except KeyError:
                 raise ActorNotExist(f"Actor {actor_id} does not exist")
-            with self._run_coro(message.message_id, actor.__pre_destroy__()) as future:
-                await future
+            await self._run_coro(message.message_id, actor.__pre_destroy__())
             del self._actors[actor_id]
 
             processor.result = ResultMessage(
@@ -498,9 +559,11 @@ class ActorPoolBase(AbstractActorPool, metaclass=ABCMeta):
         return processor.result
 
     @implements(AbstractActorPool.actor_ref)
-    async def actor_ref(self, message: ActorRefMessage) -> result_message_type:
-        with _ErrorProcessor(message.message_id, message.protocol) as processor:
-            actor_id = to_binary(message.actor_ref.uid)
+    async def actor_ref(self, message: ActorRefMessage) -> ResultMessageType:
+        with _ErrorProcessor(
+            self.external_address, message.message_id, message.protocol
+        ) as processor:
+            actor_id = message.actor_ref.uid
             if actor_id not in self._actors:
                 raise ActorNotExist(f"Actor {actor_id} does not exist")
             result = ResultMessage(
@@ -512,24 +575,28 @@ class ActorPoolBase(AbstractActorPool, metaclass=ABCMeta):
         return processor.result
 
     @implements(AbstractActorPool.send)
-    async def send(self, message: SendMessage) -> result_message_type:
+    async def send(self, message: SendMessage) -> ResultMessageType:
         with _ErrorProcessor(
-            message.message_id, message.protocol
+            self.external_address, message.message_id, message.protocol
         ) as processor, record_message_trace(message):
             actor_id = message.actor_ref.uid
             if actor_id not in self._actors:
                 raise ActorNotExist(f"Actor {actor_id} does not exist")
             coro = self._actors[actor_id].__on_receive__(message.content)
-            with self._run_coro(message.message_id, coro) as future:
-                result = await future
+            result = await self._run_coro(message.message_id, coro)
             processor.result = ResultMessage(
-                message.message_id, result, protocol=message.protocol
+                message.message_id,
+                result,
+                protocol=message.protocol,
+                profiling_context=message.profiling_context,
             )
         return processor.result
 
     @implements(AbstractActorPool.tell)
-    async def tell(self, message: TellMessage) -> result_message_type:
-        with _ErrorProcessor(message.message_id, message.protocol) as processor:
+    async def tell(self, message: TellMessage) -> ResultMessageType:
+        with _ErrorProcessor(
+            self.external_address, message.message_id, message.protocol
+        ) as processor:
             actor_id = message.actor_ref.uid
             if actor_id not in self._actors:  # pragma: no cover
                 raise ActorNotExist(f"Actor {actor_id} does not exist")
@@ -538,17 +605,22 @@ class ActorPoolBase(AbstractActorPool, metaclass=ABCMeta):
             asyncio.create_task(call)
             await asyncio.sleep(0)
             processor.result = ResultMessage(
-                message.message_id, None, protocol=message.protocol
+                message.message_id,
+                None,
+                protocol=message.protocol,
+                profiling_context=message.profiling_context,
             )
         return processor.result
 
     @implements(AbstractActorPool.cancel)
-    async def cancel(self, message: CancelMessage) -> result_message_type:
-        with _ErrorProcessor(message.message_id, message.protocol) as processor:
+    async def cancel(self, message: CancelMessage) -> ResultMessageType:
+        with _ErrorProcessor(
+            self.external_address, message.message_id, message.protocol
+        ) as processor:
             future = self._process_messages.get(message.cancel_message_id)
             if future is None or future.done():  # pragma: no cover
                 raise CannotCancelTask(
-                    "Task not exists, maybe it is done " "or cancelled already"
+                    "Task not exists, maybe it is done or cancelled already"
                 )
             future.cancel()
             processor.result = ResultMessage(
@@ -567,6 +639,64 @@ class ActorPoolBase(AbstractActorPool, metaclass=ABCMeta):
         # append this router to global
         default_router.add_router(router)
 
+    @staticmethod
+    def _update_stored_addresses(
+        servers: List[Server],
+        raw_addresses: List[str],
+        actor_pool_config: ActorPoolConfig,
+        kw: Dict,
+    ):
+        process_index = kw["process_index"]
+        curr_pool_config = actor_pool_config.get_pool_config(process_index)
+        external_addresses = curr_pool_config["external_address"]
+        external_address_set = set(external_addresses)
+
+        kw["servers"] = servers
+
+        new_external_addresses = [
+            server.address
+            for server, raw_address in zip(servers, raw_addresses)
+            if raw_address in external_address_set
+        ]
+
+        if external_address_set != set(new_external_addresses):
+            external_addresses = new_external_addresses
+            actor_pool_config.reset_pool_external_address(
+                process_index, external_addresses
+            )
+            external_addresses = curr_pool_config["external_address"]
+
+            logger.debug(
+                "External address of process index %s updated to %s",
+                process_index,
+                external_addresses[0],
+            )
+            if kw["internal_address"] == kw["external_address"]:
+                # internal address may be the same as external address in Windows
+                kw["internal_address"] = external_addresses[0]
+            kw["external_address"] = external_addresses[0]
+
+            kw["router"] = Router(
+                external_addresses,
+                gen_local_address(process_index),
+                actor_pool_config.external_to_internal_address_map,
+            )
+
+    @classmethod
+    async def _create_servers(cls, addresses: List[str], channel_handler: Callable):
+        assert len(set(addresses)) == len(addresses)
+        # create servers
+        create_server_tasks = []
+        for addr in addresses:
+            server_type = get_server_type(addr)
+            task = asyncio.create_task(
+                server_type.create(dict(address=addr, handle_channel=channel_handler))
+            )
+            create_server_tasks.append(task)
+
+        await asyncio.gather(*create_server_tasks)
+        return [f.result() for f in create_server_tasks]
+
     @classmethod
     @implements(AbstractActorPool.create)
     async def create(cls, config: Dict) -> "ActorPoolType":
@@ -574,36 +704,33 @@ class ActorPoolBase(AbstractActorPool, metaclass=ABCMeta):
         kw = dict()
         cls._parse_config(config, kw)
         process_index: int = kw["process_index"]
-        actor_pool_config = kw["config"]
-        external_addresses = actor_pool_config.get_pool_config(process_index)[
-            "external_address"
-        ]
+        actor_pool_config = kw["config"]  # type: ActorPoolConfig
+        cur_pool_config = actor_pool_config.get_pool_config(process_index)
+        external_addresses = cur_pool_config["external_address"]
         internal_address = kw["internal_address"]
 
         # import predefined modules
-        modules = actor_pool_config.get_pool_config(process_index)["modules"] or []
+        modules = cur_pool_config["modules"] or []
         for mod in modules:
             __import__(mod, globals(), locals(), [])
-
-        # set default router
-        # actor context would be able to use exact client
-        cls._set_global_router(kw["router"])
+        # make sure all lazy imports loaded
+        TypeDispatcher.reload_all_lazy_handlers()
 
         def handle_channel(channel):
             return pool.on_new_channel(channel)
 
         # create servers
-        create_server_tasks = []
-        for addr in set(
-            external_addresses + [internal_address, gen_local_address(process_index)]
-        ):
-            server_type = get_server_type(addr)
-            task = asyncio.create_task(
-                server_type.create(dict(address=addr, handle_channel=handle_channel))
-            )
-            create_server_tasks.append(task)
-        await asyncio.gather(*create_server_tasks)
-        kw["servers"] = [f.result() for f in create_server_tasks]
+        server_addresses = external_addresses + [
+            internal_address,
+            gen_local_address(process_index),
+        ]
+        server_addresses = sorted(set(server_addresses))
+        servers = await cls._create_servers(server_addresses, handle_channel)
+        cls._update_stored_addresses(servers, server_addresses, actor_pool_config, kw)
+
+        # set default router
+        # actor context would be able to use exact client
+        cls._set_global_router(kw["router"])
 
         # create pool
         pool = cls(**kw)
@@ -647,21 +774,51 @@ class SubActorPoolBase(ActorPoolBase):
     ):  # pragma: no cover
         await self.call(self._main_address, message)
 
+    async def notify_main_pool_to_create(self, message: CreateActorMessage):
+        reg_message = ControlMessage(
+            new_message_id(),
+            self.external_address,
+            ControlMessageType.add_sub_pool_actor,
+            (self.external_address, message.allocate_strategy, message),
+        )
+        await self.call(self._main_address, reg_message)
+
+    @implements(AbstractActorPool.create_actor)
+    async def create_actor(self, message: CreateActorMessage) -> ResultMessageType:
+        result = await super().create_actor(message)
+        if not message.from_main:
+            await self.notify_main_pool_to_create(message)
+        return result
+
     @implements(AbstractActorPool.actor_ref)
-    async def actor_ref(self, message: ActorRefMessage) -> result_message_type:
+    async def actor_ref(self, message: ActorRefMessage) -> ResultMessageType:
         result = await super().actor_ref(message)
         if isinstance(result, ErrorMessage):
-            message.actor_ref.address = self._main_address
-            result = await self.call(self._main_address, message)
+            # need a new message id to call main actor
+            main_message = ActorRefMessage(
+                new_message_id(),
+                create_actor_ref(self._main_address, message.actor_ref.uid),
+            )
+            result = await self.call(self._main_address, main_message)
+            # rewrite to message_id of the original request
+            result.message_id = message.message_id
         return result
 
     @implements(AbstractActorPool.destroy_actor)
-    async def destroy_actor(self, message: DestroyActorMessage) -> result_message_type:
+    async def destroy_actor(self, message: DestroyActorMessage) -> ResultMessageType:
         result = await super().destroy_actor(message)
         if isinstance(result, ResultMessage) and not message.from_main:
             # sync back to main actor pool
             await self.notify_main_pool_to_destroy(message)
         return result
+
+    @implements(AbstractActorPool.handle_control_command)
+    async def handle_control_command(
+        self, message: ControlMessage
+    ) -> ResultMessageType:
+        if message.control_message_type == ControlMessageType.sync_config:
+            self._main_address = message.address
+        return await super().handle_control_command(message)
 
     @staticmethod
     def _parse_config(config: Dict, kw: Dict) -> Dict:
@@ -741,9 +898,11 @@ class MainActorPoolBase(ActorPoolBase):
         return self.sub_processes
 
     @implements(AbstractActorPool.create_actor)
-    async def create_actor(self, message: CreateActorMessage) -> result_message_type:
+    async def create_actor(self, message: CreateActorMessage) -> ResultMessageType:
         with _ErrorProcessor(
-            message_id=message.message_id, protocol=message.protocol
+            address=self.external_address,
+            message_id=message.message_id,
+            protocol=message.protocol,
         ) as processor:
             allocate_strategy = message.allocate_strategy
             with self._allocation_lock:
@@ -773,6 +932,7 @@ class MainActorPoolBase(ActorPoolBase):
                     message.args,
                     message.kwargs,
                     allocate_strategy=new_allocate_strategy,
+                    from_main=True,
                     protocol=message.protocol,
                     message_trace=message.message_trace,
                 )
@@ -803,7 +963,7 @@ class MainActorPoolBase(ActorPoolBase):
         return ResultMessage(message.message_id, False, protocol=message.protocol)
 
     @implements(AbstractActorPool.destroy_actor)
-    async def destroy_actor(self, message: DestroyActorMessage) -> result_message_type:
+    async def destroy_actor(self, message: DestroyActorMessage) -> ResultMessageType:
         actor_ref_message = ActorRefMessage(
             message.message_id, message.actor_ref, protocol=message.protocol
         )
@@ -812,7 +972,9 @@ class MainActorPoolBase(ActorPoolBase):
             return result
         real_actor_ref = result.result
         if real_actor_ref.address == self.external_address:
-            await super().destroy_actor(message)
+            result = await super().destroy_actor(message)
+            if result.message_type == MessageType.error:
+                return result
             del self._allocated_actors[self.external_address][real_actor_ref]
             return ResultMessage(
                 message.message_id, real_actor_ref.uid, protocol=message.protocol
@@ -828,7 +990,7 @@ class MainActorPoolBase(ActorPoolBase):
         return await self.call(real_actor_ref.address, new_destroy_message)
 
     @implements(AbstractActorPool.send)
-    async def send(self, message: SendMessage) -> result_message_type:
+    async def send(self, message: SendMessage) -> ResultMessageType:
         if message.actor_ref.uid in self._actors:
             return await super().send(message)
         actor_ref_message = ActorRefMessage(
@@ -848,7 +1010,7 @@ class MainActorPoolBase(ActorPoolBase):
         return await self.call(actor_ref.address, new_send_message)
 
     @implements(AbstractActorPool.tell)
-    async def tell(self, message: TellMessage) -> result_message_type:
+    async def tell(self, message: TellMessage) -> ResultMessageType:
         if message.actor_ref.uid in self._actors:
             return await super().tell(message)
         actor_ref_message = ActorRefMessage(
@@ -868,7 +1030,7 @@ class MainActorPoolBase(ActorPoolBase):
         return await self.call(actor_ref.address, new_tell_message)
 
     @implements(AbstractActorPool.actor_ref)
-    async def actor_ref(self, message: ActorRefMessage) -> result_message_type:
+    async def actor_ref(self, message: ActorRefMessage) -> ResultMessageType:
         actor_ref = message.actor_ref
         actor_ref.uid = to_binary(actor_ref.uid)
         if actor_ref.address == self.external_address and actor_ref.uid in self._actors:
@@ -883,7 +1045,7 @@ class MainActorPoolBase(ActorPoolBase):
                 return ResultMessage(message.message_id, ref, protocol=message.protocol)
 
         with _ErrorProcessor(
-            message.message_id, protocol=message.protocol
+            self.external_address, message.message_id, protocol=message.protocol
         ) as processor:
             raise ActorNotExist(
                 f"Actor {actor_ref.uid} does not exist in {actor_ref.address}"
@@ -892,7 +1054,7 @@ class MainActorPoolBase(ActorPoolBase):
         return processor.result
 
     @implements(AbstractActorPool.cancel)
-    async def cancel(self, message: CancelMessage) -> result_message_type:
+    async def cancel(self, message: CancelMessage) -> ResultMessageType:
         if message.address == self.external_address:
             # local message
             return await super().cancel(message)
@@ -902,8 +1064,10 @@ class MainActorPoolBase(ActorPoolBase):
     @implements(AbstractActorPool.handle_control_command)
     async def handle_control_command(
         self, message: ControlMessage
-    ) -> result_message_type:
-        with _ErrorProcessor(message.message_id, message.protocol) as processor:
+    ) -> ResultMessageType:
+        with _ErrorProcessor(
+            self.external_address, message.message_id, message.protocol
+        ) as processor:
             if message.address == self.external_address:
                 if message.control_message_type == ControlMessageType.sync_config:
                     # sync config, need to notify all sub pools
@@ -911,7 +1075,7 @@ class MainActorPoolBase(ActorPoolBase):
                     for addr in self.sub_processes:
                         control_message = ControlMessage(
                             new_message_id(),
-                            addr,
+                            message.address,
                             message.control_message_type,
                             message.content,
                             protocol=message.protocol,
@@ -950,6 +1114,17 @@ class MainActorPoolBase(ActorPoolBase):
                 processor.result = ResultMessage(
                     message.message_id, True, protocol=message.protocol
                 )
+            elif message.control_message_type == ControlMessageType.add_sub_pool_actor:
+                address, allocate_strategy, create_message = message.content
+                create_message.from_main = True
+                ref = create_actor_ref(address, to_binary(create_message.actor_id))
+                self._allocated_actors[address][ref] = (
+                    allocate_strategy,
+                    create_message,
+                )
+                processor.result = ResultMessage(
+                    message.message_id, True, protocol=message.protocol
+                )
             else:
                 processor.result = await self.call(message.address, message)
         return processor.result
@@ -972,8 +1147,10 @@ class MainActorPoolBase(ActorPoolBase):
         if "process_index" not in config:
             config["process_index"] = actor_pool_config.get_process_indexes()[0]
         curr_process_index = config.get("process_index")
+        old_config_addresses = set(actor_pool_config.get_external_addresses())
 
         tasks = []
+        subpool_process_idxes = []
         # create sub actor pools
         n_sub_pool = actor_pool_config.n_pool - 1
         if n_sub_pool > 0:
@@ -987,8 +1164,15 @@ class MainActorPoolBase(ActorPoolBase):
                 await asyncio.sleep(0)
                 # await create_pool_task
                 tasks.append(create_pool_task)
+                subpool_process_idxes.append(process_index)
 
-        processes = await cls.wait_sub_pools_ready(tasks)
+        processes, ext_addresses = await cls.wait_sub_pools_ready(tasks)
+        if ext_addresses:
+            for process_index, ext_address in zip(subpool_process_idxes, ext_addresses):
+                actor_pool_config.reset_pool_external_address(
+                    process_index, ext_address
+                )
+
         # create main actor pool
         pool: MainActorPoolType = await super().create(config)
         addresses = actor_pool_config.get_external_addresses()[1:]
@@ -998,6 +1182,17 @@ class MainActorPoolBase(ActorPoolBase):
         ), f"addresses {addresses}, processes {processes}"
         for addr, proc in zip(addresses, processes):
             pool.attach_sub_process(addr, proc)
+
+        new_config_addresses = set(actor_pool_config.get_external_addresses())
+        if old_config_addresses != new_config_addresses:
+            control_message = ControlMessage(
+                message_id=new_message_id(),
+                address=pool.external_address,
+                control_message_type=ControlMessageType.sync_config,
+                content=actor_pool_config,
+            )
+            await pool.handle_control_command(control_message)
+
         return pool
 
     async def start_monitor(self):
@@ -1007,6 +1202,10 @@ class MainActorPoolBase(ActorPoolBase):
 
     @implements(AbstractActorPool.stop)
     async def stop(self):
+        global_router = Router.get_instance()
+        if global_router is not None:
+            global_router.remove_router(self._router)
+
         # turn off auto recover to avoid errors
         self._auto_recover = False
         self._stopped.set()
@@ -1068,7 +1267,7 @@ class MainActorPoolBase(ActorPoolBase):
             if timeout is None:
                 message = await self.call(address, stop_message)
                 if isinstance(message, ErrorMessage):  # pragma: no cover
-                    raise message.error.with_traceback(message.traceback)
+                    raise message.as_instanceof_cause()
             else:
                 call = asyncio.create_task(self.call(address, stop_message))
                 try:
@@ -1112,9 +1311,8 @@ class MainActorPoolBase(ActorPoolBase):
     async def monitor_sub_pools(self):
         try:
             while not self._stopped.is_set():
-                for address in self.sub_processes:
+                for address, process in self.sub_processes.items():
                     try:
-                        process = self.sub_processes[address]
                         recover_events_discovered = address in self._recover_events
                         if not await self.is_sub_pool_alive(
                             process
@@ -1179,10 +1377,10 @@ async def create_actor_pool(
         n_process = multiprocessing.cpu_count()
     if labels and len(labels) != n_process + 1:
         raise ValueError(
-            f"`labels` should be of size {n_process + 1}, " f"got {len(labels)}"
+            f"`labels` should be of size {n_process + 1}, got {len(labels)}"
         )
     if envs and len(envs) != n_process:
-        raise ValueError(f"`envs` should be of size {n_process}, " f"got {len(envs)}")
+        raise ValueError(f"`envs` should be of size {n_process}, got {len(envs)}")
     if auto_recover is True:
         auto_recover = "actor"
     if auto_recover not in ("actor", "process", False):
@@ -1198,10 +1396,13 @@ async def create_actor_pool(
         except ImportError:
             use_uvloop = False
 
+    modules = list(modules or []) + DEFAULT_MODULES
+
     external_addresses = pool_cls.get_external_addresses(
         address, n_process=n_process, ports=ports
     )
     actor_pool_config = ActorPoolConfig()
+    actor_pool_config.add_metric_configs(kwargs.get("metrics", {}))
     # add main config
     process_index_gen = pool_cls.process_index_gen(address)
     main_process_index = next(process_index_gen)

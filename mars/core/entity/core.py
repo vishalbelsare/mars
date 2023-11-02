@@ -23,7 +23,7 @@ from ..base import Base
 
 
 class EntityData(Base):
-    __slots__ = "__weakref__", "_siblings"
+    __slots__ = ("_siblings",)
     type_name = None
 
     # required fields
@@ -75,6 +75,11 @@ class EntityData(Base):
         )
 
         return Source(dot)
+
+    def _need_execution(self):  # pylint: disable=no-self-use
+        # some tileable may generate unknown meta,
+        # they need to be executed first
+        return False
 
 
 class Entity(Serializable):
@@ -139,6 +144,9 @@ class Entity(Serializable):
             object.__setattr__(self, key, value)
         except AttributeError:
             return setattr(self._data, key, value)
+
+    def _need_execution(self):
+        return self._data._need_execution()
 
 
 ENTITY_TYPE = (Entity, EntityData)

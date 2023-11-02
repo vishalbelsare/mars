@@ -15,6 +15,7 @@
 import os
 import tempfile
 
+import mars
 import numpy as np
 import pandas as pd
 import pytest
@@ -30,9 +31,12 @@ except ImportError:  # pragma: no cover
 
 from .... import dataframe as md
 from .... import tensor as mt
+from ....utils import pd_release_version
 from ...datasource.read_csv import DataFrameReadCSV
 from ...datasource.read_sql import DataFrameReadSQL
 from ...datasource.read_parquet import DataFrameReadParquet
+
+_allow_set_missing_list = pd_release_version[:2] >= (1, 1)
 
 
 @pytest.mark.parametrize("chunk_size", [2, (2, 3)])
@@ -289,6 +293,11 @@ def test_loc_getitem(setup):
     expected = raw2.loc[[]]
     pd.testing.assert_frame_equal(result, expected)
 
+    df = df2.loc[1:4]
+    result = df.execute().fetch()
+    expected = raw2.loc[1:4]
+    pd.testing.assert_frame_equal(result, expected)
+
     df = df2.loc[1:4, "b":"d"]
     result = df.execute().fetch()
     expected = raw2.loc[1:4, "b":"d"]
@@ -309,6 +318,10 @@ def test_loc_getitem(setup):
     result = df.execute().fetch()
     expected = raw2.loc[:, "b"]
     pd.testing.assert_series_equal(result, expected)
+    df = df2.loc[:, ["b", "a"]]
+    result = df.execute().fetch()
+    expected = raw2.loc[:, ["b", "a"]]
+    pd.testing.assert_frame_equal(result, expected)
 
     # 'b' is non-unique
     df = df3.loc[:, "b"]
@@ -330,6 +343,11 @@ def test_loc_getitem(setup):
 
     # label-based fancy index
     df = df2.loc[[3, 0, 1], ["c", "a", "d"]]
+    result = df.execute().fetch()
+    expected = raw2.loc[[3, 0, 1], ["c", "a", "d"]]
+    pd.testing.assert_frame_equal(result, expected)
+    df = df2[df2["a"] < 10]
+    df = df.loc[[3, 0, 1], ["c", "a", "d"]]
     result = df.execute().fetch()
     expected = raw2.loc[[3, 0, 1], ["c", "a", "d"]]
     pd.testing.assert_frame_equal(result, expected)
@@ -380,6 +398,7 @@ def test_loc_getitem(setup):
     pd.testing.assert_frame_equal(result, expected)
 
 
+@pytest.mark.pd_compat
 def test_dataframe_getitem(setup):
     data = pd.DataFrame(np.random.rand(10, 5), columns=["c1", "c2", "c3", "c4", "c5"])
     df = md.DataFrame(data, chunk_size=2)
@@ -478,6 +497,16 @@ def test_dataframe_getitem_bool(setup):
     r = df[(df["c1"] > 0.5).to_tensor()]
     result = r.execute().fetch()
     pd.testing.assert_frame_equal(result, data[data["c1"] > 0.5])
+
+    # test input data with unknown shape
+    data = pd.DataFrame(np.random.rand(10, 2), columns=["c1", "c2"])
+    mask_data = data[data["c2"] > 0.5]
+    df = md.DataFrame(data, chunk_size=2)
+    s = md.Series(mask_data["c1"] > 0.5, chunk_size=2)
+    df1 = df[df["c2"] > 0.5]
+    s._index_value = df1.index_value
+    r = df1[s]
+    pd.testing.assert_frame_equal(r.execute().fetch(), mask_data[mask_data["c1"] > 0.5])
 
 
 def test_dataframe_getitem_using_attr(setup):
@@ -631,6 +660,7 @@ def test_iat(setup):
     assert result == data.iloc[:, 2].iat[3]
 
 
+@pytest.mark.pd_compat
 def test_setitem(setup):
     data = pd.DataFrame(
         np.random.rand(10, 5),
@@ -663,7 +693,13 @@ def test_setitem(setup):
     df[["c11", "c12"]] = mt.tensor(data3, chunk_size=4)
 
     result = df.execute().fetch()
-    expected = data.copy()
+    if not _allow_set_missing_list:
+        expected = data.copy().reindex(
+            ["c" + str(i) for i in range(5)] + ["c10", "c11", "c12"],
+            axis=1,
+        )
+    else:
+        expected = data.copy()
     expected[["c0", "c2"]] = 1
     expected[["c1", "c10"]] = expected["c4"].mean()
     expected[["c11", "c12"]] = data3
@@ -692,6 +728,32 @@ def test_setitem(setup):
     result = df.execute().fetch()
     expected["b"] = pd.Series(np.arange(2, 12), index=pd.RangeIndex(1, 11))
     pd.testing.assert_frame_equal(result, expected)
+
+    # test set multiple item order
+    data = pd.DataFrame(
+        [list(range(5))] * 10,
+        columns=["cc" + str(i) for i in range(5)],
+        index=["i" + str(i) for i in range(10)],
+    )
+    df = md.DataFrame(data, chunk_size=3)
+    df2 = df.apply(
+        lambda x: x * 2,
+        axis=1,
+        result_type="expand",
+        dtypes=[np.int64, np.int64, np.int64, np.int64, np.int64],
+        output_type="dataframe",
+    )
+    columns = ["dd" + str(i) for i in range(5)]
+    columns[1] = "cc2"
+    columns[3] = "cc1"
+    columns[4] = "cc3"
+    df2.columns = columns
+    df[columns] = df2[columns]
+    result = df.execute().fetch()
+    df2 = data.apply(lambda x: x * 2)
+    df2.columns = columns
+    data[columns] = df2[columns]
+    pd.testing.assert_frame_equal(result, data)
 
 
 def test_reset_index_execution(setup):
@@ -859,8 +921,8 @@ def test_rename(setup):
     r = series.rename("new_series")
     pd.testing.assert_series_equal(r.execute().fetch(), raw.rename("new_series"))
 
-    r = series.rename(lambda x: 2 ** x)
-    pd.testing.assert_series_equal(r.execute().fetch(), raw.rename(lambda x: 2 ** x))
+    r = series.rename(lambda x: 2**x)
+    pd.testing.assert_series_equal(r.execute().fetch(), raw.rename(lambda x: 2**x))
 
     with pytest.raises(TypeError):
         series.name = {1: 10, 2: 20}
@@ -967,9 +1029,7 @@ def _wrap_execute_data_source_usecols(usecols, op_cls):
         result = ctx[op.outputs[0].key]
         if not isinstance(usecols, list):
             if not isinstance(result, pd.Series):
-                raise RuntimeError(
-                    "Out data should be a Series, " f"got {type(result)}"
-                )
+                raise RuntimeError(f"Out data should be a Series, got {type(result)}")
         elif len(result.columns) > len(usecols):
             params = dict(
                 (k, getattr(op, k, None))
@@ -999,6 +1059,8 @@ def _wrap_execute_data_source_mixed(limit, usecols, op_cls):
     return _execute_data_source
 
 
+@pytest.mark.skip_ray_dag  # operand_executors is not supported by ray backend.
+@pytest.mark.pd_compat
 def test_optimization(setup):
     import sqlalchemy as sa
 
@@ -1500,6 +1562,17 @@ def test_sample_execution(setup):
         r.execute().fetch(), raw_df.sample(10, weights=raw_df["c2"], random_state=rs)
     )
 
+    r = df.sample(10, weights=df["c2"], random_state=0)
+    pd.testing.assert_frame_equal(
+        r.execute().fetch(), raw_df.sample(10, weights=raw_df["c2"], random_state=0)
+    )
+
+    r = df.sample(10, weights=df["c2"], random_state=np.array([1, 2]))
+    pd.testing.assert_frame_equal(
+        r.execute().fetch(),
+        raw_df.sample(10, weights=raw_df["c2"], random_state=np.array([1, 2])),
+    )
+
     # test multinomial tile & execution
     df = md.DataFrame(raw_df, chunk_size=13)
     r1 = df.sample(10, replace=True, random_state=rs)
@@ -1513,6 +1586,26 @@ def test_sample_execution(setup):
     r1 = df.sample(frac=0.1, weights=df["c2"], always_multinomial=True, random_state=rs)
     r2 = df[:].sample(
         frac=0.1, weights=df["c2"], always_multinomial=True, random_state=rs
+    )
+    pd.testing.assert_frame_equal(r1.execute().fetch(), r2.execute().fetch())
+
+    r1 = df.sample(frac=0.1, weights=df["c2"], always_multinomial=True, random_state=0)
+    r2 = df[:].sample(
+        frac=0.1, weights=df["c2"], always_multinomial=True, random_state=0
+    )
+    pd.testing.assert_frame_equal(r1.execute().fetch(), r2.execute().fetch())
+
+    r1 = df.sample(
+        frac=0.1,
+        weights=df["c2"],
+        always_multinomial=True,
+        random_state=np.array([1, 2]),
+    )
+    r2 = df[:].sample(
+        frac=0.1,
+        weights=df["c2"],
+        always_multinomial=True,
+        random_state=np.array([1, 2]),
     )
     pd.testing.assert_frame_equal(r1.execute().fetch(), r2.execute().fetch())
 
@@ -1532,6 +1625,14 @@ def test_sample_execution(setup):
 
     r1 = df.sample(frac=0.1, weights=df["c2"], random_state=rs)
     r2 = df[:].sample(frac=0.1, weights=df["c2"], random_state=rs)
+    pd.testing.assert_frame_equal(r1.execute().fetch(), r2.execute().fetch())
+
+    r1 = df.sample(frac=0.1, weights=df["c2"], random_state=0)
+    r2 = df[:].sample(frac=0.1, weights=df["c2"], random_state=0)
+    pd.testing.assert_frame_equal(r1.execute().fetch(), r2.execute().fetch())
+
+    r1 = df.sample(frac=0.1, weights=df["c2"], random_state=np.array([1, 2]))
+    r2 = df[:].sample(frac=0.1, weights=df["c2"], random_state=np.array([1, 2]))
     pd.testing.assert_frame_equal(r1.execute().fetch(), r2.execute().fetch())
 
     # test series
@@ -1574,7 +1675,28 @@ def test_sample_execution(setup):
     pd.testing.assert_series_equal(r1.execute().fetch(), r2.execute().fetch())
 
 
-def test_add_prefix(setup):
+def test_loc_setitem(setup):
+    raw_df = pd.DataFrame({"a": [1, 2, 3, 4, 2, 4, 5, 7, 2, 8, 9], 1: [10] * 11})
+    md_data = md.DataFrame(raw_df, chunk_size=3)
+    md_data.loc[md_data["a"] <= 4, 1] = "v1"
+    pd_data = raw_df.copy(True)
+    pd_data.loc[pd_data["a"] <= 4, 1] = "v1"
+    pd.testing.assert_frame_equal(md_data.to_pandas(), pd_data)
+
+    md_data1 = md.DataFrame(raw_df, chunk_size=3)
+    md_data1.loc[1:3] = "v2"
+    pd_data1 = raw_df.copy(True)
+    pd_data1.loc[1:3] = "v2"
+    pd.testing.assert_frame_equal(md_data1.to_pandas(), pd_data1)
+
+    md_data2 = md.DataFrame(raw_df, chunk_size=3)
+    md_data2.loc[1:3, 1] = "v2"
+    pd_data2 = raw_df.copy(True)
+    pd_data2.loc[1:3, 1] = "v2"
+    pd.testing.assert_frame_equal(md_data2.to_pandas(), pd_data2)
+
+
+def test_add_prefix_suffix(setup):
     rs = np.random.RandomState(0)
     raw = pd.DataFrame(rs.rand(10, 4), columns=["A", "B", "C", "D"])
     df = md.DataFrame(raw, chunk_size=3)
@@ -1582,8 +1704,148 @@ def test_add_prefix(setup):
     r = df.add_prefix("col_")
     pd.testing.assert_frame_equal(r.execute().fetch(), raw.add_prefix("col_"))
 
+    r = df.add_suffix("_col")
+    pd.testing.assert_frame_equal(r.execute().fetch(), raw.add_suffix("_col"))
+
     raw = pd.Series(rs.rand(10), name="series")
     series = md.Series(raw, chunk_size=3)
 
     r = series.add_prefix("item_")
     pd.testing.assert_series_equal(r.execute().fetch(), raw.add_prefix("item_"))
+
+    r = series.add_suffix("_item")
+    pd.testing.assert_series_equal(r.execute().fetch(), raw.add_suffix("_item"))
+
+
+@pytest.mark.parametrize("join", ["outer", "left"])
+def test_align_execution(setup, join):
+    rs = np.random.RandomState(0)
+    raw_df1 = pd.DataFrame(
+        rs.rand(10, 10), columns=list("ABCDEFGHIJ"), index=pd.RangeIndex(10)
+    )
+    raw_df2 = pd.DataFrame(
+        rs.rand(10, 10),
+        columns=list("ACDFGIJKLM"),
+        index=[2, 3, 6, 7, 8, 9, 10, 13, 15, 17],
+    )
+    raw_s1 = pd.Series(rs.rand(10), index=[2, 3, 6, 7, 8, 9, 10, 13, 15, 17])
+    raw_s2 = pd.Series(rs.rand(10), index=pd.RangeIndex(10))
+    raw_s3 = raw_s4 = raw_df2.iloc[0, :]
+    raw_s5 = raw_df1.iloc[0, :]
+
+    df1 = md.DataFrame(raw_df1, chunk_size=5)
+    df2 = md.DataFrame(raw_df2, chunk_size=4)
+    s1 = md.Series(raw_s1, chunk_size=4)
+    s2 = md.Series(raw_s2, chunk_size=4)
+    s3 = md.Series(raw_s3, chunk_size=4)
+    s4 = df2.iloc[0, :]
+    s5 = df1.iloc[0, :]
+
+    # test dataframe vs dataframe
+    r1, r2 = mars.fetch(
+        mars.execute(*df1.align(df1, join=join), extra_config={"check_nsplits": False})
+    )
+    pd.testing.assert_frame_equal(r1, raw_df1)
+    pd.testing.assert_frame_equal(r2, raw_df1)
+
+    r1, r2 = mars.fetch(
+        mars.execute(*df1.align(df2, join=join), extra_config={"check_nsplits": False})
+    )
+    exp1, exp2 = raw_df1.align(raw_df2, join=join)
+    pd.testing.assert_frame_equal(r1, exp1)
+    pd.testing.assert_frame_equal(r2, exp2)
+
+    r1, r2 = mars.fetch(
+        mars.execute(
+            *df1.align(df2, join=join, axis=0), extra_config={"check_nsplits": False}
+        )
+    )
+    exp1, exp2 = raw_df1.align(raw_df2, join=join, axis=0)
+    pd.testing.assert_frame_equal(r1.sort_index(axis=1), exp1)
+    pd.testing.assert_frame_equal(r2.sort_index(axis=1), exp2)
+
+    r2, r1 = mars.fetch(
+        mars.execute(
+            *df2.align(df1, join=join, axis=0, fill_value=0.0),
+            extra_config={"check_nsplits": False},
+        )
+    )
+    exp2, exp1 = raw_df2.align(raw_df1, join=join, axis=0, fill_value=0.0)
+    pd.testing.assert_frame_equal(r1.sort_index(axis=1), exp1)
+    pd.testing.assert_frame_equal(r2.sort_index(axis=1), exp2)
+
+    r1, r2 = mars.fetch(
+        mars.execute(
+            *df1.align(df2, join=join, axis=1), extra_config={"check_nsplits": False}
+        )
+    )
+    exp1, exp2 = raw_df1.align(raw_df2, join=join, axis=1)
+    pd.testing.assert_frame_equal(r1.sort_index(), exp1)
+    pd.testing.assert_frame_equal(r2.sort_index(), exp2)
+
+    # test dataframe vs series
+    with pytest.raises(ValueError):
+        # must specify align axis
+        df1.align(s1)
+
+    r1, r2 = mars.fetch(
+        mars.execute(
+            *df1.align(s1, join=join, axis=0, method="ffill"),
+            extra_config={"check_nsplits": False},
+        )
+    )
+    exp1, exp2 = raw_df1.align(raw_s1, join=join, axis=0, method="ffill")
+    pd.testing.assert_frame_equal(r1.sort_index(), exp1)
+    pd.testing.assert_series_equal(r2.sort_index(), exp2)
+
+    r1, r2 = mars.fetch(
+        mars.execute(
+            *df1.align(s1, join=join, axis=0, broadcast_axis=1),
+            extra_config={"check_nsplits": False},
+        )
+    )
+    exp1, exp2 = raw_df1.align(raw_s1, join=join, axis=0, broadcast_axis=1)
+    pd.testing.assert_frame_equal(r1.sort_index(), exp1)
+    pd.testing.assert_frame_equal(r2.sort_index(), exp2)
+
+    r1, r2 = mars.fetch(
+        mars.execute(
+            *df1.align(s3, join=join, axis=1), extra_config={"check_nsplits": False}
+        )
+    )
+    exp1, exp2 = raw_df1.align(raw_s3, join=join, axis=1)
+    pd.testing.assert_frame_equal(r1.sort_index(axis=1), exp1)
+    pd.testing.assert_series_equal(r2.sort_index(), exp2)
+
+    r1, r2 = mars.fetch(
+        mars.execute(
+            *df1.align(s4, join=join, axis=1), extra_config={"check_nsplits": False}
+        )
+    )
+    exp1, exp2 = raw_df1.align(raw_s4, join=join, axis=1)
+    pd.testing.assert_frame_equal(r1.sort_index(axis=1), exp1)
+    pd.testing.assert_series_equal(r2.sort_index(), exp2)
+
+    r1, r2 = mars.fetch(
+        mars.execute(
+            *s1.align(df1, join=join, axis=0), extra_config={"check_nsplits": False}
+        )
+    )
+    exp1, exp2 = raw_s1.align(raw_df1, join=join, axis=0)
+    pd.testing.assert_series_equal(r1.sort_index(), exp1)
+    pd.testing.assert_frame_equal(r2.sort_index(), exp2)
+
+    # test series vs series
+    r1, r2 = mars.fetch(
+        mars.execute(*s1.align(s2, join=join), extra_config={"check_nsplits": False})
+    )
+    exp1, exp2 = raw_s1.align(raw_s2, join=join)
+    pd.testing.assert_series_equal(r1.sort_index(), exp1)
+    pd.testing.assert_series_equal(r2.sort_index(), exp2)
+
+    r1, r2 = mars.fetch(
+        mars.execute(*s4.align(s5, join=join), extra_config={"check_nsplits": False})
+    )
+    exp1, exp2 = raw_s4.align(raw_s5, join=join)
+    pd.testing.assert_series_equal(r1.sort_index(), exp1)
+    pd.testing.assert_series_equal(r2.sort_index(), exp2)

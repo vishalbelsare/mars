@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import asyncio
-import functools
 import inspect
 import textwrap
 from collections import namedtuple
@@ -82,6 +81,7 @@ class _ExtensibleCallable:
     func: Callable
     batch_func: Optional[Callable]
     is_async: bool
+    has_single_func: bool
 
     def __call__(self, *args, **kwargs):
         if self.is_async:
@@ -91,20 +91,26 @@ class _ExtensibleCallable:
 
     async def _async_call(self, *args, **kwargs):
         try:
-            return await self.func(*args, **kwargs)
+            if self.has_single_func:
+                return await self.func(*args, **kwargs)
         except NotImplementedError:
-            if self.batch_func:
-                ret = await self.batch_func([args], [kwargs])
-                return None if ret is None else ret[0]
-            raise
+            self.has_single_func = False
+
+        if self.batch_func is not None:
+            ret = await self.batch_func([args], [kwargs])
+            return None if ret is None else ret[0]
+        raise NotImplementedError
 
     def _sync_call(self, *args, **kwargs):
         try:
-            return self.func(*args, **kwargs)
+            if self.has_single_func:
+                return self.func(*args, **kwargs)
         except NotImplementedError:
-            if self.batch_func:
-                return self.batch_func([args], [kwargs])[0]
-            raise
+            self.has_single_func = False
+
+        if self.batch_func is not None:
+            return self.batch_func([args], [kwargs])[0]
+        raise NotImplementedError
 
 
 class _ExtensibleWrapper(_ExtensibleCallable):
@@ -119,6 +125,7 @@ class _ExtensibleWrapper(_ExtensibleCallable):
         self.batch_func = batch_func
         self.bind_func = bind_func
         self.is_async = is_async
+        self.has_single_func = True
 
     @staticmethod
     def delay(*args, **kwargs):
@@ -126,22 +133,25 @@ class _ExtensibleWrapper(_ExtensibleCallable):
 
     @staticmethod
     def _gen_args_kwargs_list(delays):
-        args_list = list()
-        kwargs_list = list()
-        for delay in delays:
-            args_list.append(delay.args)
-            kwargs_list.append(delay.kwargs)
+        args_list = [delay.args for delay in delays]
+        kwargs_list = [delay.kwargs for delay in delays]
         return args_list, kwargs_list
 
-    async def _async_batch(self, *delays):
-        if self.batch_func:
-            args_list, kwargs_list = self._gen_args_kwargs_list(delays)
+    async def _async_batch(self, args_list, kwargs_list):
+        # when there is only one call in batch, calling one-pass method
+        # will be more efficient
+        if len(args_list) == 0:
+            return []
+        elif len(args_list) == 1:
+            return [await self._async_call(*args_list[0], **kwargs_list[0])]
+        elif self.batch_func:
             return await self.batch_func(args_list, kwargs_list)
         else:
             # this function has no batch implementation
             # call it separately
             tasks = [
-                asyncio.create_task(self.func(*d.args, **d.kwargs)) for d in delays
+                asyncio.create_task(self.func(*args, **kwargs))
+                for args, kwargs in zip(args_list, kwargs_list)
             ]
             try:
                 return await asyncio.gather(*tasks)
@@ -149,20 +159,28 @@ class _ExtensibleWrapper(_ExtensibleCallable):
                 _ = [task.cancel() for task in tasks]
                 return await asyncio.gather(*tasks)
 
-    def _sync_batch(self, *delays):
-        if self.batch_func:
-            args_list, kwargs_list = self._gen_args_kwargs_list(delays)
+    def _sync_batch(self, args_list, kwargs_list):
+        if len(args_list) == 0:
+            return []
+        elif self.batch_func:
             return self.batch_func(args_list, kwargs_list)
         else:
             # this function has no batch implementation
             # call it separately
-            return [self.func(*d.args, **d.kwargs) for d in delays]
+            return [
+                self.func(*args, **kwargs)
+                for args, kwargs in zip(args_list, kwargs_list)
+            ]
 
     def batch(self, *delays):
+        args_list, kwargs_list = self._gen_args_kwargs_list(delays)
+        return self.call_with_lists(args_list, kwargs_list)
+
+    def call_with_lists(self, args_list, kwargs_list):
         if self.is_async:
-            return self._async_batch(*delays)
+            return self._async_batch(args_list, kwargs_list)
         else:
-            return self._sync_batch(*delays)
+            return self._sync_batch(args_list, kwargs_list)
 
     def bind(self, *args, **kwargs):
         if self.bind_func is None:
@@ -179,12 +197,12 @@ class _ExtensibleAccessor(_ExtensibleCallable):
         self.batch_func = None
         self.bind_func = build_args_binder(func, remove_self=True)
         self.is_async = asyncio.iscoroutinefunction(self.func)
+        self.has_single_func = True
 
     def batch(self, func: Callable):
         self.batch_func = func
         return self
 
-    @functools.lru_cache(1000)
     def __get__(self, instance, owner):
         if instance is None:
             # calling from class

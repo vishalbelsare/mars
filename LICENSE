@@ -127,7 +127,7 @@ Copyright 1999-2021 Alibaba Group Holding Ltd.
       may provide additional or different license terms and conditions
       for use, reproduction, or distribution of Your modifications, or
       for any such Derivative Works as a whole, provided Your use,
-      reproduction, and distribution of the Work otherwise complies with
+      reproduction, and distribution of the Work otherwise compiles with
       the conditions stated in this License.
 
    5. Submission of Contributions. Unless You explicitly state otherwise,
@@ -259,6 +259,8 @@ MIT License
 - sqlalchemy:1.4.0
 - async-lru:1.0.2
 - setuptools:55.0.0
+- bloom-filter2:2.0
+- ordered-set:4.1.0
 - react:17.0.0
 - react-dom:17.0.0
 - react-router-dom:5.2.0
@@ -267,6 +269,7 @@ MIT License
 - dagre-d3:0.6.4
 - cytoscape:3.19.1
 - cytoscape-dagre:2.3.2
+- tqdm:4.60.0
 
 
 ISC License

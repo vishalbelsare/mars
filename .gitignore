@@ -10,6 +10,7 @@
 *.egg
 *.egg-info
 dist
+wheelhouse
 build/
 eggs
 parts
@@ -67,6 +68,9 @@ test*.ipynb
 *.log
 *.swp
 
+# nfs temp file
+.nfs*
+
 # docs
 *.mo
 docs/**/generated
@@ -82,9 +86,16 @@ mars/learn/cluster/*.c*
 mars/learn/utils/*.c*
 mars/lib/*.c*
 mars/oscar/**/*.c*
+mars/serialization/*.c*
 
 # web bundle file
 mars/services/web/static
 
 # docs
 docs/source/savefig/
+
+# Unit / Performance Testing #
+##############################
+benchmarks/asv_bench/env/
+benchmarks/asv_bench/html/
+benchmarks/asv_bench/results/

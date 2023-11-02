@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_list_like
@@ -20,10 +21,14 @@ from ... import opcodes
 from ...core import OutputType, recursive_tile
 from ...serialization.serializables import KeyField, AnyField
 from ...tensor.core import TENSOR_TYPE
+from ...utils import pd_release_version
 from ..core import DATAFRAME_TYPE, SERIES_TYPE, DataFrame
 from ..initializer import DataFrame as asframe, Series as asseries
 from ..operands import DataFrameOperand, DataFrameOperandMixin
-from ..utils import parse_index
+from ..utils import parse_index, is_index_value_identical
+
+# in pandas 1.0.x, __setitem__ with a list with missing items are not allowed
+_allow_set_missing_list = pd_release_version[:2] >= (1, 1)
 
 
 class DataFrameSetitem(DataFrameOperand, DataFrameOperandMixin):
@@ -39,7 +44,7 @@ class DataFrameSetitem(DataFrameOperand, DataFrameOperandMixin):
             _indexes=indexes,
             _value=value,
             _output_types=output_types,
-            **kw
+            **kw,
         )
         if self.output_types is None:
             self.output_types = [OutputType.dataframe]
@@ -139,14 +144,17 @@ class DataFrameSetitem(DataFrameOperand, DataFrameOperandMixin):
 
     @classmethod
     def tile(cls, op: "DataFrameSetitem"):
+        from ..merge.concat import DataFrameConcat
+
         out = op.outputs[0]
         target = op.target
         value = op.value
         indexes = op.indexes
         columns = target.columns_value.to_pandas()
+        last_column_index = target.chunk_shape[1] - 1
         is_value_scalar = np.isscalar(value) or cls._is_scalar_tensor(value)
         has_multiple_cols = getattr(out.dtypes[indexes], "ndim", 0) > 0
-        target_index_to_value = dict()
+        target_index_to_value_index = collections.defaultdict(list)
 
         if has_multiple_cols:
             append_cols = [c for c in indexes if c not in columns]
@@ -157,16 +165,7 @@ class DataFrameSetitem(DataFrameOperand, DataFrameOperandMixin):
             rechunk_arg = {}
 
             # check if all chunk's index_value are identical
-            target_chunk_index_values = [
-                c.index_value for c in target.chunks if c.index[1] == 0
-            ]
-            value_chunk_index_values = [v.index_value for v in value.chunks]
-            is_identical = len(target_chunk_index_values) == len(
-                target_chunk_index_values
-            ) and all(
-                c.key == v.key
-                for c, v in zip(target_chunk_index_values, value_chunk_index_values)
-            )
+            is_identical = is_index_value_identical(target, value)
             if not is_identical:
                 # do rechunk
                 if any(np.isnan(s) for s in target.nsplits[0]) or any(
@@ -177,31 +176,54 @@ class DataFrameSetitem(DataFrameOperand, DataFrameOperandMixin):
                 rechunk_arg[0] = target.nsplits[0]
 
             if isinstance(value, DATAFRAME_TYPE):
-                # rechunk in column dim given distribution of indexes in target chunks
-                col_nsplits = []
-                for head_chunk in target.cix[0, :]:
-                    new_indexes = [vc for vc in indexes if vc in head_chunk.dtypes]
-                    if new_indexes:
-                        target_index_to_value[head_chunk.index[1]] = len(col_nsplits)
-                        col_nsplits.append(len(new_indexes))
+                if len(append_cols) < len(indexes):
+                    # rechunk in column dim given distribution of indexes in target chunks
+                    target_col_to_chunk_index = {
+                        col: head_chunk.index[1]
+                        for head_chunk in target.cix[0, :]
+                        for col in head_chunk.dtypes.keys()
+                    }
+                    value_chunk_indexes = [
+                        target_col_to_chunk_index.get(vc, None) for vc in indexes
+                    ]
+                    col_nsplits = []
+                    last_cidx = value_chunk_indexes[0]
+                    match_idxes = []
+                    for cidx, idx in zip(value_chunk_indexes, indexes):
+                        if cidx != last_cidx:
+                            target_index_to_value_index[last_cidx].append(
+                                len(col_nsplits)
+                            )
+                            col_nsplits.append(len(match_idxes))
+                            last_cidx = cidx
+                            match_idxes = [idx]
+                        else:
+                            match_idxes.append(idx)
+                    target_index_to_value_index[last_cidx].append(len(col_nsplits))
+                    col_nsplits.append(len(match_idxes))
 
-                if not col_nsplits:
-                    # purely new chunks, just update last column of chunks
-                    target_index_to_value[target.chunk_shape[1] - 1] = 0
-                    col_nsplits = [len(append_cols)]
+                    # merge last column indexes and keep column order
+                    last_value_index = target_index_to_value_index.pop(
+                        last_column_index, []
+                    )
+                    append_value_index = target_index_to_value_index.pop(None, [])
+                    target_index_to_value_index[None] = (
+                        last_value_index + append_value_index
+                    )
+
+                    rechunk_arg[1] = col_nsplits
                 else:
-                    col_nsplits[-1] += len(append_cols)
-                rechunk_arg[1] = col_nsplits
+                    target_index_to_value_index[None] = [0]
+                    rechunk_arg[1] = [len(append_cols)]
 
             if rechunk_arg:
                 value = yield from recursive_tile(value.rechunk(rechunk_arg))
 
         out_chunks = []
         nsplits = [list(ns) for ns in target.nsplits]
-
         nsplits[1][-1] += len(append_cols)
+        nsplits = tuple(tuple(ns) for ns in nsplits)
 
-        column_chunk_shape = target.chunk_shape[1]
         for c in target.chunks:
             result_chunk = c
 
@@ -210,7 +232,7 @@ class DataFrameSetitem(DataFrameOperand, DataFrameOperandMixin):
             else:
                 new_indexes = [indexes] if indexes in c.dtypes else []
 
-            if c.index[-1] == column_chunk_shape - 1:
+            if c.index[-1] == last_column_index:
                 new_indexes.extend(append_cols)
 
             if new_indexes:
@@ -225,36 +247,52 @@ class DataFrameSetitem(DataFrameOperand, DataFrameOperandMixin):
                 else:
                     # get proper chunk from value chunks
                     if has_multiple_cols:
-                        value_chunk = value.cix[
-                            c.index[0], target_index_to_value[c.index[1]]
-                        ]
+                        value_chunks = []
+                        target_index = (
+                            None if c.index[-1] == last_column_index else c.index[1]
+                        )
+                        for value_index in target_index_to_value_index[target_index]:
+                            value_chunk = value.cix[c.index[0], value_index]
+                            value_chunks.append(value_chunk)
+                        if len(value_chunks) == 1:
+                            value_chunk = value_chunks[0]
+                        else:
+                            # concat multiple columns by order
+                            shape = (
+                                value_chunks[0].shape[0],
+                                sum(c.shape[1] for c in value_chunks),
+                            )
+                            dtypes = pd.concat([c.dtypes for c in value_chunks])
+                            concat_op = DataFrameConcat(output_types=op.output_types)
+                            value_chunk = concat_op.new_chunk(
+                                value_chunks, shape=shape, dtypes=dtypes
+                            )
                     else:
-                        value_chunk = value.cix[
-                            c.index[0],
-                        ]
+                        value_chunk = value.cix[c.index[0],]
 
                     chunk_inputs = [c, value_chunk]
 
-                dtypes, shape, columns_value = c.dtypes, c.shape, c.columns_value
-
-                if append_cols and c.index[-1] == column_chunk_shape - 1:
+                shape = c.shape
+                if append_cols and c.index[-1] == last_column_index:
                     # some columns appended at the last column of chunks
                     shape = (shape[0], shape[1] + len(append_cols))
-                    dtypes = pd.concat([dtypes, out.dtypes.iloc[-len(append_cols) :]])
-                    columns_value = parse_index(dtypes.index, store_data=True)
 
                 result_chunk = chunk_op.new_chunk(
                     chunk_inputs,
                     shape=shape,
-                    dtypes=dtypes,
-                    index_value=c.index_value,
-                    columns_value=columns_value,
                     index=c.index,
+                )
+                result_chunk._set_tileable_meta(
+                    tileable_key=out.key,
+                    nsplits=nsplits,
+                    index_value=out.index_value,
+                    columns_value=out.columns_value,
+                    dtypes=out.dtypes,
                 )
             out_chunks.append(result_chunk)
 
         params = out.params
-        params["nsplits"] = tuple(tuple(ns) for ns in nsplits)
+        params["nsplits"] = nsplits
         params["chunks"] = out_chunks
         new_op = op.copy()
         return new_op.new_tileables(op.inputs, kws=[params])
@@ -266,9 +304,29 @@ class DataFrameSetitem(DataFrameOperand, DataFrameOperandMixin):
 
     @classmethod
     def execute(cls, ctx, op: "DataFrameSetitem"):
-        target = ctx[op.target.key].copy()
+        target = ctx[op.target.key]
+        # only deep copy when updating
+        indexes = (
+            (op.indexes,)
+            if not isinstance(op.indexes, (tuple, list, set))
+            else op.indexes
+        )
+        deep = bool(set(indexes) & set(target.columns))
+        target = ctx[op.target.key].copy(deep=deep)
         value = ctx[op.value.key] if not np.isscalar(op.value) else op.value
-        target[op.indexes] = value
+        try:
+            target[op.indexes] = value
+        except KeyError:
+            if _allow_set_missing_list:  # pragma: no cover
+                raise
+            else:
+                existing = set(target.columns)
+                new_columns = target.columns.append(
+                    pd.Index([idx for idx in op.indexes if idx not in existing])
+                )
+                target = target.reindex(new_columns, axis=1)
+                target[op.indexes] = value
+
         ctx[op.outputs[0].key] = target
 
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import itertools
 import operator
 from dataclasses import dataclass
@@ -21,12 +22,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from .... import tensor as mt
 from ....core import OutputType, OperandType, tile
 from ....core.operand import OperandStage
 from ....utils import dataslots
 from ...align import DataFrameIndexAlign, DataFrameShuffleProxy
 from ...core import IndexValue
 from ...datasource.dataframe import from_pandas, DataFrameDataSource
+from ...datasource.from_tensor import dataframe_from_tensor
 from ...datasource.series import from_pandas as from_pandas_series, SeriesDataSource
 from ...utils import hash_dtypes
 from ...utils import (
@@ -173,10 +176,10 @@ def test_without_shuffle(func_name, func_opts):
     pd.testing.assert_index_equal(
         df3.columns_value.to_pandas(), func_opts.func(data1, data2).columns
     )
-    assert df3.columns_value.should_be_monotonic is True
     assert isinstance(df3.index_value.value, IndexValue.Int64Index)
-    assert df3.index_value.should_be_monotonic is True
-    pd.testing.assert_index_equal(df3.index_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df3.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df3.index_value.key != df1.index_value.key
     assert df3.index_value.key != df2.index_value.key
     assert df3.shape[1] == 11  # columns is recorded, so we can get it
@@ -187,10 +190,10 @@ def test_without_shuffle(func_name, func_opts):
     pd.testing.assert_index_equal(
         df3.columns_value.to_pandas(), func_opts.func(data1, data2).columns
     )
-    assert df3.columns_value.should_be_monotonic is True
     assert isinstance(df3.index_value.value, IndexValue.Int64Index)
-    assert df3.index_value.should_be_monotonic is True
-    pd.testing.assert_index_equal(df3.index_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df3.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df3.index_value.key != df1.index_value.key
     assert df3.index_value.key != df2.index_value.key
     assert df3.shape[1] == 11  # columns is recorded, so we can get it
@@ -408,9 +411,10 @@ def test_dataframe_and_series_with_shuffle(func_name, func_opts):
     # test df2's index and columns
     assert df2.shape == (df1.shape[0], np.nan)
     assert df2.index_value.key == df1.index_value.key
-    pd.testing.assert_index_equal(df2.columns_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df2.columns_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df2.columns_value.key != df1.columns_value.key
-    assert df2.columns_value.should_be_monotonic is True
 
     df1, df2, s1 = tile(df1, df2, s1)
 
@@ -602,8 +606,9 @@ def test_series_and_series_with_shuffle(func_name, func_opts):
     assert s3.shape == (np.nan,)
     assert s3.index_value.key != s1.index_value.key
     assert s3.index_value.key != s2.index_value.key
-    pd.testing.assert_index_equal(s3.index_value.to_pandas(), pd.Int64Index([]))
-    assert s3.index_value.should_be_monotonic is True
+    pd.testing.assert_index_equal(
+        s3.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
 
     s1, s2, s3 = tile(s1, s2, s3)
 
@@ -662,9 +667,7 @@ def test_identical_index_and_columns(func_name, func_opts):
     pd.testing.assert_index_equal(
         df3.columns_value.to_pandas(), func_opts.func(data1, data2).columns
     )
-    assert df3.columns_value.should_be_monotonic is False
     assert isinstance(df3.index_value.value, IndexValue.RangeIndex)
-    assert df3.index_value.should_be_monotonic is False
     pd.testing.assert_index_equal(df3.index_value.to_pandas(), pd.RangeIndex(0, 10))
     assert df3.index_value.key == df1.index_value.key
     assert df3.index_value.key == df2.index_value.key
@@ -723,10 +726,10 @@ def test_with_one_shuffle(func_name, func_opts):
     pd.testing.assert_index_equal(
         df3.columns_value.to_pandas(), func_opts.func(data1, data2).columns
     )
-    assert df3.columns_value.should_be_monotonic is True
     assert isinstance(df3.index_value.value, IndexValue.Int64Index)
-    assert df3.index_value.should_be_monotonic is True
-    pd.testing.assert_index_equal(df3.index_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df3.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df3.index_value.key != df1.index_value.key
     assert df3.index_value.key != df2.index_value.key
     assert df3.shape[1] == 12  # columns is recorded, so we can get it
@@ -855,10 +858,10 @@ def test_with_all_shuffle(func_name, func_opts):
     pd.testing.assert_index_equal(
         df3.columns_value.to_pandas(), func_opts.func(data1, data2).columns
     )
-    assert df3.columns_value.should_be_monotonic is True
     assert isinstance(df3.index_value.value, IndexValue.Int64Index)
-    assert df3.index_value.should_be_monotonic is True
-    pd.testing.assert_index_equal(df3.index_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df3.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df3.index_value.key != df1.index_value.key
     assert df3.index_value.key != df2.index_value.key
     assert df3.shape[1] == 12  # columns is recorded, so we can get it
@@ -955,10 +958,10 @@ def test_with_all_shuffle(func_name, func_opts):
     pd.testing.assert_index_equal(
         df6.columns_value.to_pandas(), func_opts.func(data4, data5).columns
     )
-    assert df6.columns_value.should_be_monotonic is True
     assert isinstance(df6.index_value.value, IndexValue.Int64Index)
-    assert df6.index_value.should_be_monotonic is True
-    pd.testing.assert_index_equal(df6.index_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df6.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df6.index_value.key != df4.index_value.key
     assert df6.index_value.key != df5.index_value.key
     assert df6.shape[1] == 20  # columns is recorded, so we can get it
@@ -1060,10 +1063,10 @@ def test_without_shuffle_and_with_one_chunk(func_name, func_opts):
     pd.testing.assert_index_equal(
         df3.columns_value.to_pandas(), func_opts.func(data1, data2).columns
     )
-    assert df3.columns_value.should_be_monotonic is True
     assert isinstance(df3.index_value.value, IndexValue.Int64Index)
-    assert df3.index_value.should_be_monotonic is True
-    pd.testing.assert_index_equal(df3.index_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df3.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df3.index_value.key != df1.index_value.key
     assert df3.index_value.key != df2.index_value.key
     assert df3.shape[1] == 12  # columns is recorded, so we can get it
@@ -1172,10 +1175,10 @@ def test_both_one_chunk(func_name, func_opts):
     pd.testing.assert_index_equal(
         df3.columns_value.to_pandas(), func_opts.func(data1, data2).columns
     )
-    assert df3.columns_value.should_be_monotonic is True
     assert isinstance(df3.index_value.value, IndexValue.Int64Index)
-    assert df3.index_value.should_be_monotonic is True
-    pd.testing.assert_index_equal(df3.index_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df3.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df3.index_value.key != df1.index_value.key
     assert df3.index_value.key != df2.index_value.key
     assert df3.shape[1] == 12  # columns is recorded, so we can get it
@@ -1216,10 +1219,10 @@ def test_with_shuffle_and_one_chunk(func_name, func_opts):
     pd.testing.assert_index_equal(
         df3.columns_value.to_pandas(), func_opts.func(data1, data2).columns
     )
-    assert df3.columns_value.should_be_monotonic is True
     assert isinstance(df3.index_value.value, IndexValue.Int64Index)
-    assert df3.index_value.should_be_monotonic is True
-    pd.testing.assert_index_equal(df3.index_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df3.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df3.index_value.key != df1.index_value.key
     assert df3.index_value.key != df2.index_value.key
     assert df3.shape[1] == 12  # columns is recorded, so we can get it
@@ -1309,10 +1312,10 @@ def test_on_same_dataframe(func_name, func_opts):
     pd.testing.assert_index_equal(
         df2.columns_value.to_pandas(), func_opts.func(data, data).columns
     )
-    assert df2.columns_value.should_be_monotonic is False
     assert isinstance(df2.index_value.value, IndexValue.Int64Index)
-    assert df2.index_value.should_be_monotonic is False
-    pd.testing.assert_index_equal(df2.index_value.to_pandas(), pd.Int64Index([]))
+    pd.testing.assert_index_equal(
+        df2.index_value.to_pandas(), pd.Index([], dtype=np.int64)
+    )
     assert df2.index_value.key == df.index_value.key
     assert df2.columns_value.key == df.columns_value.key
     assert df2.shape[1] == 10
@@ -1512,3 +1515,36 @@ def test_not():
         pd.testing.assert_index_equal(
             c2.index_value.to_pandas(), c1.index_value.to_pandas()
         )
+
+
+def test_arithmetic_lazy_chunk_meta():
+    df = dataframe_from_tensor(mt.random.rand(10, 3, chunk_size=3))
+    df2 = df + 1
+    df2 = tile(df2)
+
+    chunk = df2.chunks[0].data
+    assert chunk._FIELDS["_dtypes"].get(chunk) is None
+    pd.testing.assert_series_equal(chunk.dtypes, df.dtypes)
+    assert chunk._FIELDS["_dtypes"].get(chunk) is not None
+    assert chunk._FIELDS["_index_value"].get(chunk) is None
+    pd.testing.assert_index_equal(chunk.index_value.to_pandas(), pd.RangeIndex(3))
+    assert chunk._FIELDS["_index_value"].get(chunk) is not None
+    assert chunk._FIELDS["_columns_value"].get(chunk) is None
+    pd.testing.assert_index_equal(chunk.columns_value.to_pandas(), pd.RangeIndex(3))
+    assert chunk._FIELDS["_columns_value"].get(chunk) is not None
+
+
+def test_datetime_arithmetic():
+    data1 = (
+        pd.Series([pd.Timedelta(days=d) for d in range(10)]) + datetime.datetime.now()
+    )
+    s1 = from_pandas_series(data1)
+
+    assert (s1 + pd.Timedelta(days=10)).dtype == (data1 + pd.Timedelta(days=10)).dtype
+    assert (s1 + datetime.timedelta(days=10)).dtype == (
+        data1 + datetime.timedelta(days=10)
+    ).dtype
+    assert (s1 - pd.Timestamp.now()).dtype == (data1 - pd.Timestamp.now()).dtype
+    assert (s1 - datetime.datetime.now()).dtype == (
+        data1 - datetime.datetime.now()
+    ).dtype

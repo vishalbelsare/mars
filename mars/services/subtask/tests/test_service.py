@@ -22,6 +22,7 @@ from .... import oscar as mo
 from .... import tensor as mt
 from .... import remote as mr
 from ....core.graph import TileableGraph, TileableGraphBuilder, ChunkGraphBuilder
+from ....resource import Resource
 from ....utils import Timer
 from ... import start_services, stop_services, NodeRole
 from ...meta import MetaAPI
@@ -62,9 +63,11 @@ async def actor_pools():
         await pool.start()
         return pool
 
-    sv_pool, worker_pool = await asyncio.gather(start_pool(False), start_pool(True))
-    yield sv_pool, worker_pool
-    await asyncio.gather(sv_pool.stop(), worker_pool.stop())
+    try:
+        sv_pool, worker_pool = await asyncio.gather(start_pool(False), start_pool(True))
+        yield sv_pool, worker_pool
+    finally:
+        await asyncio.gather(sv_pool.stop(), worker_pool.stop())
 
 
 @pytest.mark.asyncio
@@ -85,7 +88,7 @@ async def test_subtask_service(actor_pools):
         "cluster": {
             "backend": "fixed",
             "lookup_address": sv_pool.external_address,
-            "resource": {"numa-0": 2},
+            "resource": {"numa-0": Resource(num_cpus=2)},
         },
         "meta": {"store": "dict"},
         "scheduling": {},
@@ -117,6 +120,7 @@ async def test_subtask_service(actor_pools):
     b = a + 1
 
     subtask = _gen_subtask(b, session_id)
+    assert "TensorAdd" in repr(subtask)
     await subtask_api.run_subtask_in_slot("numa-0", 0, subtask)
 
     # check storage

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
 import pandas as pd
 
 from ... import opcodes as OperandDef
@@ -27,14 +28,10 @@ from .psrs import DataFramePSRSOperandMixin, execute_sort_values
 class DataFrameSortValues(DataFrameSortOperand, DataFramePSRSOperandMixin):
     _op_type_ = OperandDef.SORT_VALUES
 
-    _by = ListField("by")
+    by = ListField("by", default=None)
 
-    def __init__(self, by=None, output_types=None, **kw):
-        super().__init__(_by=by, _output_types=output_types, **kw)
-
-    @property
-    def by(self):
-        return self._by
+    def __init__(self, output_types=None, **kw):
+        super().__init__(_output_types=output_types, **kw)
 
     @classmethod
     def _tile_dataframe(cls, op):
@@ -94,7 +91,11 @@ class DataFrameSortValues(DataFrameSortOperand, DataFramePSRSOperandMixin):
 
     @classmethod
     def _tile(cls, op):
-        if op.inputs[0].ndim == 2:
+        inp = op.inputs[0]
+        if inp.shape[op.axis] == 0:
+            # if the length is zero, return input directly
+            return inp
+        if inp.ndim == 2:
             return (yield from cls._tile_dataframe(op))
         else:
             return (yield from cls._tile_series(op))
@@ -113,7 +114,7 @@ class DataFrameSortValues(DataFrameSortOperand, DataFramePSRSOperandMixin):
             index_value = parse_index(pd.RangeIndex(a.shape[0]))
         else:
             if isinstance(a.index_value.value, IndexValue.RangeIndex):
-                index_value = parse_index(pd.Int64Index([]))
+                index_value = parse_index(pd.Index([], dtype=np.int64))
             else:
                 index_value = a.index_value
         if a.ndim == 2:
@@ -247,6 +248,13 @@ def dataframe_sort_values(
         raise NotImplementedError("Only support sort on axis 0")
     psrs_kinds = _validate_sort_psrs_kinds(psrs_kinds)
     by = by if isinstance(by, (list, tuple)) else [by]
+    if isinstance(ascending, list):  # pragma: no cover
+        if all(ascending):
+            # all are True, convert to True
+            ascending = True
+        elif not any(ascending):
+            # all are False, convert to False
+            ascending = False
     op = DataFrameSortValues(
         by=by,
         axis=axis,

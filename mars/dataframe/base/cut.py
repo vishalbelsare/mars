@@ -21,6 +21,7 @@ import pandas as pd
 from ... import opcodes as OperandDef
 from ...core import ENTITY_TYPE, ExecutableTuple, OutputType, recursive_tile
 from ...core.context import get_context
+from ...lib.version import parse as parse_version
 from ...serialization.serializables import (
     KeyField,
     AnyField,
@@ -49,6 +50,7 @@ class DataFrameCut(DataFrameOperand, DataFrameOperandMixin):
     _precision = Int32Field("precision")
     _include_lowest = BoolField("include_lowest")
     _duplicates = StringField("duplicates")
+    _ordered = BoolField("ordered")
 
     def __init__(
         self,
@@ -59,6 +61,7 @@ class DataFrameCut(DataFrameOperand, DataFrameOperandMixin):
         precision=None,
         include_lowest=None,
         duplicates=None,
+        ordered=None,
         **kw
     ):
         super().__init__(
@@ -69,6 +72,7 @@ class DataFrameCut(DataFrameOperand, DataFrameOperandMixin):
             _precision=precision,
             _include_lowest=include_lowest,
             _duplicates=duplicates,
+            _ordered=ordered,
             **kw
         )
 
@@ -103,6 +107,10 @@ class DataFrameCut(DataFrameOperand, DataFrameOperandMixin):
     @property
     def duplicates(self):
         return self._duplicates
+
+    @property
+    def ordered(self):
+        return self._ordered
 
     @property
     def output_limit(self):
@@ -256,7 +264,8 @@ class DataFrameCut(DataFrameOperand, DataFrameOperandMixin):
             input_max_chunk = input_max.chunks[0]
 
             # let input min and max execute first
-            yield [input_min_chunk, input_max_chunk]
+            min_max_chunks = [input_min_chunk, input_max_chunk]
+            yield min_max_chunks + [c for inp in op.inputs for c in inp.chunks]
 
             ctx = get_context()
             keys = [input_min_chunk.key, input_max_chunk.key]
@@ -265,7 +274,7 @@ class DataFrameCut(DataFrameOperand, DataFrameOperandMixin):
             # calculate bins
             if np.isinf(min_val) or np.isinf(max_val):
                 raise ValueError(
-                    "cannot specify integer `bins` " "when input data contains infinity"
+                    "cannot specify integer `bins` when input data contains infinity"
                 )
             elif min_val == max_val:  # adjust end points before binning
                 min_val -= 0.001 * abs(min_val) if min_val != 0 else 0.001
@@ -361,14 +370,25 @@ class DataFrameCut(DataFrameOperand, DataFrameOperandMixin):
         bins = ctx[op.bins.key] if isinstance(op.bins, ENTITY_TYPE) else op.bins
         labels = ctx[op.labels.key] if isinstance(op.labels, ENTITY_TYPE) else op.labels
 
-        cut = partial(
-            pd.cut,
-            right=op.right,
-            retbins=op.retbins,
-            precision=op.precision,
-            include_lowest=op.include_lowest,
-            duplicates=op.duplicates,
-        )
+        if parse_version(pd.__version__) >= parse_version("1.1.0"):
+            cut = partial(
+                pd.cut,
+                right=op.right,
+                retbins=op.retbins,
+                precision=op.precision,
+                include_lowest=op.include_lowest,
+                duplicates=op.duplicates,
+                ordered=op.ordered,
+            )
+        else:
+            cut = partial(
+                pd.cut,
+                right=op.right,
+                retbins=op.retbins,
+                precision=op.precision,
+                include_lowest=op.include_lowest,
+                duplicates=op.duplicates,
+            )
         try:
             ret = cut(x, bins, labels=labels)
         except ValueError:
@@ -390,6 +410,7 @@ def cut(
     precision: int = 3,
     include_lowest: bool = False,
     duplicates: str = "raise",
+    ordered: bool = True,
 ):
     """
     Bin values into discrete intervals.
@@ -435,6 +456,11 @@ def cut(
         Whether the first interval should be left-inclusive or not.
     duplicates : {default 'raise', 'drop'}, optional
         If bin edges are not unique, raise ValueError or drop non-uniques.
+    ordered : bool, default True
+        Whether the labels are ordered or not. Applies to returned types
+        Categorical and Series (with Categorical dtype). If True, the resulting
+        categorical will be ordered. If False, the resulting categorical will be
+        unordered (labels must be provided).
 
     Returns
     -------
@@ -497,6 +523,14 @@ def cut(
     ...        3, labels=["bad", "medium", "good"]).execute()
     [bad, good, medium, medium, good, bad]
     Categories (3, object): [bad < medium < good]
+
+    ordered=False will result in unordered categories when labels are passed. This parameter
+    can be used to allow non-unique labels:
+
+    >>> md.cut(np.array([1, 7, 5, 4, 6, 3]), 3,
+    ...        labels=["B", "A", "B"], ordered=False).execute()
+    ['B', 'B', 'A', 'A', 'B', 'B']
+    Categories (2, object): ['A', 'B']
 
     ``labels=False`` implies you just want the bins back.
 
@@ -565,6 +599,7 @@ def cut(
         precision=precision,
         include_lowest=include_lowest,
         duplicates=duplicates,
+        ordered=ordered,
     )
     ret = op(x)
     if not retbins:

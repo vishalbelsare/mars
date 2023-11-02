@@ -21,7 +21,7 @@ from weakref import WeakSet, WeakKeyDictionary
 
 import numpy as np
 
-from ...serialization.serializables import FieldTypes, TupleField
+from ...serialization.serializables import FieldTypes, BoolField, TupleField
 from ...typing import OperandType, TileableType, ChunkType
 from ...utils import on_serialize_shape, on_deserialize_shape, on_serialize_nsplits
 from ..base import Base
@@ -88,7 +88,7 @@ class OperandTilesHandler:
         tiled_results = [t.data if hasattr(t, "data") else t for t in tiled_result]
         assert len(tileables) == len(tiled_results)
         if any(inspect.isgenerator(r) for r in tiled_results):  # pragma: no cover
-            raise TypeError(f"tiled result cannot be generator " f"when tiling {op}")
+            raise TypeError(f"tiled result cannot be generator when tiling {op}")
         cls._assign_to(tiled_results, tileables)
         return tileables
 
@@ -270,9 +270,11 @@ class TileableData(EntityData, _ExecutableMixin):
     # `nsplits` means the sizes of chunks for each dimension
     _nsplits = TupleField(
         "nsplits",
-        FieldTypes.tuple(FieldTypes.uint64),
+        FieldTypes.tuple(FieldTypes.tuple(FieldTypes.uint64)),
         on_serialize=on_serialize_nsplits,
     )
+    # cache tileable data, if true, this data will be materialized
+    cache = BoolField("cache", default=False)
 
     def __init__(self: TileableType, *args, **kwargs):
         if kwargs.get("_nsplits", None) is not None:
@@ -286,7 +288,11 @@ class TileableData(EntityData, _ExecutableMixin):
                 self._chunks = sorted(chunks, key=attrgetter("index"))
         except AttributeError:  # pragma: no cover
             pass
+        self._entities = WeakSet()
+        self._executed_sessions = []
 
+    def __on_deserialize__(self):
+        super(TileableData, self).__on_deserialize__()
         self._entities = WeakSet()
         self._executed_sessions = []
 
@@ -343,8 +349,6 @@ class TileableData(EntityData, _ExecutableMixin):
 
 
 class Tileable(Entity):
-    __slots__ = ("__weakref__",)
-
     def __init__(self, data: TileableType = None, **kw):
         super().__init__(data=data, **kw)
         data = self._data

@@ -39,7 +39,7 @@ class TensorRepeat(TensorHasInput, TensorOperandMixin):
     _axis = Int32Field("axis")
 
     def __init__(self, axis=None, dtype=None, sparse=False, **kw):
-        super().__init__(_axis=axis, _dtype=dtype, _sparse=sparse, **kw)
+        super().__init__(_axis=axis, dtype=dtype, sparse=sparse, **kw)
 
     @property
     def repeats(self):
@@ -133,9 +133,7 @@ class TensorRepeat(TensorHasInput, TensorOperandMixin):
                 rp = repeats[start:stop]
                 size = int(rp.sum())
             elif not isinstance(repeats, Integral):
-                rp = repeats.cix[
-                    ax_idx,
-                ]
+                rp = repeats.cix[ax_idx,]
                 size = np.nan
             else:
                 rp = repeats

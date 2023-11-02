@@ -17,7 +17,7 @@ import pytest
 from sklearn.metrics import pairwise_distances as sk_pairwise_distances
 from sklearn.neighbors import NearestNeighbors as SkNearestNeighbors
 from sklearn.exceptions import DataConversionWarning
-from sklearn.utils._testing import assert_warns
+
 
 from ..... import tensor as mt
 from .....session import execute, fetch
@@ -47,7 +47,7 @@ def test_pairwise_distances_execution(setup):
     weight = np.random.rand(5)
     d = pairwise_distances(x, y, metric="wminkowski", p=3, w=weight)
     result = d.execute().fetch()
-    expected = sk_pairwise_distances(raw_x, raw_y, metric="wminkowski", p=3, w=weight)
+    expected = sk_pairwise_distances(raw_x, raw_y, metric="minkowski", p=3, w=weight)
     np.testing.assert_almost_equal(result, expected)
 
     # test pdist
@@ -63,7 +63,8 @@ def test_pairwise_distances_execution(setup):
     expected = sk_pairwise_distances(raw_x, raw_y, metric=m)
     np.testing.assert_almost_equal(result, expected)
 
-    assert_warns(DataConversionWarning, pairwise_distances, x, y, metric="jaccard")
+    with pytest.warns(DataConversionWarning):
+        pairwise_distances(x, y, metric="jaccard")
 
     with pytest.raises(ValueError):
         _ = pairwise_distances(x, y, metric="unknown")

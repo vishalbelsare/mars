@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import asyncio
+from dataclasses import dataclass
 from typing import Tuple, Union, Type
 
-from ...utils import to_binary
+from ...utils import to_binary, dataslots
 from ..api import Actor
-from ..core import ActorRef
+from ..core import ActorRef, create_local_actor_ref
 from ..context import BaseActorContext
 from ..debug import debug_async_timeout, detect_cycle_send
 from ..errors import CannotCancelTask
@@ -42,13 +43,19 @@ from .message import (
 from .router import Router
 
 
+@dataslots
+@dataclass
+class ProfilingContext:
+    task_id: str
+
+
 class MarsActorContext(BaseActorContext):
-    __slots__ = "_address", "_caller"
+    __slots__ = ("_caller",)
 
     support_allocate_strategy = True
 
     def __init__(self, address: str = None):
-        self._address = address
+        BaseActorContext.__init__(self, address)
         self._caller = ActorCaller()
 
     def __del__(self):
@@ -66,17 +73,19 @@ class MarsActorContext(BaseActorContext):
         if isinstance(message, ResultMessage):
             return message.result
         else:
-            raise message.error.with_traceback(message.traceback)
+            raise message.as_instanceof_cause()
 
     async def _wait(self, future: asyncio.Future, address: str, message: _MessageBase):
         try:
-            await asyncio.wait([future])
+            await asyncio.shield(future)
         except asyncio.CancelledError:
             try:
                 await self.cancel(address, message.message_id)
             except CannotCancelTask:
                 # cancel failed, already finished
                 raise asyncio.CancelledError
+        except:  # noqa: E722  # nosec  # pylint: disable=bare-except
+            pass
         return await future
 
     async def create_actor(
@@ -147,6 +156,9 @@ class MarsActorContext(BaseActorContext):
 
     async def actor_ref(self, *args, **kwargs):
         actor_ref = create_actor_ref(*args, **kwargs)
+        local_actor_ref = create_local_actor_ref(actor_ref.address, actor_ref.uid)
+        if local_actor_ref is not None:
+            return local_actor_ref
         message = ActorRefMessage(
             new_message_id(), actor_ref, protocol=DEFAULT_PROTOCOL
         )
@@ -155,15 +167,24 @@ class MarsActorContext(BaseActorContext):
         return self._process_result_message(result)
 
     async def send(
-        self, actor_ref: ActorRef, message: Tuple, wait_response: bool = True
+        self,
+        actor_ref: ActorRef,
+        message: Tuple,
+        wait_response: bool = True,
+        profiling_context: ProfilingContext = None,
     ):
         message = SendMessage(
-            new_message_id(), actor_ref, message, protocol=DEFAULT_PROTOCOL
+            new_message_id(),
+            actor_ref,
+            message,
+            protocol=DEFAULT_PROTOCOL,
+            profiling_context=profiling_context,
         )
 
+        # use `%.500` to avoid print too long messages
         with debug_async_timeout(
             "actor_call_timeout",
-            "Calling %r on %s at %s timed out",
+            "Calling %.500r on %s at %s timed out",
             message.content,
             actor_ref.uid,
             actor_ref.address,
@@ -209,3 +230,13 @@ class MarsActorContext(BaseActorContext):
             protocol=DEFAULT_PROTOCOL,
         )
         self._process_result_message(await self._call(main_address, control_message))
+
+    async def get_pool_config(self, address: str):
+        control_message = ControlMessage(
+            new_message_id(),
+            address,
+            ControlMessageType.get_config,
+            None,
+            protocol=DEFAULT_PROTOCOL,
+        )
+        return self._process_result_message(await self._call(address, control_message))

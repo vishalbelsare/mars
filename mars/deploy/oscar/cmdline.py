@@ -18,6 +18,7 @@ import faulthandler
 import glob
 import importlib
 import json
+import logging.config
 import os
 import sys
 import tempfile
@@ -25,18 +26,12 @@ from typing import List
 
 import psutil
 
+from ...utils import ensure_coverage
 from ..utils import load_service_config_file, get_third_party_modules_from_config
 
+logger = logging.getLogger(__name__)
 _is_windows: bool = sys.platform.startswith("win")
-
-# make sure coverage is handled when starting with subprocess.Popen
-if not _is_windows and "COV_CORE_SOURCE" in os.environ:  # pragma: no cover
-    try:
-        from pytest_cov.embed import cleanup_on_sigterm
-    except ImportError:
-        pass
-    else:
-        cleanup_on_sigterm()
+ensure_coverage()
 
 
 class OscarCommandRunner:
@@ -62,7 +57,7 @@ class OscarCommandRunner:
         parser.add_argument(
             "-p",
             "--ports",
-            help="ports of the service, must equal to" "num of processes",
+            help="ports of the service, must equal to num of processes",
         )
         parser.add_argument("-c", "--config", help="service configuration")
         parser.add_argument(
@@ -81,33 +76,37 @@ class OscarCommandRunner:
             "--log-conf", help="log config file, logging.conf by default"
         )
         parser.add_argument("--load-modules", nargs="*", help="modules to import")
-        parser.add_argument("--use-uvloop", help="use uvloop, auto by default")
+        parser.add_argument(
+            "--use-uvloop", help="use uvloop, 'auto' by default. Use 'no' to disable"
+        )
 
-    def config_logging(self):
-        import logging.config
+    def _get_logging_config_paths(self):
         import mars
 
         log_conf = self.args.log_conf or "logging.conf"
 
-        conf_file_paths = [
-            "",
-            os.path.abspath("."),
-            os.path.dirname(os.path.dirname(mars.__file__)),
+        return [
+            log_conf,
+            os.path.join(os.path.abspath("."), log_conf),
+            os.path.join(os.path.dirname(os.path.dirname(mars.__file__)), log_conf),
         ]
-        for path in conf_file_paths:
-            conf_path = os.path.join(path, log_conf) if path else log_conf
+
+    def config_logging(self):
+        for conf_path in self._get_logging_config_paths():
             if os.path.exists(conf_path):
                 self.logging_conf["file"] = conf_path
                 logging.config.fileConfig(conf_path, disable_existing_loggers=False)
+                logger.debug("Use logging config file at %s", conf_path)
                 break
         else:
             log_level = self.args.log_level
             level = getattr(logging, log_level.upper()) if log_level else logging.INFO
+            logging.getLogger("__main__").setLevel(level)
             logging.getLogger("mars").setLevel(level)
-            logging.basicConfig(format=self.args.log_format)
-            self.logging_conf.update(
-                {"level": log_level, "format": self.args.log_format}
-            )
+            self.logging_conf["level"] = level
+            if self.args.log_format:
+                logging.basicConfig(format=self.args.log_format)
+                self.logging_conf["format"] = self.args.log_format
 
     @classmethod
     def _build_endpoint_file_path(cls, pid: int = None, asterisk: bool = False):
@@ -219,8 +218,8 @@ class OscarCommandRunner:
         raise NotImplementedError
 
     def create_loop(self):
-        use_uvloop = self.args.use_uvloop
-        if not use_uvloop:
+        use_uvloop = self.args.use_uvloop.strip()
+        if use_uvloop in ("0", "no"):
             loop = asyncio.get_event_loop()
         else:
             try:

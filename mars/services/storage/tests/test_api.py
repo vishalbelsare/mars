@@ -17,6 +17,7 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from .... import oscar as mo
@@ -25,21 +26,15 @@ from ....core import tile
 from ....serialization import AioDeserializer, AioSerializer
 from ....storage import StorageLevel
 from ....tests.core import require_ray
-from ....utils import get_next_port
+from ....utils import get_next_port, lazy_import
 from ...cluster import MockClusterAPI
 from ...meta import MockMetaAPI
 from ...session import MockSessionAPI
 from ...web import WebActor
 from ..api import MockStorageAPI, WebStorageAPI
 
-try:
-    import vineyard
-except ImportError:
-    vineyard = None
-try:
-    import ray
-except ImportError:
-    ray = None
+ray = lazy_import("ray")
+vineyard = lazy_import("vineyard")
 
 require_lib = lambda x: x
 storage_configs = []
@@ -53,7 +48,7 @@ else:
 plasma_setup_params = dict(
     store_memory=plasma_storage_size, plasma_directory=plasma_dir, check_dir_size=False
 )
-if not sys.platform.lower().startswith("win"):
+if not (sys.platform.lower().startswith("win") or pa.__version__ >= "12.0.0"):
     storage_configs.append({"plasma": plasma_setup_params})
 
 # ray backend

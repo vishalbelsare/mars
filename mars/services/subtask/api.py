@@ -14,6 +14,8 @@
 
 from ... import oscar as mo
 from ...lib.aio import alru_cache
+from ...oscar.backends.context import ProfilingContext
+from ...oscar.profiling import MARS_ENABLE_PROFILING
 from .core import Subtask
 
 
@@ -56,7 +58,16 @@ class SubtaskAPI:
 
         """
         ref = await self._get_runner_ref(band_name, slot_id)
-        return await ref.run_subtask(subtask)
+        extra_config = subtask.extra_config
+        enable_profiling = MARS_ENABLE_PROFILING or (
+            extra_config and extra_config.get("enable_profiling")
+        )
+        profiling_context = (
+            ProfilingContext(task_id=subtask.task_id) if enable_profiling else None
+        )
+        return await ref.run_subtask.options(profiling_context=profiling_context).send(
+            subtask
+        )
 
     async def cancel_subtask_in_slot(self, band_name: str, slot_id: int):
         """

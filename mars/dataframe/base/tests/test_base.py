@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import List, Union
 
 import numpy as np
 import pandas as pd
@@ -18,7 +19,13 @@ import pytest
 
 from .... import opcodes
 from ....config import options, option_context
-from ....core import OutputType, tile
+from ....core import OutputType, tile, Tileable
+from ....core.graph import (
+    TileableGraph,
+    TileableGraphBuilder,
+    TileContext,
+    ChunkGraphBuilder,
+)
 from ....core.operand import OperandStage
 from ....tensor.core import TENSOR_TYPE
 from ... import eval as mars_eval, cut, get_dummies, to_numeric
@@ -29,11 +36,28 @@ from ...core import (
     INDEX_TYPE,
     CATEGORICAL_TYPE,
     CATEGORICAL_CHUNK_TYPE,
+    DataFrameData,
+    SeriesData,
 )
 from ...datasource.dataframe import from_pandas as from_pandas_df
 from ...datasource.series import from_pandas as from_pandas_series
 from ...datasource.index import from_pandas as from_pandas_index
 from .. import to_gpu, to_cpu, astype
+
+
+def _get_df_after_tile(
+    tileables: List[Tileable],
+) -> List[Union[DataFrameData, SeriesData]]:
+    graph = TileableGraph(tileables)
+    next(TileableGraphBuilder(graph).build())
+    context = TileContext()
+    chunk_graph_builder = ChunkGraphBuilder(
+        graph, fuse_enabled=False, tile_context=context
+    )
+    chunk_graph_builder = chunk_graph_builder.build()
+    for _ in chunk_graph_builder:
+        pass
+    return [context[df] for df in tileables]
 
 
 def test_to_gpu():
@@ -51,7 +75,7 @@ def test_to_gpu():
     assert cdf.op.gpu is True
     pd.testing.assert_series_equal(df.dtypes, cdf.dtypes)
 
-    df, cdf = tile(df, cdf)
+    df, cdf = _get_df_after_tile([df.data, cdf.data])
 
     assert df.nsplits == cdf.nsplits
     assert df.chunks[0].index_value == cdf.chunks[0].index_value
@@ -69,7 +93,7 @@ def test_to_gpu():
     assert series.index_value == cseries.index_value
     assert cseries.op.gpu is True
 
-    series, cseries = tile(series, cseries)
+    series, cseries = _get_df_after_tile([series.data, cseries.data])
 
     assert series.nsplits == cseries.nsplits
     assert series.chunks[0].index_value == cseries.chunks[0].index_value
@@ -93,7 +117,7 @@ def test_to_cpu():
     assert df2.op.gpu is False
     pd.testing.assert_series_equal(df.dtypes, df2.dtypes)
 
-    df, df2 = tile(df, df2)
+    df, df2 = _get_df_after_tile([df.data, df2.data])
 
     assert df.nsplits == df2.nsplits
     assert df.chunks[0].index_value == df2.chunks[0].index_value
@@ -105,6 +129,8 @@ def test_to_cpu():
 
 
 def test_rechunk():
+    from ...merge.concat import DataFrameConcat
+
     raw = pd.DataFrame(np.random.rand(10, 10))
     df = from_pandas_df(raw, chunk_size=3)
     df2 = tile(df.rechunk(4))
@@ -202,6 +228,7 @@ def test_rechunk():
     assert series2.shape == (10,)
     assert len(series2.chunks) == 10
     pd.testing.assert_index_equal(series2.index_value.to_pandas(), pd.RangeIndex(10))
+    assert not any(isinstance(c.op, DataFrameConcat) for c in series2.chunks)
 
     assert series2.chunk_shape == (10,)
     assert series2.nsplits == ((1,) * 10,)
@@ -217,9 +244,9 @@ def test_rechunk():
     assert series2.nsplits == series.nsplits
 
 
-def test_data_frame_apply():
+def test_dataframe_apply():
     cols = [chr(ord("A") + i) for i in range(10)]
-    df_raw = pd.DataFrame(dict((c, [i ** 2 for i in range(20)]) for c in cols))
+    df_raw = pd.DataFrame(dict((c, [i**2 for i in range(20)]) for c in cols))
 
     old_chunk_store_limit = options.chunk_store_limit
     try:
@@ -231,6 +258,10 @@ def test_data_frame_apply():
             assert len(v) > 2
             return v.sort_values()
 
+        def df_series_func_with_err(v):
+            assert len(v) > 2
+            return 0
+
         with pytest.raises(TypeError):
             df.apply(df_func_with_err)
 
@@ -238,6 +269,15 @@ def test_data_frame_apply():
         assert r.shape == (np.nan, df.shape[-1])
         assert r.op._op_type_ == opcodes.APPLY
         assert r.op.output_types[0] == OutputType.dataframe
+        assert r.op.elementwise is False
+
+        r = df.apply(
+            df_series_func_with_err, output_type="series", dtype=object, name="output"
+        )
+        assert r.dtype == np.dtype("O")
+        assert r.shape == (df.shape[-1],)
+        assert r.op._op_type_ == opcodes.APPLY
+        assert r.op.output_types[0] == OutputType.series
         assert r.op.elementwise is False
 
         r = df.apply("ffill")
@@ -328,7 +368,7 @@ def test_data_frame_apply():
 
 def test_series_apply():
     idxes = [chr(ord("A") + i) for i in range(20)]
-    s_raw = pd.Series([i ** 2 for i in range(20)], index=idxes)
+    s_raw = pd.Series([i**2 for i in range(20)], index=idxes)
 
     series = from_pandas_series(s_raw, chunk_size=5)
 
@@ -376,6 +416,12 @@ def test_series_apply():
     pd.testing.assert_series_equal(r.dtypes, dtypes)
     assert r.shape == (2, 3)
 
+    def apply_with_error(_):
+        raise ValueError
+
+    r = series.apply(apply_with_error, output_type="dataframe", dtypes=dtypes)
+    assert r.ndim == 2
+
     r = series.apply(
         pd.Series, output_type="dataframe", dtypes=dtypes, index=pd.RangeIndex(2)
     )
@@ -393,11 +439,11 @@ def test_series_apply():
 
 def test_transform():
     cols = [chr(ord("A") + i) for i in range(10)]
-    df_raw = pd.DataFrame(dict((c, [i ** 2 for i in range(20)]) for c in cols))
+    df_raw = pd.DataFrame(dict((c, [i**2 for i in range(20)]) for c in cols))
     df = from_pandas_df(df_raw, chunk_size=5)
 
     idxes = [chr(ord("A") + i) for i in range(20)]
-    s_raw = pd.Series([i ** 2 for i in range(20)], index=idxes)
+    s_raw = pd.Series([i**2 for i in range(20)], index=idxes)
     series = from_pandas_series(s_raw, chunk_size=5)
 
     def rename_fn(f, new_name):
@@ -655,6 +701,8 @@ def test_datetime_method():
         assert c.shape == (2,) if i == 0 else (1,)
 
     with pytest.raises(AttributeError):
+        _ = from_pandas_series(pd.Series([1])).dt
+    with pytest.raises(AttributeError):
         _ = series.dt.non_exist
 
     assert "ceil" in dir(series.dt)
@@ -675,39 +723,39 @@ def test_series_isin():
         assert c.op.inputs[0].index == (i,)
         assert c.op.inputs[0].shape == (10,)
         assert c.op.inputs[1].index == (0,)
-        assert c.op.inputs[1].shape == (4,)  # has been rechunked
+        assert c.op.inputs[1].shape == (10,)
 
     # multiple chunk in one chunks
-    a = from_pandas_series(pd.Series([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), chunk_size=2)
+    a = from_pandas_series(pd.Series([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), chunk_size=5)
     b = from_pandas_series(pd.Series([2, 1, 9, 3]), chunk_size=4)
 
     r = tile(a.isin(b))
     for i, c in enumerate(r.chunks):
         assert c.index == (i,)
         assert c.dtype == np.dtype("bool")
-        assert c.shape == (2,)
+        assert c.shape == (5,)
         assert len(c.op.inputs) == 2
         assert c.op.output_types[0] == OutputType.series
         assert c.op.inputs[0].index == (i,)
-        assert c.op.inputs[0].shape == (2,)
+        assert c.op.inputs[0].shape == (5,)
         assert c.op.inputs[1].index == (0,)
         assert c.op.inputs[1].shape == (4,)
 
     # multiple chunk in multiple chunks
-    a = from_pandas_series(pd.Series([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), chunk_size=2)
+    a = from_pandas_series(pd.Series([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), chunk_size=5)
     b = from_pandas_series(pd.Series([2, 1, 9, 3]), chunk_size=2)
 
     r = tile(a.isin(b))
     for i, c in enumerate(r.chunks):
         assert c.index == (i,)
         assert c.dtype == np.dtype("bool")
-        assert c.shape == (2,)
+        assert c.shape == (5,)
         assert len(c.op.inputs) == 2
         assert c.op.output_types[0] == OutputType.series
         assert c.op.inputs[0].index == (i,)
-        assert c.op.inputs[0].shape == (2,)
-        assert c.op.inputs[1].index == (0,)
-        assert c.op.inputs[1].shape == (4,)  # has been rechunked
+        assert c.op.inputs[0].shape == (5,)
+        assert c.op.inputs[1].index == (i,)
+        assert c.op.inputs[1].shape == (5,)
 
     with pytest.raises(TypeError):
         _ = a.isin("sth")

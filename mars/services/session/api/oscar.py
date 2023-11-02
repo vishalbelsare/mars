@@ -25,7 +25,7 @@ from .core import AbstractSessionAPI
 
 class SessionAPI(AbstractSessionAPI):
     def __init__(
-        self, address: str, session_manager: Union[SessionManagerActor, mo.ActorRef]
+        self, address: str, session_manager: mo.ActorRefType[SessionManagerActor]
     ):
         self._address = address
         self._session_manager_ref = session_manager
@@ -34,9 +34,7 @@ class SessionAPI(AbstractSessionAPI):
     @alru_cache(cache_exceptions=False)
     async def create(cls, address: str, **kwargs) -> "SessionAPI":
         if kwargs:  # pragma: no cover
-            raise TypeError(
-                f"SessionAPI.create " f"got unknown arguments: {list(kwargs)}"
-            )
+            raise TypeError(f"SessionAPI.create got unknown arguments: {list(kwargs)}")
         session_manager = await mo.actor_ref(address, SessionManagerActor.default_uid())
         return SessionAPI(address, session_manager)
 
@@ -65,6 +63,9 @@ class SessionAPI(AbstractSessionAPI):
     async def delete_session(self, session_id: str):
         await self._session_manager_ref.delete_session(session_id)
 
+    async def delete_all_sessions(self):
+        await self._session_manager_ref.delete_all_sessions()
+
     @alru_cache(cache_exceptions=False)
     async def get_session_address(self, session_id: str) -> str:
         """
@@ -88,9 +89,7 @@ class SessionAPI(AbstractSessionAPI):
         return await self._session_manager_ref.get_last_idle_time(session_id)
 
     @alru_cache(cache_exceptions=False)
-    async def _get_session_ref(
-        self, session_id: str
-    ) -> Union[SessionActor, mo.ActorRef]:
+    async def _get_session_ref(self, session_id: str) -> mo.ActorRefType[SessionActor]:
         return await self._session_manager_ref.get_session_ref(session_id)
 
     async def create_remote_object(
@@ -110,7 +109,7 @@ class SessionAPI(AbstractSessionAPI):
     @alru_cache(cache_exceptions=False)
     async def _get_custom_log_meta_ref(
         self, session_id: str
-    ) -> Union[CustomLogMetaActor, mo.ActorRef]:
+    ) -> mo.ActorRefType[CustomLogMetaActor]:
         session = await self._get_session_ref(session_id)
         return await mo.actor_ref(
             mo.ActorRef(session.address, CustomLogMetaActor.gen_uid(session_id))
@@ -198,9 +197,7 @@ class MockSessionAPI(SessionAPI):
     async def create(cls, address: str, **kwargs) -> "SessionAPI":
         session_id = kwargs.pop("session_id")
         if kwargs:  # pragma: no cover
-            raise TypeError(
-                f"SessionAPI.create " f"got unknown arguments: {list(kwargs)}"
-            )
+            raise TypeError(f"SessionAPI.create got unknown arguments: {list(kwargs)}")
 
         session_manager = await mo.create_actor(
             SessionManagerActor, address=address, uid=SessionManagerActor.default_uid()

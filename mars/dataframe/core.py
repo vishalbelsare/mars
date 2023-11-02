@@ -19,7 +19,7 @@ import operator
 import weakref
 from collections.abc import Iterable
 from io import StringIO
-from typing import Union, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -45,6 +45,7 @@ from ..serialization.serializables import (
     AnyField,
     SeriesField,
     BoolField,
+    Int8Field,
     Int32Field,
     StringField,
     ListField,
@@ -54,16 +55,21 @@ from ..serialization.serializables import (
     ReferenceField,
     NDArrayField,
     IntervalArrayField,
+    DictField,
 )
+from ..session import get_default_session
+from ..tensor import statistics
 from ..utils import (
     on_serialize_shape,
     on_deserialize_shape,
     on_serialize_numpy_type,
     ceildiv,
     tokenize,
+    estimate_pandas_size,
+    calc_nsplits,
+    is_debugger_repr_thread,
 )
 from .utils import fetch_corner_data, ReprSeries, parse_index, merge_index_value
-from ..tensor import statistics
 
 
 class IndexValue(Serializable):
@@ -78,7 +84,6 @@ class IndexValue(Serializable):
         _is_monotonic_increasing = BoolField("is_monotonic_increasing")
         _is_monotonic_decreasing = BoolField("is_monotonic_decreasing")
         _is_unique = BoolField("is_unique")
-        _should_be_monotonic = BoolField("should_be_monotonic")
         _max_val = AnyField("max_val", on_serialize=on_serialize_numpy_type)
         _max_val_close = BoolField("max_val_close")
         _min_val = AnyField("min_val", on_serialize=on_serialize_numpy_type)
@@ -95,14 +100,6 @@ class IndexValue(Serializable):
         @property
         def is_unique(self):
             return self._is_unique
-
-        @property
-        def should_be_monotonic(self):
-            return self._should_be_monotonic
-
-        @should_be_monotonic.setter
-        def should_be_monotonic(self, val):
-            self._should_be_monotonic = val
 
         @property
         def min_val(self):
@@ -137,7 +134,11 @@ class IndexValue(Serializable):
             kw = {k: v for k, v in kw.items() if v is not None}
             if kw.get("data") is None:
                 kw["data"] = []
-            return getattr(pd, type(self).__name__)(**kw)
+
+            pd_initializer = getattr(self, "_pd_initializer", None)
+            if pd_initializer is None:
+                pd_initializer = getattr(pd, type(self).__name__)
+            return pd_initializer(**kw)
 
     class Index(IndexBase):
         _name = AnyField("name")
@@ -239,6 +240,8 @@ class IndexValue(Serializable):
             return "period"
 
     class Int64Index(IndexBase):
+        _pd_initializer = pd.Index
+
         _name = AnyField("name")
         _data = NDArrayField("data")
         _dtype = DataTypeField("dtype")
@@ -248,6 +251,8 @@ class IndexValue(Serializable):
             return "integer"
 
     class UInt64Index(IndexBase):
+        _pd_initializer = pd.Index
+
         _name = AnyField("name")
         _data = NDArrayField("data")
         _dtype = DataTypeField("dtype")
@@ -257,6 +262,8 @@ class IndexValue(Serializable):
             return "integer"
 
     class Float64Index(IndexBase):
+        _pd_initializer = pd.Index
+
         _name = AnyField("name")
         _data = NDArrayField("data")
         _dtype = DataTypeField("dtype")
@@ -282,9 +289,16 @@ class IndexValue(Serializable):
         def to_pandas(self):
             data = getattr(self, "_data", None)
             sortorder = getattr(self, "_sortorder", None)
+
+            def _build_empty_array(dtype):
+                try:
+                    return np.array([], dtype=dtype)
+                except TypeError:  # pragma: no cover
+                    return pd.array([], dtype=dtype)
+
             if data is None:
                 return pd.MultiIndex.from_arrays(
-                    [np.array([], dtype=dtype) for dtype in self._dtypes],
+                    [_build_empty_array(dtype) for dtype in self._dtypes],
                     sortorder=sortorder,
                     names=self._names,
                 )
@@ -309,14 +323,8 @@ class IndexValue(Serializable):
 
     def __mars_tokenize__(self):
         # return object for tokenize
-        # todo fix this when index support is fixed
-        if hasattr(self, "_key"):
-            return self._key
-        try:
-            v = self._index_value
-        except AttributeError:
-            return None
-        return [type(v).__name__] + [getattr(v, f, None) for f in v.__slots__]
+        v = self._index_value
+        return v._key
 
     @property
     def value(self):
@@ -337,10 +345,6 @@ class IndexValue(Serializable):
     @property
     def is_monotonic_increasing_or_decreasing(self):
         return self.is_monotonic_increasing or self.is_monotonic_decreasing
-
-    @property
-    def should_be_monotonic(self):
-        return self._index_value.should_be_monotonic
 
     @property
     def is_unique(self):
@@ -374,6 +378,10 @@ class IndexValue(Serializable):
     @property
     def name(self):
         return getattr(self._index_value, "_name", None)
+
+    @property
+    def names(self):
+        return getattr(self._index_value, "_names", [self.name])
 
     @property
     def inferred_type(self):
@@ -425,9 +433,8 @@ def refresh_index_value(tileable: ENTITY_TYPE):
         elif chunk.index[1] == 0:
             index_to_index_values[chunk.index] = chunk.index_value
     index_value = merge_index_value(index_to_index_values, store_data=False)
-    index_value._index_value.should_be_monotonic = getattr(
-        tileable.index_value, "should_be_monotonic", None
-    )
+    # keep key as original index_value's
+    index_value._index_value._key = tileable.index_value.key
     tileable._index_value = index_value
 
 
@@ -436,11 +443,206 @@ def refresh_dtypes(tileable: ENTITY_TYPE):
     dtypes = pd.concat(all_dtypes)
     tileable._dtypes = dtypes
     columns_values = parse_index(dtypes.index, store_data=True)
-    columns_values._index_value.should_be_monotonic = getattr(
-        tileable.columns_value, "should_be_monotonic", None
-    )
     tileable._columns_value = columns_values
     tileable._dtypes_value = DtypesValue(key=tokenize(dtypes), value=dtypes)
+
+
+_tileable_key_property = "_tileable_key"
+_tileable_dtypes_property = "_tileable_dtypes"
+_tileable_index_value_property = "_tileable_index_value"
+_tileable_columns_value_property = "_tileable_columns_value"
+_nsplits_property = "_tileable_nsplits"
+_lazy_chunk_meta_properties = (
+    _tileable_key_property,
+    _tileable_dtypes_property,
+    _tileable_index_value_property,
+    _tileable_columns_value_property,
+    _nsplits_property,
+)
+
+
+class LazyMetaChunkData(ChunkData):
+    __slots__ = _lazy_chunk_meta_properties
+
+    def _set_tileable_meta(
+        self,
+        tileable_key: str = None,
+        nsplits: Tuple[Tuple[int, ...]] = None,
+        index_value: IndexValue = None,
+        columns_value: IndexValue = None,
+        dtypes: pd.Series = None,
+    ):
+        setattr(self, _tileable_key_property, tileable_key)
+        setattr(self, _nsplits_property, nsplits)
+        setattr(self, _tileable_index_value_property, index_value)
+        setattr(self, _tileable_columns_value_property, columns_value)
+        setattr(self, _tileable_dtypes_property, dtypes)
+
+
+def is_chunk_meta_lazy(chunk: ChunkData) -> bool:
+    chunk = chunk.data if hasattr(chunk, "data") else chunk
+    return isinstance(chunk, LazyMetaChunkData) and hasattr(
+        chunk, _tileable_key_property
+    )
+
+
+@functools.lru_cache(maxsize=128)
+def _get_cum_nsplit(nsplit: Tuple[int]) -> List[int]:
+    return [0] + np.cumsum(nsplit).tolist()
+
+
+def _calc_axis_slice(nsplit: Tuple[int], index: int) -> slice:
+    if not isinstance(nsplit, tuple):
+        nsplit = tuple(nsplit)
+    cum_nsplit = _get_cum_nsplit(nsplit)
+    return slice(cum_nsplit[index], cum_nsplit[index + 1])
+
+
+class ChunkDtypesField(SeriesField):
+    _tileable_key_index_to_dtypes = dict()
+
+    @staticmethod
+    def _gen_chunk_dtypes(instance: Chunk, index: int) -> Optional[pd.Series]:
+        # dtypes of tileable
+        try:
+            tileable_key = getattr(instance, _tileable_key_property)
+        except AttributeError:
+            return
+        cache = ChunkDtypesField._tileable_key_index_to_dtypes
+        try:
+            return cache[tileable_key, index]
+        except KeyError:
+            tileable_dtypes = getattr(instance, _tileable_dtypes_property)
+            # nsplits of tileable
+            nsplits = getattr(instance, _nsplits_property)[1]
+            # calc slice
+            slc = _calc_axis_slice(nsplits, index)
+            dtypes = tileable_dtypes.iloc[slc]
+            cache[tileable_key, index] = dtypes
+            return dtypes
+
+    def __get__(self, instance, owner=None):
+        if not issubclass(owner, LazyMetaChunkData):  # pragma: no cover
+            return super().__get__(instance, owner)
+
+        try:
+            value = self.get(instance, owner)
+            if value is not None:
+                return value
+        except AttributeError:  # pragma: no cover
+            pass
+
+        if instance.index is None:
+            return super().__get__(instance, owner)
+
+        # get dtypes lazily
+        index = instance.index[1]
+        dtypes = self._gen_chunk_dtypes(instance, index)
+        # cache dtypes
+        self.set(instance, dtypes)
+        return dtypes
+
+
+class ChunkIndexValueField(ReferenceField):
+    _tileable_key_index_to_index_value = dict()
+
+    @staticmethod
+    def _gen_chunk_index_value(instance: Chunk, index: int) -> Optional[IndexValue]:
+        # index_value of tileable
+        try:
+            tileable_key = getattr(instance, _tileable_key_property)
+        except AttributeError:
+            return
+        cache = ChunkIndexValueField._tileable_key_index_to_index_value
+        try:
+            return cache[tileable_key, index]
+        except KeyError:
+            tileable_index_value = getattr(instance, _tileable_index_value_property)
+            # nsplits of tileable
+            nsplit = getattr(instance, _nsplits_property)[0]
+            # calc slice
+            slc = _calc_axis_slice(nsplit, index)
+            pd_index = tileable_index_value.to_pandas()
+            if np.isnan(slc.stop - slc.start):
+                chunk_pd_index = pd_index[:0]
+            else:
+                chunk_pd_index = pd_index[slc]
+            index_value = parse_index(
+                chunk_pd_index,
+                key=f"{tileable_index_value.key}_index_{index}_{slc.start}_{slc.stop}",
+            )
+            cache[tileable_key, index] = index_value
+            return index_value
+
+    def __get__(self, instance, owner=None):
+        if not issubclass(owner, LazyMetaChunkData):  # pragma: no cover
+            return super().__get__(instance, owner)
+
+        try:
+            value = self.get(instance, owner)
+            if value is not None:
+                return value
+        except AttributeError:  # pragma: no cover
+            pass
+
+        if instance.index is None:
+            return super().__get__(instance, owner)
+
+        # get index_value lazily
+        index = instance.index[0]
+        index_value = self._gen_chunk_index_value(instance, index)
+        # cache index_value
+        self.set(instance, index_value)
+        return index_value
+
+
+class ChunkColumnsValueField(ReferenceField):
+    _tileable_key_index_to_index_value = dict()
+
+    @staticmethod
+    def _gen_chunk_columns_value(instance: Chunk, index: int) -> Optional[IndexValue]:
+        # columns_value of tileable
+        try:
+            tileable_key = getattr(instance, _tileable_key_property)
+        except AttributeError:
+            return
+        cache = ChunkColumnsValueField._tileable_key_index_to_index_value
+        try:
+            return cache[tileable_key, index]
+        except KeyError:
+            tileable_columns_value = getattr(instance, _tileable_columns_value_property)
+            # nsplits of tileable
+            nsplit = getattr(instance, _nsplits_property)[1]
+            # calc slice
+            slc = _calc_axis_slice(nsplit, index)
+            pd_index = tileable_columns_value.to_pandas()
+            chunk_pd_index = (
+                pd_index[:0] if np.isnan(slc.stop - slc.start) else pd_index[slc]
+            )
+            columns_value = parse_index(chunk_pd_index, store_data=True)
+            cache[tileable_key, index] = columns_value
+            return columns_value
+
+    def __get__(self, instance, owner=None):
+        if not issubclass(owner, LazyMetaChunkData):  # pragma: no cover
+            return super().__get__(instance, owner)
+
+        try:
+            value = self.get(instance, owner)
+            if value is not None:
+                return value
+        except AttributeError:  # pragma: no cover
+            pass
+
+        if instance.index is None:
+            return super().__get__(instance, owner)
+
+        # get columns_value lazily
+        index = instance.index[1]
+        columns_value = self._gen_chunk_columns_value(instance, index)
+        # cache columns_value
+        self.set(instance, columns_value)
+        return columns_value
 
 
 class IndexChunkData(ChunkData):
@@ -565,20 +767,44 @@ class _ToPandasMixin(_ExecuteAndFetchMixin):
 class _BatchedFetcher:
     __slots__ = ()
 
-    def _iter(self, batch_size=1000, session=None, **kw):
+    def _iter(self, batch_size=None, session=None, **kw):
         from .indexing.iloc import iloc
 
-        size = self.shape[0]
-        n_batch = ceildiv(size, batch_size)
+        if batch_size is not None:
+            size = self.shape[0]
+            n_batch = ceildiv(size, batch_size)
 
-        if n_batch > 1:
-            for i in range(n_batch):
-                batch_data = iloc(self)[batch_size * i : batch_size * (i + 1)]
-                yield batch_data._fetch(session=session, **kw)
+            if n_batch > 1:
+                for i in range(n_batch):
+                    batch_data = iloc(self)[batch_size * i : batch_size * (i + 1)]
+                    yield batch_data._fetch(session=session, **kw)
+            else:
+                yield self._fetch(session=session, **kw)
         else:
-            yield self._fetch(session=session, **kw)
+            # if batch_size is not specified, use first batch to estimate
+            # batch_size.
+            default_batch_bytes = 50 * 1024**2
+            first_batch = 1000
+            size = self.shape[0]
 
-    def iterbatch(self, batch_size=1000, session=None, **kw):
+            if size >= first_batch:
+                batch_data = iloc(self)[:first_batch]
+                first_batch_data = batch_data._fetch(session=session, **kw)
+                yield first_batch_data
+                data_size = estimate_pandas_size(first_batch_data)
+                batch_size = int(default_batch_bytes / data_size * first_batch)
+                n_batch = ceildiv(size - 1000, batch_size)
+                for i in range(n_batch):
+                    batch_data = iloc(self)[
+                        first_batch
+                        + batch_size * i : first_batch
+                        + batch_size * (i + 1)
+                    ]
+                    yield batch_data._fetch(session=session, **kw)
+            else:
+                yield self._fetch(session=session, **kw)
+
+    def iterbatch(self, batch_size=None, session=None, **kw):
         # trigger execution
         self.execute(session=session, **kw)
         return self._iter(batch_size=batch_size, session=session)
@@ -586,7 +812,7 @@ class _BatchedFetcher:
     def fetch(self, session=None, **kw):
         from .indexing.iloc import DataFrameIlocGetItem, SeriesIlocGetItem
 
-        batch_size = kw.pop("batch_size", 1000)
+        batch_size = kw.pop("batch_size", None)
         if isinstance(self.op, (DataFrameIlocGetItem, SeriesIlocGetItem)):
             # see GH#1871
             # already iloc, do not trigger batch fetch
@@ -939,7 +1165,7 @@ class MultiIndex(Index):
     __slots__ = ()
 
 
-class BaseSeriesChunkData(ChunkData):
+class BaseSeriesChunkData(LazyMetaChunkData):
     __slots__ = ()
 
     # required fields
@@ -952,7 +1178,7 @@ class BaseSeriesChunkData(ChunkData):
     # optional field
     _dtype = DataTypeField("dtype")
     _name = AnyField("name")
-    _index_value = ReferenceField(
+    _index_value = ChunkIndexValueField(
         "index_value", IndexValue, on_deserialize=_on_deserialize_index_value
     )
 
@@ -1157,7 +1383,7 @@ class BaseSeriesData(HasShapeTileableData, _ToPandasMixin):
 
     @property
     def dtype(self):
-        return getattr(self, "_dtype", None) or self.op.dtype
+        return getattr(self, "_dtype", None) or getattr(self.op, "dtype", None)
 
     @property
     def name(self):
@@ -1205,6 +1431,10 @@ class SeriesData(_BatchedFetcher, BaseSeriesData):
         return tensor.astype(dtype=dtype, order=order, copy=False)
 
     def iteritems(self, batch_size=10000, session=None):
+        if is_build_mode():
+            raise NotImplementedError("Not implemented when building dags")
+        if is_debugger_repr_thread() and len(self._executed_sessions) == 0:
+            raise NotImplementedError("Not implemented when not executed under debug")
         for batch_data in self.iterbatch(batch_size=batch_size, session=session):
             yield from getattr(batch_data, "iteritems")()
 
@@ -1595,9 +1825,9 @@ class Series(HasShapeTileable, _ToPandasMixin):
             )
 
 
-class BaseDataFrameChunkData(ChunkData):
+class BaseDataFrameChunkData(LazyMetaChunkData):
     __slots__ = ("_dtypes_value",)
-    _no_copy_attrs_ = ChunkData._no_copy_attrs_ | {"_dtypes"}
+    _no_copy_attrs_ = ChunkData._no_copy_attrs_ | {"_dtypes", "_columns_value"}
 
     # required fields
     _shape = TupleField(
@@ -1607,11 +1837,11 @@ class BaseDataFrameChunkData(ChunkData):
         on_deserialize=on_deserialize_shape,
     )
     # optional fields
-    _dtypes = SeriesField("dtypes")
-    _index_value = ReferenceField(
+    _dtypes = ChunkDtypesField("dtypes")
+    _index_value = ChunkIndexValueField(
         "index_value", IndexValue, on_deserialize=_on_deserialize_index_value
     )
-    _columns_value = ReferenceField("columns_value", IndexValue)
+    _columns_value = ChunkColumnsValueField("columns_value", IndexValue)
 
     def __init__(
         self,
@@ -1632,6 +1862,10 @@ class BaseDataFrameChunkData(ChunkData):
             _columns_value=columns_value,
             **kw,
         )
+        self._dtypes_value = None
+
+    def __on_deserialize__(self):
+        super(BaseDataFrameChunkData, self).__on_deserialize__()
         self._dtypes_value = None
 
     def __len__(self):
@@ -1771,6 +2005,12 @@ class BaseDataFrameData(HasShapeTileableData, _ToPandasMixin):
             _chunks=chunks,
             **kw,
         )
+        self._accessors = dict()
+        self._dtypes_value = None
+        self._dtypes_dict = None
+
+    def __on_deserialize__(self):
+        super().__on_deserialize__()
         self._accessors = dict()
         self._dtypes_value = None
         self._dtypes_dict = None
@@ -1993,6 +2233,11 @@ class DataFrameData(_BatchedFetcher, BaseDataFrameData):
     def itertuples(self, index=True, name="Pandas", batch_size=1000, session=None):
         for batch_data in self.iterbatch(batch_size=batch_size, session=session):
             yield from getattr(batch_data, "itertuples")(index=index, name=name)
+
+    def _need_execution(self):
+        if self._dtypes is None:
+            return True
+        return False
 
 
 class DataFrame(HasShapeTileable, _ToPandasMixin):
@@ -2780,10 +3025,219 @@ class Categorical(HasShapeTileable, _ToPandasMixin):
         return super().__hash__()
 
 
+class DataFrameOrSeriesChunkData(ChunkData):
+    __slots__ = ()
+    type_name = "DataFrameOrSeries"
+
+    _collapse_axis = Int8Field("collapse_axis")
+    _data_type = StringField("data_type")
+    _data_params = DictField("data_params")
+
+    def __init__(
+        self,
+        op=None,
+        index=None,
+        collapse_axis=None,
+        data_type=None,
+        data_params=None,
+        **kw,
+    ):
+        self._collapse_axis = collapse_axis
+        self._index = index
+        self._data_type = data_type
+        self._data_params = data_params or dict()
+        super().__init__(_op=op, **kw)
+
+    def __getattr__(self, item):
+        if item in self._data_params:
+            return self._data_params[item]
+        raise AttributeError(f"'{type(self)}' object has no attribute '{item}'")
+
+    @property
+    def ndim(self) -> int:
+        return (self._data_type == "dataframe") + 1
+
+    @property
+    def params(self) -> Dict[str, Any]:
+        return {
+            "collapse_axis": self._collapse_axis,
+            "index": self._index,
+            "data_type": self._data_type,
+            "data_params": self._data_params,
+        }
+
+    @params.setter
+    def params(self, new_params: Dict[str, Any]):
+        self._data_type = new_params.get("data_type")
+        if self._collapse_axis is not None and self._data_type == "series":
+            self._index = (self._index[1 - self._collapse_axis],)
+        if self._collapse_axis is None and self._data_type == "dataframe":
+            self._index = (self._index[0], 0)
+        data_params = new_params["data_params"]
+        if self._data_type == "dataframe":
+            data_params["dtypes"] = data_params["dtypes_value"].value
+            data_params["columns_value"] = parse_index(
+                data_params["dtypes_value"].value.index, store_data=True
+            )
+        self._data_params = {k: v for k, v in data_params.items()}
+
+    @classmethod
+    def get_params_from_data(cls, data: Any) -> Dict[str, Any]:
+        if isinstance(data, pd.DataFrame):
+            return {
+                "data_type": "dataframe",
+                "data_params": DataFrameChunkData.get_params_from_data(data),
+            }
+        else:
+            return {
+                "data_type": "series",
+                "data_params": SeriesChunkData.get_params_from_data(data),
+            }
+
+
+class DataFrameOrSeriesChunk(Chunk):
+    __slots__ = ()
+    _allow_data_type_ = (DataFrameOrSeriesChunkData,)
+    type_name = "DataFrameOrSeries"
+
+
+class DataFrameOrSeriesData(HasShapeTileableData, _ToPandasMixin):
+    __slots__ = ()
+    _chunks = ListField(
+        "chunks",
+        FieldTypes.reference(DataFrameOrSeriesChunkData),
+        on_serialize=lambda x: [it.data for it in x] if x is not None else x,
+        on_deserialize=lambda x: [DataFrameOrSeriesChunk(it) for it in x]
+        if x is not None
+        else x,
+    )
+
+    _data_type = StringField("data_type")
+    _data_params = DictField("data_params")
+
+    def __init__(
+        self,
+        op=None,
+        chunks=None,
+        data_type=None,
+        data_params=None,
+        **kw,
+    ):
+        self._data_type = data_type
+        self._data_params = data_params or dict()
+        super().__init__(
+            _op=op,
+            _chunks=chunks,
+            **kw,
+        )
+
+    def __getattr__(self, item):
+        if item in self._data_params:
+            return self._data_params[item]
+        raise AttributeError(f"'{type(self)}' object has no attribute '{item}'")
+
+    @property
+    def shape(self):
+        return self._data_params.get("shape", None)
+
+    @property
+    def nsplits(self):
+        return self._data_params.get("nsplits", None)
+
+    @property
+    def data_type(self):
+        return self._data_type
+
+    @property
+    def data_params(self):
+        return self._data_params
+
+    @property
+    def params(self) -> Dict[str, Any]:
+        return {"data_type": self._data_type, "data_params": self._data_params}
+
+    @params.setter
+    def params(self, new_params: Dict[str, Any]):
+        # After execution, create DataFrameFetch, and the data
+        # corresponding to the original key is still DataFrameOrSeries type,
+        # so when restoring DataFrameOrSeries type,
+        # there is no "data_type" field in params.
+        if "data_type" not in new_params:
+            if "dtype" in new_params:
+                self._data_type = "series"
+            else:
+                self._data_type = "dataframe"
+            self._data_params = new_params.copy()
+        else:
+            self._data_type = new_params.get("data_type")
+            self._data_params = {
+                k: v for k, v in new_params.get("data_params", {}).items()
+            }
+
+    def refresh_params(self):
+        index_to_index_values = dict()
+        for chunk in self.chunks:
+            if chunk.ndim == 1:
+                index_to_index_values[chunk.index] = chunk.index_value
+            elif chunk.index[1] == 0:
+                index_to_index_values[chunk.index] = chunk.index_value
+        index_value = merge_index_value(index_to_index_values, store_data=False)
+        nsplits = calc_nsplits({c.index: c.shape for c in self.chunks})
+        shape = tuple(sum(ns) for ns in nsplits)
+
+        data_params = dict()
+        data_params["nsplits"] = nsplits
+        data_params["shape"] = shape
+        data_params["index_value"] = index_value
+
+        self._data_type = self._chunks[0]._data_type
+        if self.data_type == "dataframe":
+            all_dtypes = [c.dtypes_value.value for c in self.chunks if c.index[0] == 0]
+            dtypes = pd.concat(all_dtypes)
+            data_params["dtypes"] = dtypes
+            columns_values = parse_index(dtypes.index, store_data=True)
+            data_params["columns_value"] = columns_values
+            data_params["dtypes_value"] = DtypesValue(
+                key=tokenize(dtypes), value=dtypes
+            )
+        else:
+            data_params["dtype"] = self.chunks[0].dtype
+            data_params["name"] = self.chunks[0].name
+        self._data_params.update(data_params)
+
+    def ensure_data(self):
+        from .fetch.core import DataFrameFetch
+
+        self.execute()
+        default_sess = get_default_session()
+        self._detach_session(default_sess._session)
+
+        fetch_tileable = default_sess._session._tileable_to_fetch[self]
+        new = DataFrameFetch(
+            output_types=[getattr(OutputType, self.data_type)]
+        ).new_tileable(
+            [],
+            _key=self.key,
+            chunks=fetch_tileable.chunks,
+            nsplits=fetch_tileable.nsplits,
+            **self.data_params,
+        )
+        new._attach_session(default_sess._session)
+        return new
+
+
+class DataFrameOrSeries(HasShapeTileable, _ToPandasMixin):
+    __slots__ = ()
+    _allow_data_type_ = (DataFrameOrSeriesData,)
+    type_name = "DataFrameOrSeries"
+
+
 INDEX_TYPE = (Index, IndexData)
 INDEX_CHUNK_TYPE = (IndexChunk, IndexChunkData)
 SERIES_TYPE = (Series, SeriesData)
 SERIES_CHUNK_TYPE = (SeriesChunk, SeriesChunkData)
+DATAFRAME_OR_SERIES_TYPE = (DataFrameOrSeries, DataFrameOrSeriesData)
+DATAFRAME_OR_SERIES_CHUNK_TYPE = (DataFrameOrSeriesChunk, DataFrameOrSeriesChunkData)
 DATAFRAME_TYPE = (DataFrame, DataFrameData)
 DATAFRAME_CHUNK_TYPE = (DataFrameChunk, DataFrameChunkData)
 DATAFRAME_GROUPBY_TYPE = (DataFrameGroupBy, DataFrameGroupByData)
@@ -2807,6 +3261,9 @@ CHUNK_TYPE = (
 
 register_output_types(OutputType.dataframe, DATAFRAME_TYPE, DATAFRAME_CHUNK_TYPE)
 register_output_types(OutputType.series, SERIES_TYPE, SERIES_CHUNK_TYPE)
+register_output_types(
+    OutputType.df_or_series, DATAFRAME_OR_SERIES_TYPE, DATAFRAME_OR_SERIES_CHUNK_TYPE
+)
 register_output_types(OutputType.index, INDEX_TYPE, INDEX_CHUNK_TYPE)
 register_output_types(OutputType.categorical, CATEGORICAL_TYPE, CATEGORICAL_CHUNK_TYPE)
 register_output_types(

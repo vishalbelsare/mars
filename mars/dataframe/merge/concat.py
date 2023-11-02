@@ -34,87 +34,32 @@ from ..utils import (
     validate_axis,
 )
 
-cudf = lazy_import("cudf", globals=globals())
+cudf = lazy_import("cudf")
 
 
 class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
     _op_type_ = OperandDef.CONCATENATE
 
-    _axis = AnyField("axis")
-    _join = StringField("join")
-    _ignore_index = BoolField("ignore_index")
-    _keys = ListField("keys")
-    _levels = ListField("levels")
-    _names = ListField("names")
-    _verify_integrity = BoolField("verify_integrity")
-    _sort = BoolField("sort")
-    _copy = BoolField("copy")
+    axis = AnyField("axis", default=None)
+    join = StringField("join", default=None)
+    ignore_index = BoolField("ignore_index", default=None)
+    keys = ListField("keys", default=None)
+    levels = ListField("levels", default=None)
+    names = ListField("names", default=None)
+    verify_integrity = BoolField("verify_integrity", default=None)
+    sort = BoolField("sort", default=None)
+    copy_ = BoolField("copy", default=None)
 
-    def __init__(
-        self,
-        axis=None,
-        join=None,
-        ignore_index=None,
-        keys=None,
-        levels=None,
-        names=None,
-        verify_integrity=None,
-        sort=None,
-        copy=None,
-        sparse=None,
-        output_types=None,
-        **kw
-    ):
-        super().__init__(
-            _axis=axis,
-            _join=join,
-            _ignore_index=ignore_index,
-            _keys=keys,
-            _levels=levels,
-            _names=names,
-            _verify_integrity=verify_integrity,
-            _sort=sort,
-            _copy=copy,
-            _sparse=sparse,
-            _output_types=output_types,
-            **kw
-        )
-
-    @property
-    def axis(self):
-        return self._axis
-
-    @property
-    def join(self):
-        return self._join
-
-    @property
-    def ignore_index(self):
-        return self._ignore_index
-
-    @property
-    def keys(self):
-        return self._keys
+    def __init__(self, copy=None, output_types=None, **kw):
+        super().__init__(copy_=copy, _output_types=output_types, **kw)
 
     @property
     def level(self):
-        return self._levels
+        return self.levels
 
     @property
     def name(self):
-        return self._names
-
-    @property
-    def verify_integrity(self):
-        return self._verify_integrity
-
-    @property
-    def sort(self):
-        return self._sort
-
-    @property
-    def copy_(self):
-        return self._copy
+        return self.names
 
     @classmethod
     def _tile_dataframe(cls, op):
@@ -169,6 +114,7 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
         )
 
         if op.ignore_index:
+            yield out_chunks
             out_chunks = standardize_range_index(out_chunks)
 
         new_op = op.copy()
@@ -183,7 +129,7 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
         )
 
     @classmethod
-    def _tile_series(cls, op):
+    def _tile_series(cls, op: "DataFrameConcat"):
         from ..datasource.from_tensor import DataFrameFromTensor
         from ..indexing.iloc import SeriesIlocGetItem, DataFrameIlocGetItem
 
@@ -223,7 +169,11 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
                 else:
                     index = (c.index[0], cum_index)
                     shape = (c.shape[0], 1)
-                    to_frame_op = DataFrameFromTensor(input_=c)
+                    to_frame_op = DataFrameFromTensor(
+                        input=c,
+                        index=None,
+                        columns=None,
+                    )
                     if c.name:
                         dtypes = pd.Series([c.dtype], index=[c.name])
                     else:
@@ -259,6 +209,7 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
                 offset += 1
 
         if op.ignore_index:
+            yield out_chunks
             out_chunks = standardize_range_index(out_chunks)
 
         new_op = op.copy()
@@ -286,14 +237,14 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
             )
 
     @classmethod
-    def tile(cls, op):
+    def tile(cls, op: "DataFrameConcat"):
         if isinstance(op.inputs[0], SERIES_TYPE):
             return (yield from cls._tile_series(op))
         else:
             return (yield from cls._tile_dataframe(op))
 
     @classmethod
-    def execute(cls, ctx, op):
+    def execute(cls, ctx, op: "DataFrameConcat"):
         def _base_concat(chunk, inputs):
             # auto generated concat when executing a DataFrame, Series or Index
             if chunk.op.output_types[0] == OutputType.dataframe:
@@ -350,10 +301,6 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
                     # cuDF will lost index name when concat two seriess.
                     ret.index.name = concats[0].index.name
 
-            if getattr(chunk.index_value, "should_be_monotonic", False):
-                ret.sort_index(inplace=True)
-            if getattr(chunk.columns_value, "should_be_monotonic", False):
-                ret.sort_index(axis=1, inplace=True)
             return ret
 
         def _auto_concat_series_chunks(chunk, inputs):
@@ -366,8 +313,6 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
                     concat = xdf.concat(inputs, axis=chunk.op.axis)
                 else:
                     concat = xdf.concat(inputs)
-            if getattr(chunk.index_value, "should_be_monotonic", False):
-                concat.sort_index(inplace=True)
             return concat
 
         def _auto_concat_index_chunks(chunk, inputs):
@@ -378,8 +323,6 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
                 xdf = pd if isinstance(inputs[0], pd.Index) or cudf is None else cudf
                 empty_dfs = [xdf.DataFrame(index=inp) for inp in inputs]
                 concat_df = xdf.concat(empty_dfs, axis=0)
-            if getattr(chunk.index_value, "should_be_monotonic", False):
-                concat_df.sort_index(inplace=True)
             return concat_df.index
 
         def _auto_concat_categorical_chunks(_, inputs):
@@ -492,7 +435,7 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
                 else:
                     empty_dfs.append(build_empty_series(df.dtype, name=df.name))
 
-            emtpy_result = pd.concat(empty_dfs, join=self.join, sort=True)
+            emtpy_result = pd.concat(empty_dfs, join=self.join, sort=self.sort)
             shape = (row_length, emtpy_result.shape[1])
             columns_value = parse_index(emtpy_result.columns, store_data=True)
 
@@ -549,7 +492,7 @@ class DataFrameConcat(DataFrameOperand, DataFrameOperandMixin):
                 new_objs = [obj if obj.ndim == 2 else obj.to_frame() for obj in objs]
             else:  # pragma: no cover
                 raise NotImplementedError(
-                    "Does not support concat dataframes " "which has different index"
+                    "Does not support concat dataframes which has different index"
                 )
 
             shape = (objs[0].shape[0], col_length)

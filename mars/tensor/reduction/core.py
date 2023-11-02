@@ -328,11 +328,17 @@ class TensorReductionMixin(TensorOperandMixin):
         func_name = getattr(cls, "_func_name", None)
         reduce_func = getattr(xp, func_name)
         out = op.outputs[0]
+
+        def get_reduce_args(func):
+            if hasattr(func, "_implementation"):
+                func = func._implementation
+            return inspect.getfullargspec(func).args
+
         with device(device_id):
             if input_chunk.size == 0 and op.keepdims:
                 # input chunk is empty, when keepdims is True, return itself
                 ret = input_chunk
-            elif "dtype" in inspect.getfullargspec(reduce_func).args:
+            elif "dtype" in get_reduce_args(reduce_func):
                 ret = reduce_func(
                     input_chunk, axis=axis, dtype=op.dtype, keepdims=bool(op.keepdims)
                 )
@@ -373,7 +379,7 @@ class TensorArgReductionMixin(TensorReductionMixin):
             axis = (axis,)
             ravel = ndim == 1
         else:
-            raise TypeError("axis must be either `None` or int, " f"got '{axis}'")
+            raise TypeError(f"axis must be either `None` or int, got '{axis}'")
         return axis, ravel
 
     @staticmethod
@@ -586,7 +592,11 @@ class TensorCumReductionMixin(TensorReductionMixin):
                 to_cum_chunks.append(sliced_chunk)
             to_cum_chunks.append(chunk)
 
-            bin_op = bin_op_type(args=to_cum_chunks, dtype=chunk.dtype)
+            # GH#3132: some chunks of to_cum_chunks may be empty,
+            # so we tell tree_add&tree_multiply to ignore them
+            bin_op = bin_op_type(
+                args=to_cum_chunks, dtype=chunk.dtype, ignore_empty_input=True
+            )
             output_chunk = bin_op.new_chunk(
                 to_cum_chunks,
                 shape=chunk.shape,

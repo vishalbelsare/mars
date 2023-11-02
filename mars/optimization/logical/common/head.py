@@ -20,12 +20,16 @@ from ....dataframe.datasource.core import HeadOptimizedDataSource
 from ....dataframe.sort.core import DataFrameSortOperand
 from ....dataframe.utils import parse_index
 from ....utils import implements
-from ..core import OptimizationRule, OptimizationRecord, OptimizationRecordType
+from ..core import (
+    OperandBasedOptimizationRule,
+    OptimizationRecord,
+    OptimizationRecordType,
+)
 
 
-class HeadPushDown(OptimizationRule):
-    @implements(OptimizationRule.match)
-    def match(self, op: OperandType) -> bool:
+class HeadPushDown(OperandBasedOptimizationRule):
+    @implements(OperandBasedOptimizationRule.match_operand)
+    def match_operand(self, op: OperandType) -> bool:
         node = op.outputs[0]
         input_node = self._graph.predecessors(node)[0]
         successors = self._graph.successors(input_node)
@@ -33,13 +37,17 @@ class HeadPushDown(OptimizationRule):
 
     def _all_successor_head_pushdown(self, successors: List[TileableType]):
         for succ in successors:
-            rule_types = self._optimizer_cls.get_rule_types(type(succ.op))
-            if rule_types is None:
+            push_down_rule_types = [
+                rule_type
+                for rule_type in self._rule_type_to_op_types
+                if issubclass(rule_type, HeadPushDown)
+                and isinstance(succ.op, tuple(self._rule_type_to_op_types[rule_type]))
+            ]
+            if not push_down_rule_types:
                 return False
-            for rule_type in rule_types:
-                if not issubclass(rule_type, HeadPushDown):
-                    return False
-                rule = rule_type(self._graph, self._records, self._optimizer_cls)
+
+            for rule_type in push_down_rule_types:
+                rule = self._cached_rule(rule_type)
                 if not rule._can_push_down(succ.op):
                     return False
         return True
@@ -60,7 +68,7 @@ class HeadPushDown(OptimizationRule):
             return True
         return False
 
-    def apply(self, op: OperandType):
+    def apply_to_operand(self, op: OperandType):
         node = op.outputs[0]
         input_node = self._graph.predecessors(node)[0]
         nrows = input_node.op.nrows or 0
@@ -68,7 +76,7 @@ class HeadPushDown(OptimizationRule):
 
         new_input_op = input_node.op.copy()
         new_input_op._key = input_node.op.key
-        new_input_op._nrows = nrows = max(nrows, head)
+        new_input_op.nrows = nrows = max(nrows, head)
         new_input_params = input_node.params.copy()
         new_input_params["shape"] = (nrows,) + input_node.shape[1:]
         pandas_index = node.index_value.to_pandas()[:nrows]

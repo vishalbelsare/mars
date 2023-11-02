@@ -53,7 +53,7 @@ def test_linear_regression(setup):
     assert_array_almost_equal(reg.predict(X), model.predict(X))
 
     # Regular model fitting, #samples <= 2, # features < 2
-    error_msg = re.escape("Does not support sigular matrix!")
+    error_msg = re.escape("Does not support singular matrix!")
 
     X = [[1], [2]]
     Y = [1, 2]
@@ -68,8 +68,8 @@ def test_linear_regression(setup):
     assert_array_almost_equal(reg.intercept_, model.intercept_)
     assert_array_almost_equal(reg.predict(X), model.predict(X))
 
-    # Extra case #1: singluar matrix, degenerate input
-    error_msg = re.escape("Does not support sigular matrix!")
+    # Extra case #1: singular matrix, degenerate input
+    error_msg = re.escape("Does not support singular matrix!")
 
     X = [[1]]
     Y = [0]
@@ -78,7 +78,7 @@ def test_linear_regression(setup):
     with pytest.raises(NotImplementedError, match=error_msg):
         reg.fit(X, Y)
 
-    # # Extra case #2: algebrically singluar matrix but algorithmically not
+    # # Extra case #2: algebrically singular matrix but algorithmically not
     # # Works locally but not work in github checks
     # # May be because the inverse is super large
     # X = [[1, 1.5], [1.8, 2]]
@@ -101,13 +101,11 @@ def test_linear_regression_sample_weights(setup):
 
     # It would not work with under-determined systems
     for n_samples, n_features in ((6, 5),):
-
         y = rng.randn(n_samples)
         X = rng.randn(n_samples, n_features)
         sample_weight = 1.0 + rng.rand(n_samples)
 
         for intercept in (True, False):
-
             # LinearRegression with explicit sample_weight
             reg = LinearRegression(fit_intercept=intercept)
             reg.fit(X, y, sample_weight=sample_weight)
@@ -557,7 +555,6 @@ def test_dtype_preprocess_data(setup):
 
     for fit_intercept in [True, False]:
         for normalize in [True, False]:
-
             Xt_32, yt_32, X_mean_32, y_mean_32, X_norm_32 = _preprocess_data(
                 X_32,
                 y_32,

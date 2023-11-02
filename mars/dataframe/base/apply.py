@@ -21,6 +21,7 @@ from ... import opcodes
 from ...config import options
 from ...core import OutputType, recursive_tile
 from ...core.custom_log import redirect_custom_log
+from ...core.operand import OperatorLogicKeyGeneratorMixin
 from ...serialization.serializables import (
     StringField,
     AnyField,
@@ -29,7 +30,8 @@ from ...serialization.serializables import (
     DictField,
     FunctionField,
 )
-from ...utils import enter_current_session, quiet_stdio
+from ...utils import enter_current_session, quiet_stdio, get_func_token, tokenize
+from ..arrays import ArrowArray
 from ..operands import DataFrameOperandMixin, DataFrameOperand
 from ..utils import (
     build_df,
@@ -41,10 +43,29 @@ from ..utils import (
     make_dtype,
     build_empty_df,
     build_empty_series,
+    clean_up_func,
+    restore_func,
 )
 
 
-class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
+class ApplyOperandLogicKeyGeneratorMixin(OperatorLogicKeyGeneratorMixin):
+    def _get_logic_key_token_values(self):
+        token_values = super()._get_logic_key_token_values() + [
+            self._axis,
+            self._convert_dtype,
+            self._raw,
+            self._result_type,
+            self._elementwise,
+        ]
+        if self.func:
+            return token_values + [get_func_token(self.func)]
+        else:  # pragma: no cover
+            return token_values
+
+
+class ApplyOperand(
+    DataFrameOperand, DataFrameOperandMixin, ApplyOperandLogicKeyGeneratorMixin
+):
     _op_type_ = opcodes.APPLY
 
     _func = FunctionField("func")
@@ -53,6 +74,9 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
     _raw = BoolField("raw")
     _result_type = StringField("result_type")
     _elementwise = BoolField("elementwise")
+    _logic_key = StringField("logic_key")
+    _func_key = AnyField("func_key")
+    _need_clean_up_func = BoolField("need_clean_up_func")
     _args = TupleField("args")
     _kwds = DictField("kwds")
 
@@ -67,6 +91,9 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
         kwds=None,
         output_type=None,
         elementwise=None,
+        logic_key=None,
+        func_key=None,
+        need_clean_up_func=False,
         **kw,
     ):
         if output_type:
@@ -80,12 +107,26 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
             _args=args,
             _kwds=kwds,
             _elementwise=elementwise,
+            _logic_key=logic_key,
+            _func_key=func_key,
+            _need_clean_up_func=need_clean_up_func,
             **kw,
         )
+
+    def _update_key(self):
+        values = [v for v in self._values_ if v is not self.func] + [
+            get_func_token(self.func)
+        ]
+        self._obj_set("_key", tokenize(type(self).__name__, *values))
+        return self
 
     @property
     def func(self):
         return self._func
+
+    @func.setter
+    def func(self, func):
+        self._func = func
 
     @property
     def axis(self):
@@ -108,6 +149,30 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
         return self._elementwise
 
     @property
+    def logic_key(self):
+        return self._logic_key
+
+    @logic_key.setter
+    def logic_key(self, logic_key):
+        self._logic_key = logic_key
+
+    @property
+    def func_key(self):
+        return self._func_key
+
+    @func_key.setter
+    def func_key(self, func_key):
+        self._func_key = func_key
+
+    @property
+    def need_clean_up_func(self):
+        return self._need_clean_up_func
+
+    @need_clean_up_func.setter
+    def need_clean_up_func(self, need_clean_up_func: bool):
+        self._need_clean_up_func = need_clean_up_func
+
+    @property
     def args(self):
         return getattr(self, "_args", None) or ()
 
@@ -119,6 +184,7 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
     @redirect_custom_log
     @enter_current_session
     def execute(cls, ctx, op):
+        restore_func(ctx, op)
         input_data = ctx[op.inputs[0].key]
         out = op.outputs[0]
         if len(input_data) == 0:
@@ -138,9 +204,22 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
                 **op.kwds,
             )
         else:
-            result = input_data.apply(
-                op.func, convert_dtype=op.convert_dtype, args=op.args, **op.kwds
-            )
+            try:
+                result = input_data.apply(
+                    op.func, convert_dtype=op.convert_dtype, args=op.args, **op.kwds
+                )
+            except TypeError:
+                if isinstance(input_data.values, ArrowArray):
+                    input_data = pd.Series(
+                        input_data.to_numpy(),
+                        name=input_data.name,
+                        index=input_data.index,
+                    )
+                    result = input_data.apply(
+                        op.func, convert_dtype=op.convert_dtype, args=op.args, **op.kwds
+                    )
+                else:  # pragma: no cover
+                    raise
         ctx[out.key] = result
 
     @classmethod
@@ -160,7 +239,13 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
             in_df = yield from recursive_tile(in_df.rechunk(chunk_size))
 
         chunks = []
-        if out_df.ndim == 2:
+        if op.output_types and op.output_types[0] == OutputType.df_or_series:
+            for c in in_df.chunks:
+                new_op = op.copy().reset_key()
+                new_op.tileable_op_key = op.key
+                chunks.append(new_op.new_chunk([c], collapse_axis=axis, index=c.index))
+            new_nsplits = None
+        elif out_df.ndim == 2:
             for c in in_df.chunks:
                 if elementwise:
                     new_shape = c.shape
@@ -216,18 +301,24 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
 
         new_op = op.copy()
         kw = out_df.params.copy()
-        kw.update(dict(chunks=chunks, nsplits=tuple(new_nsplits)))
+        if isinstance(new_nsplits, list):
+            new_nsplits = tuple(new_nsplits)
+        kw.update(dict(chunks=chunks, nsplits=new_nsplits))
         return new_op.new_tileables(op.inputs, **kw)
 
     @classmethod
     def _tile_series(cls, op):
         in_series = op.inputs[0]
         out_series = op.outputs[0]
+        output_type = op.output_types[0] if op.output_types else None
 
         chunks = []
         for c in in_series.chunks:
             new_op = op.copy().reset_key()
             new_op.tileable_op_key = op.key
+            if output_type == OutputType.df_or_series:
+                chunks.append(new_op.new_chunk([c], collapse_axis=None, index=c.index))
+                continue
             kw = c.params.copy()
             if out_series.ndim == 1:
                 kw["dtype"] = out_series.dtype
@@ -240,14 +331,18 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
 
         new_op = op.copy()
         kw = out_series.params.copy()
-        kw.update(dict(chunks=chunks, nsplits=in_series.nsplits))
-        if out_series.ndim == 2:
+        if output_type == OutputType.df_or_series:
+            kw.update(dict(chunks=chunks, nsplits=None))
+        else:
+            kw.update(dict(chunks=chunks, nsplits=in_series.nsplits))
+        if output_type != OutputType.df_or_series and out_series.ndim == 2:
             kw["nsplits"] = (in_series.nsplits[0], (out_series.shape[1],))
             kw["columns_value"] = out_series.columns_value
         return new_op.new_tileables(op.inputs, **kw)
 
     @classmethod
     def tile(cls, op):
+        clean_up_func(op)
         if op.inputs[0].ndim == 2:
             return (yield from cls._tile_df(op))
         else:
@@ -255,19 +350,21 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
 
     def _infer_df_func_returns(self, df, dtypes, dtype=None, name=None, index=None):
         if isinstance(self._func, np.ufunc):
-            output_type, new_dtypes, index_value, new_elementwise = (
-                OutputType.dataframe,
-                None,
-                "inherit",
-                True,
-            )
+            output_type = OutputType.dataframe
+            new_dtypes = None
+            index_value = "inherit"
+            new_elementwise = True
         else:
-            output_type, new_dtypes, index_value, new_elementwise = (
-                None,
-                None,
-                None,
-                False,
-            )
+            if self.output_types is not None and (
+                dtypes is not None or dtype is not None
+            ):
+                ret_dtypes = dtypes if dtypes is not None else (name, dtype)
+                ret_index_value = parse_index(index) if index is not None else None
+                self._elementwise = False
+                return ret_dtypes, ret_index_value
+
+            output_type = new_dtypes = index_value = None
+            new_elementwise = False
 
         try:
             empty_df = build_df(df, size=2)
@@ -305,6 +402,9 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
             new_elementwise if self._elementwise is None else self._elementwise
         )
         return dtypes, index_value
+
+    def _call_df_or_series(self, df):
+        return self.new_df_or_series([df])
 
     def _call_dataframe(self, df, dtypes=None, dtype=None, name=None, index=None):
         # for backward compatibility
@@ -360,14 +460,19 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
         # for backward compatibility
         dtype = dtype if dtype is not None else dtypes
         if self._convert_dtype:
-            test_series = build_series(series, size=2, name=series.name)
-            try:
-                with np.errstate(all="ignore"), quiet_stdio():
-                    infer_series = test_series.apply(
-                        self._func, args=self.args, **self.kwds
-                    )
-            except:  # noqa: E722  # nosec  # pylint: disable=bare-except
-                infer_series = None
+            if self.output_types is not None and (
+                dtypes is not None or dtype is not None
+            ):
+                infer_series = test_series = None
+            else:
+                test_series = build_series(series, size=2, name=series.name)
+                try:
+                    with np.errstate(all="ignore"), quiet_stdio():
+                        infer_series = test_series.apply(
+                            self._func, args=self.args, **self.kwds
+                        )
+                except:  # noqa: E722  # nosec  # pylint: disable=bare-except
+                    infer_series = None
 
             output_type = self._output_types[0]
 
@@ -433,8 +538,13 @@ class ApplyOperand(DataFrameOperand, DataFrameOperandMixin):
         dtype = make_dtype(dtype)
         self._axis = validate_axis(axis, df_or_series)
 
+        if self.output_types and self.output_types[0] == OutputType.df_or_series:
+            return self._call_df_or_series(df_or_series)
+
         if df_or_series.op.output_types[0] == OutputType.dataframe:
-            return self._call_dataframe(df_or_series, dtypes=dtypes, index=index)
+            return self._call_dataframe(
+                df_or_series, dtypes=dtypes, dtype=dtype, name=name, index=index
+            )
         else:
             return self._call_series(
                 df_or_series, dtypes=dtypes, dtype=dtype, name=name, index=index
@@ -454,6 +564,7 @@ def df_apply(
     output_type=None,
     index=None,
     elementwise=None,
+    skip_infer=False,
     **kwds,
 ):
     """
@@ -525,6 +636,9 @@ def df_apply(
         * ``True`` : The function is elementwise. Mars will apply
           ``func`` to original chunks. This will not introduce extra
           concatenation step and reduce overhead.
+
+    skip_infer: bool, default False
+        Whether infer dtypes when dtypes or output_type is not specified.
 
     args : tuple
         Positional arguments to pass to `func` in addition to the
@@ -623,7 +737,7 @@ def df_apply(
     2  1  2
     """
     if isinstance(func, (list, dict)):
-        return df.aggregate(func)
+        return df.aggregate(func, axis)
 
     output_types = kwds.pop("output_types", None)
     object_type = kwds.pop("object_type", None)
@@ -631,6 +745,8 @@ def df_apply(
         output_type=output_type, output_types=output_types, object_type=object_type
     )
     output_type = output_types[0] if output_types else None
+    if skip_infer and output_type is None:
+        output_type = OutputType.df_or_series
 
     # calling member function
     if isinstance(func, str):
@@ -663,6 +779,7 @@ def series_apply(
     dtype=None,
     name=None,
     index=None,
+    skip_infer=False,
     **kwds,
 ):
     """
@@ -697,6 +814,9 @@ def series_apply(
 
     args : tuple
         Positional arguments passed to func after the series value.
+
+    skip_infer: bool, default False
+        Whether infer dtypes when dtypes or output_type is not specified.
 
     **kwds
         Additional keyword arguments passed to func.
@@ -801,6 +921,9 @@ def series_apply(
                 f"'{func_str!r}' is not a valid function "
                 f"for '{type(series).__name__}' object"
             )
+
+    if skip_infer and output_type is None:
+        output_type = OutputType.df_or_series
 
     output_types = kwds.pop("output_types", None)
     object_type = kwds.pop("object_type", None)

@@ -23,7 +23,7 @@ from ...core import ENTITY_TYPE, Entity, OutputType
 from ...core.operand import OperandStage, MapReduceOperand
 from ...lib.groupby_wrapper import wrapped_groupby
 from ...serialization.serializables import BoolField, Int32Field, AnyField
-from ...utils import lazy_import
+from ...utils import lazy_import, pd_release_version, no_default
 from ..align import align_dataframe_series, align_series_series
 from ..initializer import Series as asseries
 from ..core import SERIES_TYPE, SERIES_CHUNK_TYPE
@@ -38,7 +38,10 @@ from ..utils import (
 from ..operands import DataFrameOperandMixin, DataFrameShuffleProxy
 
 
-cudf = lazy_import("cudf", globals=globals())
+cudf = lazy_import("cudf")
+
+_GROUP_KEYS_NO_DEFAULT = pd_release_version >= (1, 5, 0)
+_default_group_keys = no_default if _GROUP_KEYS_NO_DEFAULT else True
 
 
 class DataFrameGroupByOperand(MapReduceOperand, DataFrameOperandMixin):
@@ -274,9 +277,7 @@ class DataFrameGroupByOperand(MapReduceOperand, DataFrameOperandMixin):
                 chunk_by = []
                 for k in by:
                     if isinstance(k, SERIES_TYPE):
-                        by_chunk = k.cix[
-                            chunk.index[0],
-                        ]
+                        by_chunk = k.cix[chunk.index[0],]
                         chunk_by.append(by_chunk)
                         chunk_inputs.append(by_chunk)
                     else:
@@ -284,7 +285,9 @@ class DataFrameGroupByOperand(MapReduceOperand, DataFrameOperandMixin):
                 map_op._by = chunk_by
             map_chunks.append(
                 map_op.new_chunk(
-                    chunk_inputs, shape=(np.nan, np.nan), index=chunk.index
+                    chunk_inputs,
+                    shape=(np.nan, np.nan),
+                    index=chunk.index,
                 )
             )
 
@@ -294,11 +297,14 @@ class DataFrameGroupByOperand(MapReduceOperand, DataFrameOperandMixin):
 
         # generate reduce chunks
         reduce_chunks = []
-        for out_idx in itertools.product(*(range(s) for s in chunk_shape)):
+        out_indices = list(itertools.product(*(range(s) for s in chunk_shape)))
+        for ordinal, out_idx in enumerate(out_indices):
             reduce_op = op.copy().reset_key()
             reduce_op._by = None
             reduce_op._output_types = [output_type]
             reduce_op.stage = OperandStage.reduce
+            reduce_op.reducer_ordinal = ordinal
+            reduce_op.n_reducers = len(out_indices)
             reduce_chunks.append(
                 reduce_op.new_chunk(
                     [proxy_chunk], shape=(np.nan, np.nan), index=out_idx
@@ -367,55 +373,72 @@ class DataFrameGroupByOperand(MapReduceOperand, DataFrameOperandMixin):
         else:
             on = None
 
-        if isinstance(df, tuple):
-            filters = hash_dataframe_on(df[0], on, op.shuffle_size, level=op.level)
-        else:
-            filters = hash_dataframe_on(df, on, op.shuffle_size, level=op.level)
+        # Get the filter rule corresponding to each df.
+        dfs = df if isinstance(df, tuple) else (df,)
+        counter = itertools.count()
+        df_filters = []
+        idx_to_index_and_filters = dict()
+        for item in dfs:
+            is_new = True
+            for _, (index, filters) in idx_to_index_and_filters.items():
+                if item.index.equals(index):
+                    df_filters.append(filters)
+                    is_new = False
+                    break
+            if is_new:
+                filters = hash_dataframe_on(item, on, op.shuffle_size, level=op.level)
+                idx_to_index_and_filters[next(counter)] = (item.index, filters)
+                df_filters.append(filters)
 
         def _take_index(src, f):
             result = src.iloc[f]
             if src.index.names:
                 result.index.names = src.index.names
+            if isinstance(src.index, pd.MultiIndex):
+                result.index = result.index.remove_unused_levels()
             if is_cudf(result):  # pragma: no cover
                 result = result.copy()
             return result
 
-        for index_idx, index_filter in enumerate(filters):
+        for index_idx in range(len(df_filters[0])):
             if is_dataframe_obj:
                 reducer_index = (index_idx, chunk.index[1])
             else:
                 reducer_index = (index_idx,)
-
+            filtered = []
+            filtered_by = []
+            for d, filters in zip(dfs, df_filters):
+                index_filter = filters[index_idx]
+                if deliver_by:
+                    for v in by:
+                        if isinstance(v, pd.Series):
+                            filtered_by.append(_take_index(v, index_filter))
+                        else:
+                            filtered_by.append(v)
+                filtered.append(_take_index(d, index_filter))
             if deliver_by:
-                filtered_by = []
-                for v in by:
-                    if isinstance(v, pd.Series):
-                        filtered_by.append(_take_index(v, index_filter))
-                    else:
-                        filtered_by.append(v)
-                if isinstance(df, tuple):
-                    ctx[chunk.key, reducer_index] = tuple(
-                        _take_index(x, index_filter) for x in df
-                    ) + (filtered_by, deliver_by)
-                else:
-                    ctx[chunk.key, reducer_index] = (
-                        _take_index(df, index_filter),
-                        filtered_by,
-                        deliver_by,
-                    )
+                ctx[chunk.key, reducer_index] = ctx.get_current_chunk().index, (
+                    *filtered,
+                    filtered_by,
+                    deliver_by,
+                )
             else:
                 if isinstance(df, tuple):
-                    ctx[chunk.key, reducer_index] = tuple(
-                        _take_index(x, index_filter) for x in df
-                    ) + (deliver_by,)
+                    ctx[chunk.key, reducer_index] = (
+                        ctx.get_current_chunk().index,
+                        tuple(filtered) + (deliver_by,),
+                    )
                 else:
-                    ctx[chunk.key, reducer_index] = _take_index(df, index_filter)
+                    ctx[chunk.key, reducer_index] = (
+                        ctx.get_current_chunk().index,
+                        filtered[0],
+                    )
 
     @classmethod
     def execute_reduce(cls, ctx, op: "DataFrameGroupByOperand"):
         xdf = cudf if op.gpu else pd
         chunk = op.outputs[0]
-        input_idx_to_df = dict(op.iter_mapper_data_with_index(ctx))
+        input_idx_to_df = dict(op.iter_mapper_data(ctx))
         row_idxes = sorted(input_idx_to_df.keys())
 
         res = []
@@ -481,11 +504,13 @@ class DataFrameGroupByOperand(MapReduceOperand, DataFrameOperandMixin):
                 level=op.level,
                 as_index=op.as_index,
                 sort=op.sort,
-                group_keys=op.group_keys,
+                group_keys=op.group_keys if op.group_keys is not None else no_default,
             )
 
 
-def groupby(df, by=None, level=None, as_index=True, sort=True, group_keys=True):
+def groupby(
+    df, by=None, level=None, as_index=True, sort=True, group_keys=_default_group_keys
+):
     if not as_index and df.op.output_types[0] == OutputType.series:
         raise TypeError("as_index=False only valid with DataFrame")
 
@@ -503,7 +528,7 @@ def groupby(df, by=None, level=None, as_index=True, sort=True, group_keys=True):
         level=level,
         as_index=as_index,
         sort=sort,
-        group_keys=group_keys,
+        group_keys=group_keys if group_keys is not no_default else None,
         output_types=output_types,
     )
     return op(df)

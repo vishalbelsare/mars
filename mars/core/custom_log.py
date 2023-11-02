@@ -58,7 +58,7 @@ class _LogWrapper:
         session_id = self.ctx.session_id
         tileable_op_key = self.op.tileable_op_key
         chunk_op_key = self.op.key
-        worker_addr = self.ctx.current_address
+        worker_addr = self.ctx.local_address
         log_path = self.log_path
 
         self.ctx.register_custom_log_path(
@@ -131,7 +131,7 @@ class LogFetcher:
             offsets = self._chunk_op_key_to_offsets
 
         if sizes is None:
-            sizes = 1 * 1024 ** 2  # 1M each time
+            sizes = 1 * 1024**2  # 1M each time
 
         result: dict = self._session.fetch_tileable_op_logs(
             self._tileable_op_key, offsets=offsets, sizes=sizes

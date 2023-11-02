@@ -51,25 +51,18 @@ async def actor_pools():
 
     worker_pool_1 = await start_pool()
     worker_pool_2 = await start_pool()
-    yield worker_pool_1, worker_pool_2
-    await worker_pool_1.stop()
-    await worker_pool_2.stop()
+    try:
+        yield worker_pool_1, worker_pool_2
+    finally:
+        await worker_pool_1.stop()
+        await worker_pool_2.stop()
 
 
 @pytest.fixture
 async def create_actors(actor_pools):
     worker_pool_1, worker_pool_2 = actor_pools
 
-    if sys.platform == "darwin":
-        plasma_dir = "/tmp"
-    else:
-        plasma_dir = "/dev/shm"
-    plasma_setup_params = dict(
-        store_memory=5 * 1024 * 1024, plasma_directory=plasma_dir, check_dir_size=False
-    )
-    storage_configs = (
-        {"plasma": plasma_setup_params} if not _is_windows else {"shared_memory": {}}
-    )
+    storage_configs = {"shared_memory": {}}
 
     manager_ref1 = await mo.create_actor(
         StorageManagerActor,
@@ -148,9 +141,9 @@ async def test_simple_transfer(create_actors):
 
 # test for cancelling happens when writing
 class MockReceiverManagerActor(ReceiverManagerActor):
-    async def do_write(self, message):
+    async def do_write(self, *args, **kw):
         await asyncio.sleep(3)
-        await super().do_write(message)
+        await super().do_write(*args, **kw)
 
 
 class MockSenderManagerActor(SenderManagerActor):
@@ -163,9 +156,11 @@ class MockSenderManagerActor(SenderManagerActor):
 
 # test for cancelling happens when creating writer
 class MockReceiverManagerActor2(ReceiverManagerActor):
-    async def create_writers(self, session_id, data_keys, data_sizes, level):
+    async def create_writers(self, session_id, data_keys, data_sizes, level, sub_infos):
         await asyncio.sleep(3)
-        return await super().create_writers(session_id, data_keys, data_sizes, level)
+        return await super().create_writers(
+            session_id, data_keys, data_sizes, level, sub_infos
+        )
 
 
 class MockSenderManagerActor2(SenderManagerActor):

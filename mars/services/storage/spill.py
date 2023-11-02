@@ -16,7 +16,7 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import List, Union, Tuple
+from typing import List, Tuple
 
 from ... import oscar as mo
 from ...storage import StorageLevel
@@ -165,13 +165,13 @@ async def spill(
     request_size: int,
     level: StorageLevel,
     band_name: str,
-    data_manager: Union[mo.ActorRef, DataManagerActor],
-    storage_handler: Union[mo.ActorRef, StorageHandlerActor],
+    data_manager: mo.ActorRefType[DataManagerActor],
+    storage_handler: mo.ActorRefType[StorageHandlerActor],
     block_size=None,
     multiplier=1.1,
 ):
     logger.debug(
-        "%s is full, need to spill %s bytes, " "multiplier is %s",
+        "%s is full, need to spill %s bytes, multiplier is %s",
         level,
         request_size,
         multiplier,
@@ -183,7 +183,7 @@ async def spill(
         level, band_name, request_size
     )
     logger.debug(
-        "Decide to spill %s bytes, " "data keys are %s", sum(spill_sizes), spill_keys
+        "Decide to spill %s bytes, data keys are %s", sum(spill_sizes), spill_keys
     )
 
     for (session_id, key), size in zip(spill_keys, spill_sizes):

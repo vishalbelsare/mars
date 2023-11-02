@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import numpy as np
+import pandas as pd
 import pytest
 
+from ....dataframe import core  # noqa: F401  # pylint: disable=unused-variable
 from ... import OutputType
-from .. import Operand, TileableOperandMixin, execute, estimate_size
+from .. import Operand, TileableOperandMixin, execute, estimate_size, ShuffleProxy
 
 
 class MyOperand(Operand, TileableOperandMixin):
@@ -73,6 +75,8 @@ class MyOperand5(MyOperand4):
 
 
 def test_execute():
+    op = MyOperand(extra_params={"my_extra_params": 1})
+    assert op.extra_params["my_extra_params"] == 1
     MyOperand.register_executor(lambda *_: 2)
     assert execute(dict(), MyOperand(_key="1")) == 2
     assert execute(dict(), MyOperand2(_key="1")) == 2
@@ -128,3 +132,20 @@ def test_post_execute(setup):
     assert (
         t2.execute(extra_config={"operand_executors": operand_executors}).fetch() == 2
     )
+
+
+def test_shuffle(setup):
+    from ....dataframe import DataFrame
+
+    chunk_size, n_rows = 10, 100
+    df = DataFrame(
+        pd.DataFrame(np.random.rand(n_rows, 3), columns=list("abc")),
+        chunk_size=chunk_size,
+    )
+    chunk_graph = df.groupby(["a"]).apply(lambda x: x).build_graph(tile=True)
+    [proxy_chunk] = [c for c in chunk_graph if isinstance(c.op, ShuffleProxy)]
+    successors = chunk_graph.successors(proxy_chunk)
+    n_reducers = successors[0].op.n_reducers
+    assert n_reducers == len(successors), (n_reducers, len(successors))
+    assert len(set(c.op.n_reducers for c in successors)) == 1
+    assert sorted([c.op.reducer_ordinal for c in successors]) == list(range(n_reducers))

@@ -22,6 +22,8 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 
+from ...resource import Resource, ZeroResource
+
 try:
     import scipy
 except ImportError:  # pragma: no cover
@@ -33,8 +35,8 @@ from ...utils import git_info, lazy_import
 from ...storage import StorageLevel
 from .core import WorkerSlotInfo, QuotaInfo, DiskInfo, StorageInfo
 
-cp = lazy_import("cupy", globals=globals(), rename="cp")
-cudf = lazy_import("cudf", globals=globals())
+cp = lazy_import("cupy", rename="cp")
+cudf = lazy_import("cudf")
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,7 @@ _is_initial = True
 def gather_node_env():
     from ...lib.mkl_interface import mkl_get_version
     from ...lib.nvutils import NVError
-    from ..._version import __version__ as mars_version
+    from ... import __version__ as mars_version
 
     global _is_initial
     if _is_initial:
@@ -131,14 +133,19 @@ def gather_node_env():
     return node_info
 
 
-def gather_node_resource(band_to_slots=None, use_gpu=True):
+def gather_node_resource(band_to_resource: Dict[str, Resource] = None, use_gpu=True):
     # todo numa can be supported by adding more bands
     res = dict()
     mem_info = mars_resource.virtual_memory()
     num_cpu = (
         mars_resource.cpu_count()
-        if band_to_slots is None
-        else band_to_slots.get("numa-0", None)
+        if band_to_resource is None
+        else band_to_resource.get("numa-0", ZeroResource).num_cpus
+    )
+    mem_bytes = (
+        mem_info.total
+        if band_to_resource is None
+        else band_to_resource.get("numa-0", ZeroResource).mem_bytes
     )
     if num_cpu:  # pragma: no branch
         res["numa-0"] = {
@@ -146,14 +153,18 @@ def gather_node_resource(band_to_slots=None, use_gpu=True):
             - mars_resource.cpu_percent() / 100.0,
             "cpu_total": num_cpu,
             "memory_avail": mem_info.available,
-            "memory_total": mem_info.total,
+            "memory_total": min(mem_info.total, mem_bytes),
         }
 
     if use_gpu:
         for idx, gpu_card_stat in enumerate(
             mars_resource.cuda_card_stats()
         ):  # pragma: no cover
-            num_gpu = 1 if band_to_slots is None else band_to_slots.get(f"gpu-{idx}")
+            num_gpu = (
+                1
+                if band_to_resource is None
+                else band_to_resource.get(f"gpu-{idx}", ZeroResource).num_gpus
+            )
             if not num_gpu:
                 continue
             res[f"gpu-{idx}"] = {

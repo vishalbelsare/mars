@@ -86,7 +86,7 @@ def process_iloc_indexes(inp, indexes):
                         index = index.fetch()
                     except (RuntimeError, ValueError):
                         raise NotImplementedError(
-                            "indexer on axis columns cannot be " "non-executed tensor"
+                            "indexer on axis columns cannot be non-executed tensor"
                         )
             if index.dtype != np.bool_:
                 index = index.astype(np.int64)
@@ -253,9 +253,9 @@ class DataFrameIlocGetItem(DataFrameOperand, HeadTailOptimizedOperandMixin):
     _input = KeyField("input")
     _indexes = ListField("indexes")
 
-    def __init__(self, indexes=None, gpu=False, sparse=False, output_types=None, **kw):
+    def __init__(self, indexes=None, gpu=None, sparse=False, output_types=None, **kw):
         super().__init__(
-            _indexes=indexes, _gpu=gpu, _sparse=sparse, _output_types=output_types, **kw
+            _indexes=indexes, gpu=gpu, sparse=sparse, _output_types=output_types, **kw
         )
         if not self.output_types:
             self.output_types = [OutputType.dataframe]
@@ -406,13 +406,13 @@ class DataFrameIlocSetItem(DataFrameOperand, DataFrameOperandMixin):
     _value = AnyField("value")
 
     def __init__(
-        self, indexes=None, value=None, gpu=False, sparse=False, output_types=None, **kw
+        self, indexes=None, value=None, gpu=None, sparse=False, output_types=None, **kw
     ):
         super().__init__(
             _indexes=indexes,
             _value=value,
-            _gpu=gpu,
-            _sparse=sparse,
+            gpu=gpu,
+            sparse=sparse,
             _output_types=output_types,
             **kw,
         )
@@ -502,9 +502,9 @@ class SeriesIlocGetItem(DataFrameOperand, HeadTailOptimizedOperandMixin):
     _input = KeyField("input")
     _indexes = ListField("indexes")
 
-    def __init__(self, indexes=None, gpu=False, sparse=False, output_types=None, **kw):
+    def __init__(self, indexes=None, gpu=None, sparse=False, output_types=None, **kw):
         super().__init__(
-            _indexes=indexes, _gpu=gpu, _sparse=sparse, _output_types=output_types, **kw
+            _indexes=indexes, gpu=gpu, sparse=sparse, _output_types=output_types, **kw
         )
         if not self.output_types:
             self.output_types = [OutputType.series]
@@ -582,12 +582,12 @@ class SeriesIlocSetItem(DataFrameOperand, DataFrameOperandMixin):
     _indexes = ListField("indexes")
     _value = AnyField("value")
 
-    def __init__(self, indexes=None, value=None, gpu=False, sparse=False, **kw):
+    def __init__(self, indexes=None, value=None, gpu=None, sparse=False, **kw):
         super().__init__(
             _indexes=indexes,
             _value=value,
-            _gpu=gpu,
-            _sparse=sparse,
+            gpu=gpu,
+            sparse=sparse,
             _output_types=[OutputType.series],
             **kw,
         )
@@ -666,9 +666,9 @@ class IndexIlocGetItem(DataFrameOperand, DataFrameOperandMixin):
     _input = KeyField("input")
     _indexes = ListField("indexes")
 
-    def __init__(self, indexes=None, gpu=False, sparse=False, output_types=None, **kw):
+    def __init__(self, indexes=None, gpu=None, sparse=False, output_types=None, **kw):
         super().__init__(
-            _indexes=indexes, _gpu=gpu, _sparse=sparse, _output_types=output_types, **kw
+            _indexes=indexes, gpu=gpu, sparse=sparse, _output_types=output_types, **kw
         )
         if not self.output_types:
             self.output_types = [OutputType.index]
@@ -711,6 +711,8 @@ class IndexIlocGetItem(DataFrameOperand, DataFrameOperandMixin):
             )
         else:
             indexes = tuple(op.indexes)
+            if len(indexes) == 1:
+                indexes = indexes[0]
         ctx[chunk.key] = idx[indexes]
 
     def __call__(self, idx):

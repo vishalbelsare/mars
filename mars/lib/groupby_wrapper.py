@@ -17,13 +17,15 @@ from collections.abc import Iterable
 
 import cloudpickle
 import numpy as np
-import pandas as pd
 from pandas.core.groupby import DataFrameGroupBy, SeriesGroupBy
 
-from ..utils import estimate_pandas_size
-from .version import parse as parse_version
+from ..utils import estimate_pandas_size, pd_release_version, no_default
 
-_HAS_SQUEEZE = parse_version(pd.__version__) < parse_version("1.1.0")
+_HAS_SQUEEZE = pd_release_version < (1, 1, 0)
+_HAS_DROPNA = pd_release_version >= (1, 1, 0)
+_GROUP_KEYS_NO_DEFAULT = pd_release_version >= (1, 5, 0)
+
+_default_group_keys = no_default if _GROUP_KEYS_NO_DEFAULT else True
 
 
 class GroupByWrapper:
@@ -39,9 +41,10 @@ class GroupByWrapper:
         selection=None,
         as_index=True,
         sort=True,
-        group_keys=True,
+        group_keys=_default_group_keys,
         squeeze=False,
         observed=False,
+        dropna=True,
         mutated=False,
         grouper_cache=None,
     ):
@@ -62,6 +65,7 @@ class GroupByWrapper:
         self.squeeze = fill_value(squeeze, "squeeze")
         self.observed = fill_value(observed, "observed")
         self.mutated = fill_value(mutated, "mutated")
+        self.dropna = fill_value(dropna, "dropna")
 
         if groupby_obj is None:
             groupby_kw = dict(
@@ -75,9 +79,12 @@ class GroupByWrapper:
                 squeeze=squeeze,
                 observed=observed,
                 mutated=mutated,
+                dropna=dropna,
             )
             if not _HAS_SQUEEZE:  # pragma: no branch
                 groupby_kw.pop("squeeze")
+            if not _HAS_DROPNA:  # pragma: no branch
+                groupby_kw.pop("dropna")
 
             if obj.ndim == 2:
                 self.groupby_obj = DataFrameGroupBy(obj, **groupby_kw)
@@ -107,6 +114,7 @@ class GroupByWrapper:
             group_keys=self.group_keys,
             squeeze=self.squeeze,
             observed=self.observed,
+            dropna=self.dropna,
             mutated=self.mutated,
         )
 
@@ -194,6 +202,7 @@ class GroupByWrapper:
             self.group_keys,
             self.squeeze,
             self.observed,
+            self.dropna,
             self.mutated,
             getattr(self.groupby_obj.grouper, "_cache", dict()),
         )
@@ -212,6 +221,7 @@ class GroupByWrapper:
             group_keys,
             squeeze,
             observed,
+            dropna,
             mutated,
             grouper_cache,
         ) = tp
@@ -231,6 +241,7 @@ class GroupByWrapper:
             group_keys=group_keys,
             squeeze=squeeze,
             observed=observed,
+            dropna=dropna,
             mutated=mutated,
             grouper_cache=grouper_cache,
         )
@@ -243,9 +254,10 @@ def wrapped_groupby(
     level=None,
     as_index=True,
     sort=True,
-    group_keys=True,
+    group_keys=_default_group_keys,
     squeeze=False,
     observed=False,
+    dropna=True,
 ):
     groupby_kw = dict(
         by=by,
@@ -256,9 +268,12 @@ def wrapped_groupby(
         group_keys=group_keys,
         squeeze=squeeze,
         observed=observed,
+        dropna=dropna,
     )
     if not _HAS_SQUEEZE:  # pragma: no branch
         groupby_kw.pop("squeeze")
+    if not _HAS_DROPNA:  # pragma: no branch
+        groupby_kw.pop("dropna")
 
     groupby_obj = obj.groupby(**groupby_kw)
-    return GroupByWrapper(obj, groupby_obj=groupby_obj)
+    return GroupByWrapper(obj, groupby_obj=groupby_obj, as_index=as_index)

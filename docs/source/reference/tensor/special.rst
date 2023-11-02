@@ -1,6 +1,18 @@
 Special Functions
 =================
 
+Airy functions
+--------------
+
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   mars.tensor.special.airy
+   mars.tensor.special.airye
+   mars.tensor.special.itairy
+
+
 Information Theory functions
 ----------------------------
 
@@ -35,7 +47,7 @@ Bessel functions
    mars.tensor.special.hankel2e
 
 
-Error function
+Error functions and fresnel integrals
 --------------
 
 .. autosummary::
@@ -43,6 +55,46 @@ Error function
    :nosignatures:
 
    mars.tensor.special.erf
+   mars.tensor.special.erfc
+   mars.tensor.special.erfcx
+   mars.tensor.special.erfi
+   mars.tensor.special.erfinv
+   mars.tensor.special.erfcinv
+   mars.tensor.special.wofz
+   mars.tensor.special.dawsn
+   mars.tensor.special.fresnel
+   mars.tensor.special.modfresnelp
+   mars.tensor.special.modfresnelm
+
+
+Ellipsoidal harmonics
+---------------------
+
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   mars.tensor.special.ellip_harm
+   mars.tensor.special.ellip_harm_2
+   mars.tensor.special.ellip_normal
+
+
+Elliptic functions and integrals
+---------------------
+
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   mars.tensor.special.ellipk
+   mars.tensor.special.ellipkm1
+   mars.tensor.special.ellipkinc
+   mars.tensor.special.ellipe
+   mars.tensor.special.ellipeinc
+   mars.tensor.special.elliprc
+   mars.tensor.special.elliprf
+   mars.tensor.special.elliprg
+   mars.tensor.special.elliprj
 
 
 Gamma and related functions

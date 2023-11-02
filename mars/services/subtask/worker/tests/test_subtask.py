@@ -18,21 +18,26 @@ import sys
 import time
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from ..... import oscar as mo
+from ..... import dataframe as md
 from ..... import tensor as mt
 from ..... import remote as mr
+from .....core import ExecutionError, ChunkGraph
 from .....core.context import get_context
 from .....core.graph import TileableGraph, TileableGraphBuilder, ChunkGraphBuilder
+from .....core.operand import OperandStage
+from .....resource import Resource
 from .....utils import Timer
 from ....cluster import MockClusterAPI
 from ....lifecycle import MockLifecycleAPI
-from ....meta import MockMetaAPI
+from ....meta import MockMetaAPI, MockWorkerMetaAPI
 from ....scheduling import MockSchedulingAPI
 from ....session import MockSessionAPI
 from ....storage import MockStorageAPI
-from ....task import new_task_id
+from ....task import new_task_id, MapReduceInfo
 from ....task.supervisor.manager import TaskManagerActor, TaskConfigurationActor
 from ....mutable import MockMutableAPI
 from ... import Subtask, SubtaskStatus, SubtaskResult
@@ -43,6 +48,13 @@ from ...worker.runner import SubtaskRunnerActor, SubtaskRunnerRef
 class FakeTaskManager(TaskManagerActor):
     def set_subtask_result(self, subtask_result: SubtaskResult):
         return
+
+    def get_map_reduce_info(self, task_id: str, map_reduce_id: int) -> MapReduceInfo:
+        return MapReduceInfo(
+            map_reduce_id=0,
+            reducer_indexes=[(0, 0)],
+            reducer_bands=[(self.address, "numa-0")],
+        )
 
 
 @pytest.fixture
@@ -62,9 +74,12 @@ async def actor_pool():
     async with pool:
         session_id = "test_session"
         # create mock APIs
-        await MockClusterAPI.create(pool.external_address, band_to_slots={"numa-0": 2})
+        await MockClusterAPI.create(
+            pool.external_address, band_to_resource={"numa-0": Resource(num_cpus=2)}
+        )
         await MockSessionAPI.create(pool.external_address, session_id=session_id)
         meta_api = await MockMetaAPI.create(session_id, pool.external_address)
+        await MockWorkerMetaAPI.create(session_id, pool.external_address)
         await MockLifecycleAPI.create(session_id, pool.external_address)
         storage_api = await MockStorageAPI.create(session_id, pool.external_address)
         await MockSchedulingAPI.create(session_id, pool.external_address)
@@ -73,6 +88,7 @@ async def actor_pool():
         # create configuration
         await mo.create_actor(
             TaskConfigurationActor,
+            dict(),
             dict(),
             uid=TaskConfigurationActor.default_uid(),
             address=pool.external_address,
@@ -137,6 +153,39 @@ async def test_subtask_success(actor_pool):
 
 
 @pytest.mark.asyncio
+async def test_shuffle_subtask(actor_pool):
+    pool, session_id, meta_api, storage_api, manager = actor_pool
+
+    pdf = pd.DataFrame({"f1": ["a", "b", "a"], "f2": [1, 2, 3]})
+    df = md.DataFrame(pdf)
+    result = df.groupby("f1").sum(method="shuffle")
+
+    graph = TileableGraph([result.data])
+    next(TileableGraphBuilder(graph).build())
+    chunk_graph = next(ChunkGraphBuilder(graph, fuse_enabled=False).build())
+    result_chunks = []
+    new_chunk_graph = ChunkGraph(result_chunks)
+    chunk_graph_iter = chunk_graph.topological_iter()
+    curr = None
+    for _ in range(3):
+        prev = curr
+        curr = next(chunk_graph_iter)
+        new_chunk_graph.add_node(curr)
+        if prev is not None:
+            new_chunk_graph.add_edge(prev, curr)
+    assert curr.op.stage == OperandStage.map
+    curr.op.extra_params = {"analyzer_map_reduce_id": 0}
+    result_chunks.append(curr)
+    subtask = Subtask(new_task_id(), session_id, new_task_id(), new_chunk_graph)
+    subtask_runner: SubtaskRunnerRef = await mo.actor_ref(
+        SubtaskRunnerActor.gen_uid("numa-0", 0), address=pool.external_address
+    )
+    await subtask_runner.run_subtask(subtask)
+    result = await subtask_runner.get_subtask_result()
+    assert result.status == SubtaskStatus.succeeded
+
+
+@pytest.mark.asyncio
 async def test_subtask_failure(actor_pool):
     pool, session_id, meta_api, storage_api, manager = actor_pool
 
@@ -149,8 +198,9 @@ async def test_subtask_failure(actor_pool):
     subtask_runner: SubtaskRunnerRef = await mo.actor_ref(
         SubtaskRunnerActor.gen_uid("numa-0", 0), address=pool.external_address
     )
-    with pytest.raises(FloatingPointError):
+    with pytest.raises(ExecutionError) as ex_info:
         await subtask_runner.run_subtask(subtask)
+    assert isinstance(ex_info.value.nested_error, FloatingPointError)
     result = await subtask_runner.get_subtask_result()
     assert result.status == SubtaskStatus.errored
     assert isinstance(result.error, FloatingPointError)
@@ -176,7 +226,7 @@ async def test_cancel_subtask(actor_pool):
     with Timer() as timer:
         # normal cancel by cancel asyncio Task
         aio_task = asyncio.create_task(
-            asyncio.wait_for(subtask_runner.cancel_subtask(), timeout=1)
+            asyncio.wait_for(asyncio.shield(subtask_runner.cancel_subtask()), timeout=1)
         )
         assert await subtask_runner.is_runner_free() is False
         with pytest.raises(asyncio.TimeoutError):
@@ -239,3 +289,23 @@ async def test_subtask_op_progress(actor_pool):
 
     result = await subtask_runner.get_subtask_result()
     assert result.progress == 1.0
+
+
+def test_update_subtask_result():
+    subtask_result = SubtaskResult(
+        subtask_id="test_subtask_abc",
+        status=SubtaskStatus.pending,
+        progress=0.0,
+        bands=[("127.0.0.1", "numa-0")],
+    )
+    new_result = SubtaskResult(
+        subtask_id="test_subtask_abc",
+        status=SubtaskStatus.succeeded,
+        progress=1.0,
+        bands=[("127.0.0.1", "numa-0")],
+        execution_start_time=1646125099.622051,
+        execution_end_time=1646125104.448726,
+    )
+    subtask_result.update(new_result)
+    assert subtask_result.execution_start_time == new_result.execution_start_time
+    assert subtask_result.execution_end_time == new_result.execution_end_time

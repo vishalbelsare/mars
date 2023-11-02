@@ -64,12 +64,16 @@ def _unique(values, *, return_inverse=False):
         lambda c, idx: c[: idx + 1],
         args=(nan_idx,),
         dtype=uniques.dtype,
-        shape=((np.nan,),) * uniques.ndim,
+        shape=(np.nan,) * uniques.ndim,
     )
     if return_inverse:
 
         def inv_mapper(c, idx):
-            c[c > idx] = idx
+            if c.flags.writeable:
+                c[c > idx] = idx
+            else:  # pragma: no cover
+                # If c is got from the shared memory, it is immutable.
+                c = np.select([c <= idx], [c], idx)
             return c
 
         inverse = inverse.map_chunk(
@@ -79,7 +83,6 @@ def _unique(values, *, return_inverse=False):
             shape=((np.nan,),) * inverse.ndim,
         )
 
-    if return_inverse:
         return uniques, inverse
     return uniques
 

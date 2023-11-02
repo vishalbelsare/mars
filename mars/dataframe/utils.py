@@ -12,11 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import sys
+import cloudpickle
 import functools
 import itertools
+import inspect
+import logging
 import operator
 from contextlib import contextmanager
 from numbers import Integral
+from typing import List, Union, Any
 
 import numpy as np
 import pandas as pd
@@ -24,17 +30,39 @@ from pandas.api.types import is_string_dtype
 from pandas.api.extensions import ExtensionDtype
 from pandas.core.dtypes.cast import find_common_type
 
+from ..config import options
 from ..core import Entity, ExecutableTuple
+from ..core.context import Context, get_context
 from ..lib.mmh3 import hash as mmh_hash
 from ..tensor.utils import dictify_chunk_size, normalize_chunk_sizes
-from ..utils import tokenize, sbytes, lazy_import, ModulePlaceholder
+from ..typing import ChunkType, TileableType
+from ..utils import (
+    tokenize,
+    sbytes,
+    lazy_import,
+    ModulePlaceholder,
+    is_full_slice,
+    parse_readable_size,
+    is_on_ray,
+    parse_version,
+)
 
 try:
     import pyarrow as pa
 except ImportError:  # pragma: no cover
     pa = ModulePlaceholder("pyarrow")
 
-cudf = lazy_import("cudf", globals=globals(), rename="cudf")
+cudf = lazy_import("cudf", rename="cudf")
+vineyard = lazy_import("vineyard")
+try:
+    import ray
+
+    ray_release_version = parse_version(ray.__version__).release
+    ray_deprecate_ml_dataset = ray_release_version[:2] >= (2, 0)
+except ImportError:
+    ray_release_version = None
+    ray_deprecate_ml_dataset = None
+logger = logging.getLogger(__name__)
 
 
 def hash_index(index, size):
@@ -78,9 +106,9 @@ def hash_dtypes(dtypes, size):
     return [dtypes[index] for index in hashed_indexes]
 
 
-def sort_dataframe_inplace(df, *axis):
+def sort_dataframe_inplace(df, *axis, **kw):
     for ax in axis:
-        df.sort_index(axis=ax, inplace=True)
+        df.sort_index(axis=ax, inplace=True, **kw)
     return df
 
 
@@ -146,8 +174,6 @@ def decide_dataframe_chunk_sizes(shape, chunk_size, memory_usage):
     :return: the calculated chunk size for each dimension
     :rtype: tuple
     """
-    from ..config import options
-
     chunk_size = dictify_chunk_size(shape, chunk_size)
     average_memory_usage = memory_usage / shape[0]
 
@@ -190,10 +216,10 @@ def decide_dataframe_chunk_sizes(shape, chunk_size, memory_usage):
             int(np.power(max_chunk_size / nbytes_occupied, 1 / float(nleft))), 1
         )
 
-        if col_left_size == 0:
+        if col_left_size == 0 and not col_chunk_size:
             col_chunk_size.append(0)
 
-        if row_left_size == 0:
+        if row_left_size == 0 and not row_chunk_size:
             row_chunk_size.append(0)
 
         # check col first
@@ -219,8 +245,6 @@ def decide_dataframe_chunk_sizes(shape, chunk_size, memory_usage):
 
 
 def decide_series_chunk_size(shape, chunk_size, memory_usage):
-    from ..config import options
-
     chunk_size = dictify_chunk_size(shape, chunk_size)
     average_memory_usage = memory_usage / shape[0] if shape[0] != 0 else memory_usage
 
@@ -582,7 +606,7 @@ def build_df(df_obj, fill_value=1, size=1, ensure_string=False):
         for i, dtype in enumerate(dtypes):
             s = df.iloc[:, i]
             if not pd.api.types.is_dtype_equal(s.dtype, dtype):
-                df.iloc[:, i] = s.astype(dtype)
+                df[df.columns[i]] = s.astype(dtype)
         dfs.append(df)
     if len(dfs) == 1:
         ret_df = dfs[0]
@@ -632,7 +656,7 @@ def build_series(
         except AttributeError:
             series_index = series_obj.index[:0]
     else:
-        series_index = index[:0] if index else None
+        series_index = index[:0] if index is not None else None
 
     for size, fill_value in zip(sizes, fill_values):
         empty_series = build_empty_series(dtype, name=name, index=series_index)
@@ -713,12 +737,34 @@ def build_concatenated_rows_frame(df):
     return DataFrameConcat(axis=1, output_types=[OutputType.dataframe]).new_dataframe(
         [df],
         chunks=out_chunks,
-        nsplits=((chunk.shape[0] for chunk in out_chunks), (df.shape[1],)),
+        nsplits=(tuple(chunk.shape[0] for chunk in out_chunks), (df.shape[1],)),
         shape=df.shape,
         dtypes=df.dtypes,
         index_value=df.index_value,
         columns_value=df.columns_value,
     )
+
+
+def is_index_value_identical(left: TileableType, right: TileableType) -> bool:
+    if (
+        left.index_value.key == right.index_value.key
+        and not np.isnan(sum(left.nsplits[0]))
+        and not np.isnan(sum(right.nsplits[0]))
+        and left.nsplits[0] == right.nsplits[0]
+    ):
+        is_identical = True
+    else:
+        target_chunk_index_values = [
+            c.index_value for c in left.chunks if len(c.index) <= 1 or c.index[1] == 0
+        ]
+        value_chunk_index_values = [v.index_value for v in right.chunks]
+        is_identical = len(target_chunk_index_values) == len(
+            value_chunk_index_values
+        ) and all(
+            c.key == v.key
+            for c, v in zip(target_chunk_index_values, value_chunk_index_values)
+        )
+    return is_identical
 
 
 def _filter_range_index(pd_range_index, min_val, min_val_close, max_val, max_val_close):
@@ -760,7 +806,9 @@ def infer_index_value(left_index_value, right_index_value):
     ):
         if left_index_value.value.slice == right_index_value.value.slice:
             return left_index_value
-        return parse_index(pd.Int64Index([]), left_index_value, right_index_value)
+        return parse_index(
+            pd.Index([], dtype=np.int64), left_index_value, right_index_value
+        )
 
     # when left index and right index is identical, and both of them are elements unique,
     # we can infer that the out index should be identical also
@@ -804,9 +852,13 @@ def filter_index_value(index_value, min_max, store_data=False):
     return parse_index(pd_index[f], store_data=store_data)
 
 
-def indexing_index_value(index_value, indexes, store_data=False):
+def indexing_index_value(index_value, indexes, store_data=False, rechunk=False):
     pd_index = index_value.to_pandas()
-    if not index_value.has_value():
+    # when rechunk is True, the output index shall be treated
+    # different from the input one
+    if not rechunk and isinstance(indexes, slice) and is_full_slice(indexes):
+        return index_value
+    elif not index_value.has_value():
         new_index_value = parse_index(pd_index, indexes, store_data=store_data)
         new_index_value._index_value._min_val = index_value.min_val
         new_index_value._index_value._min_val_close = index_value.min_val_close
@@ -1057,7 +1109,7 @@ def validate_output_types(**kwargs):
     )
 
 
-def standardize_range_index(chunks, axis=0):
+def standardize_range_index(chunks: List[ChunkType], axis: int = 0):
     from .base.standardize_range_index import ChunkStandardizeRangeIndex
 
     row_chunks = dict(
@@ -1067,13 +1119,23 @@ def standardize_range_index(chunks, axis=0):
 
     out_chunks = []
     for c in chunks:
-        inputs = row_chunks[: c.index[axis]] + [c]
+        prev_chunks = row_chunks[: c.index[axis]]
         op = ChunkStandardizeRangeIndex(
-            pure_depends=[True] * (len(inputs) - 1) + [False],
-            axis=axis,
-            output_types=c.op.output_types,
+            prev_shapes=[p.shape for p in prev_chunks], axis=axis
         )
-        out_chunks.append(op.new_chunk(inputs, **c.params.copy()))
+        op.output_types = c.op.output_types
+        params = c.params.copy()
+        start_pos = sum(p.shape[axis] for p in prev_chunks)
+        end_pos = start_pos + c.shape[axis]
+        index = pd.RangeIndex(start_pos, end_pos)
+        if axis == 0:
+            params["index_value"] = parse_index(index)
+        else:
+            dtypes = params["dtypes"]
+            dtypes.index = index
+            params["dtypes"] = dtypes
+            params["columns_value"] = parse_index(dtypes.index, store_data=True)
+        out_chunks.append(op.new_chunk([c], kws=[params]))
 
     return out_chunks
 
@@ -1252,10 +1314,7 @@ def make_dtypes(dtypes):
     if dtypes is None:
         return None
     if not isinstance(dtypes, pd.Series):
-        if isinstance(dtypes, dict):
-            dtypes = pd.Series(dtypes.values(), index=dtypes.keys())
-        else:
-            dtypes = pd.Series(dtypes)
+        dtypes = pd.Series(dtypes)
     return dtypes.apply(make_dtype)
 
 
@@ -1292,3 +1351,249 @@ def is_cudf(x):
         if isinstance(x, (cudf.DataFrame, cudf.Series, cudf.Index)):
             return True
     return False
+
+
+def auto_merge_chunks(
+    ctx: Context,
+    df_or_series: TileableType,
+    merged_file_size: Union[int, float, str] = None,
+) -> TileableType:
+    from .merge import DataFrameConcat
+
+    if df_or_series.ndim == 2 and df_or_series.chunk_shape[1] > 1:
+        # skip auto merge optimization for DataFrame
+        # that has more than 1 chunks on columns axis
+        return df_or_series
+
+    metas = ctx.get_chunks_meta(
+        [c.key for c in df_or_series.chunks], fields=["memory_size"], error="ignore"
+    )
+    memory_sizes = [meta["memory_size"] if meta is not None else None for meta in metas]
+    if any(size is None for size in memory_sizes):
+        # has not been executed before, cannot get accurate memory size, skip auto merge
+        return df_or_series
+
+    def _concat_chunks(merge_chunks: List[ChunkType], output_index: int):
+        chunk_size = sum(c.shape[0] for c in merge_chunks)
+        concat_op = DataFrameConcat(output_types=df_or_series.op.output_types)
+        if df_or_series.ndim == 1:
+            kw = dict(
+                dtype=df_or_series.dtype,
+                index_value=merge_index_value(
+                    {c.index: c.index_value for c in merge_chunks}
+                ),
+                shape=(chunk_size,),
+                index=(output_index,),
+                name=df_or_series.name,
+            )
+        else:
+            kw = dict(
+                dtypes=merge_chunks[0].dtypes,
+                index_value=merge_index_value(
+                    {c.index: c.index_value for c in merge_chunks}
+                ),
+                columns_value=merge_chunks[0].columns_value,
+                shape=(chunk_size, merge_chunks[0].shape[1]),
+                index=(output_index, 0),
+            )
+        return concat_op.new_chunk(merge_chunks, **kw)
+
+    to_merge_size = (
+        parse_readable_size(merged_file_size)[0]
+        if merged_file_size is not None
+        else options.chunk_store_limit
+    )
+    to_merge_chunks = []
+    acc_memory_size = 0
+    n_split = []
+    out_chunks = []
+    last_idx = len(memory_sizes) - 1
+    for idx, (chunk, chunk_memory_size) in enumerate(
+        zip(df_or_series.chunks, memory_sizes)
+    ):
+        to_merge_chunks.append(chunk)
+        acc_memory_size += chunk_memory_size
+        if (
+            acc_memory_size + chunk_memory_size > to_merge_size
+            and len(to_merge_chunks) > 0
+        ) or idx == last_idx:
+            # adding current chunk would exceed the maximum,
+            # concat previous chunks
+            if len(to_merge_chunks) == 1:
+                # do not generate concat op for 1 input.
+                c = to_merge_chunks[0].copy()
+                c._index = (
+                    (len(n_split),) if df_or_series.ndim == 1 else (len(n_split), 0)
+                )
+                out_chunks.append(c)
+                n_split.append(c.shape[0])
+            else:
+                merged_chunk = _concat_chunks(to_merge_chunks, len(n_split))
+                out_chunks.append(merged_chunk)
+                n_split.append(merged_chunk.shape[0])
+            # reset
+            acc_memory_size = 0
+            to_merge_chunks = []
+    # process the last chunk
+    assert len(to_merge_chunks) == 0
+    new_op = df_or_series.op.copy()
+    params = df_or_series.params.copy()
+    params["chunks"] = out_chunks
+    if df_or_series.ndim == 1:
+        params["nsplits"] = (tuple(n_split),)
+    else:
+        params["nsplits"] = (tuple(n_split), df_or_series.nsplits[1])
+    return new_op.new_tileable(df_or_series.op.inputs, kws=[params])
+
+
+# TODO: clean_up_func, is_on_ray and restore_func functions may be
+# removed or refactored in the future to calculate func size
+# with more accuracy as well as address some serialization issues.
+def clean_up_func(op):
+    threshold = int(os.getenv("MARS_CLOSURE_CLEAN_UP_BYTES_THRESHOLD", 10**4))
+    if threshold == -1:  # pragma: no cover
+        return
+    ctx = get_context()
+    if ctx is None:
+        return
+
+    # Note: op.func_key is set only when func was put into storage.
+    # Under ray backend, func will be put into storage.
+    # While under mars backend, since storage service is empty on supervisor,
+    # func won't be put into storage but serialized in advance to reduce upcoming
+    # expenses brought by serializations and deserializations during subtask transmission.
+    if whether_to_clean_up(op, threshold) is True:
+        assert (
+            op.logic_key is not None
+        ), f"Logic key of {op} wasn't calculated before cleaning up func."
+        logger.info("%s is cleaning up func %s.", op, op.func)
+        if is_on_ray(ctx):
+            import ray
+
+            op.func_key = ray.put(op.func)
+            logger.info("%s func %s is replaced by %s.", op, op.func, op.func_key)
+            op.func = None
+        else:
+            op.func = cloudpickle.dumps(op.func)
+
+
+def whether_to_clean_up(op, threshold):
+    func = op.func
+    counted_bytes = 0
+    max_recursion_depth = 2
+
+    from numbers import Number
+    from collections import deque
+
+    BYPASS_CLASSES = (str, bytes, Number, range, bytearray, pd.DataFrame, pd.Series)
+
+    class GetSizeEarlyStopException(Exception):
+        pass
+
+    def check_exceed_threshold():
+        nonlocal threshold, counted_bytes
+        if counted_bytes >= threshold:
+            raise GetSizeEarlyStopException()
+
+    def getsize(obj_outer):
+        _seen_obj_ids = set()
+
+        def inner_count(obj, recursion_depth):
+            obj_id = id(obj)
+            if obj_id in _seen_obj_ids or recursion_depth > max_recursion_depth:
+                return 0
+            _seen_obj_ids.add(obj_id)
+            recursion_depth += 1
+            size = sys.getsizeof(obj)
+            if isinstance(obj, BYPASS_CLASSES):
+                return size
+            elif isinstance(obj, (tuple, list, set, deque)):
+                size += sum(inner_count(i, recursion_depth) for i in obj)
+            elif hasattr(obj, "items"):
+                size += sum(
+                    inner_count(k, recursion_depth) + inner_count(v, recursion_depth)
+                    for k, v in getattr(obj, "items")()
+                )
+            if hasattr(obj, "__dict__"):
+                size += inner_count(vars(obj), recursion_depth)
+            if hasattr(obj, "__slots__"):
+                size += sum(
+                    inner_count(getattr(obj, s), recursion_depth)
+                    for s in obj.__slots__
+                    if hasattr(obj, s)
+                )
+            return size
+
+        return inner_count(obj_outer, 0)
+
+    try:
+        # Note: In most cases, func is just a function with closure, while chances are that
+        # func is a callable that doesn't have __closure__ attribute.
+        if inspect.isclass(func):
+            pass
+        elif hasattr(func, "__closure__") and func.__closure__ is not None:
+            for cell in func.__closure__:
+                counted_bytes += getsize(cell.cell_contents)
+                check_exceed_threshold()
+        elif callable(func):
+            if hasattr(func, "__dict__"):
+                for k, v in func.__dict__.items():
+                    counted_bytes += sum([getsize(k), getsize(v)])
+                    check_exceed_threshold()
+            if hasattr(func, "__slots__"):
+                for slot in func.__slots__:
+                    counted_bytes += (
+                        getsize(getattr(func, slot)) if hasattr(func, slot) else 0
+                    )
+                    check_exceed_threshold()
+    except GetSizeEarlyStopException:
+        logger.debug("Func needs cleanup.")
+        op.need_clean_up_func = True
+    else:
+        assert op.need_clean_up_func is False
+        logger.debug("Func doesn't need cleanup.")
+
+    return op.need_clean_up_func
+
+
+def restore_func(ctx: Context, op):
+    if op.need_clean_up_func and ctx is not None:
+        logger.info("%s is restoring func from %s.", op, op.func_key)
+        if is_on_ray(ctx):
+            import ray
+
+            op.func = ray.get(op.func_key)
+            logger.info("%s func %s is restored.", op, op.func)
+        else:
+            op.func = cloudpickle.loads(op.func)
+
+
+def concat_on_columns(objs: List) -> Any:
+    xdf = get_xdf(objs[0])
+    # In cudf, concat with axis=1 and ignore_index=False by default behaves opposite to pandas.
+    # Cudf would reset the index when axis=1 and ignore_index=False, which does not match with its document.
+    # Therefore, we deal with this case specially.
+    result = xdf.concat(objs, axis=1)
+    if xdf is cudf:
+        result.index = objs[0].index
+    return result
+
+
+def patch_sa_engine_execute():
+    """
+    pandas did not resolve compatibility issue of sqlalchemy 2.0, the issue
+    is https://github.com/pandas-dev/pandas/issues/40686. We need to patch
+    Engine class in SQLAlchemy, and then our code can work well.
+    """
+    try:
+        from sqlalchemy.engine import Engine
+    except ImportError:  # pragma: no cover
+        return
+
+    def execute(self, statement, *multiparams, **params):
+        connection = self.connect()
+        return connection.execute(statement, *multiparams, **params)
+
+    if hasattr(Engine, "execute"):  # pragma: no cover
+        return
+    Engine.execute = execute

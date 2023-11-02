@@ -20,6 +20,7 @@ import pandas as pd
 import pytest
 
 from .... import oscar as mo
+from ....resource import Resource
 from ....serialization import AioDeserializer, AioSerializer
 from ....storage import StorageLevel
 from ....tests.core import require_cudf, require_cupy
@@ -48,27 +49,20 @@ async def actor_pools():
         return pool
 
     worker_pool = await start_pool()
-    yield worker_pool
-    await worker_pool.stop()
+    try:
+        yield worker_pool
+    finally:
+        await worker_pool.stop()
 
 
 @pytest.mark.asyncio
 async def test_storage_service(actor_pools):
     worker_pool = actor_pools
 
-    if sys.platform == "darwin":
-        plasma_dir = "/tmp"
-    else:
-        plasma_dir = "/dev/shm"
-    plasma_setup_params = dict(
-        store_memory=10 * 1024 * 1024, plasma_directory=plasma_dir, check_dir_size=False
-    )
-
     config = {
         "services": ["storage"],
         "storage": {
-            "backends": ["plasma" if not _is_windows else "shared_memory"],
-            "plasma": plasma_setup_params,
+            "backends": ["shared_memory"],
         },
     }
 
@@ -137,8 +131,10 @@ async def actor_pools_with_gpu():
         return pool
 
     worker_pool = await start_pool()
-    yield worker_pool
-    await worker_pool.stop()
+    try:
+        yield worker_pool
+    finally:
+        await worker_pool.stop()
 
 
 @require_cupy
@@ -150,26 +146,21 @@ async def test_storage_service_with_cuda(actor_pools_with_gpu):
 
     worker_pool = actor_pools_with_gpu
 
-    if sys.platform == "darwin":
-        plasma_dir = "/tmp"
-    else:
-        plasma_dir = "/dev/shm"
-    plasma_setup_params = dict(
-        store_memory=10 * 1024 * 1024, plasma_directory=plasma_dir, check_dir_size=False
-    )
-
     config = {
         "services": ["storage"],
         "storage": {
-            "backends": ["plasma" if not _is_windows else "shared_memory", "cuda"],
-            "plasma": plasma_setup_params,
+            "backends": ["shared_memory", "cuda"],
+            "shared_memory": dict(),
             "cuda": dict(),
         },
     }
 
     await MockClusterAPI.create(
         worker_pool.external_address,
-        band_to_slots={"numa-0": 1, "gpu-0": 1},
+        band_to_resource={
+            "numa-0": Resource(num_cpus=1),
+            "gpu-0": Resource(num_gpus=1),
+        },
         use_gpu=True,
     )
     await start_services(NodeRole.WORKER, config, address=worker_pool.external_address)

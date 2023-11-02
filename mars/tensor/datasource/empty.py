@@ -66,7 +66,7 @@ class TensorEmpty(TensorEmptyBase, TensorNoInput):
         )
 
 
-def empty(shape, dtype=None, chunk_size=None, gpu=False, order="C"):
+def empty(shape, dtype=None, chunk_size=None, gpu=None, order="C"):
     """
     Return a new tensor of given shape and type, without initializing entries.
 
@@ -131,7 +131,7 @@ class TensorEmptyLike(TensorEmptyBase, TensorLike):
 
     def __init__(self, dtype=None, gpu=None, sparse=False, order=None, **kw):
         dtype = np.dtype(dtype) if dtype is not None else None
-        super().__init__(_dtype=dtype, _gpu=gpu, _order=order, _sparse=sparse, **kw)
+        super().__init__(dtype=dtype, gpu=gpu, _order=order, sparse=sparse, **kw)
 
     @property
     def order(self):

@@ -298,7 +298,7 @@ class SliceIndexHandler(IndexHandler):
     def preprocess(self, index_info: IndexInfo, context: IndexHandlerContext) -> None:
         # make sure input tileable has known chunk shapes
         if has_unknown_shape(context.tileable):
-            yield []
+            yield
 
     def process(self, index_info: IndexInfo, context: IndexHandlerContext) -> None:
         tileable = context.tileable
@@ -356,8 +356,8 @@ class IntegralIndexHandler(IndexHandler):
         return info
 
     def preprocess(self, index_info: IndexInfo, context: IndexHandlerContext) -> None:
-        if has_unknown_shape(context.tileable):
-            yield []
+        if has_unknown_shape(context.tileable):  # pragma: no cover
+            yield
 
     def process(self, index_info: IndexInfo, context: IndexHandlerContext) -> None:
         tileable = context.tileable
@@ -415,8 +415,8 @@ class NDArrayBoolIndexHandler(_BoolIndexHandler):
         return isinstance(raw_index, np.ndarray) and raw_index.dtype == np.bool_
 
     def preprocess(self, index_info: IndexInfo, context: IndexHandlerContext) -> None:
-        if has_unknown_shape(context.tileable):
-            yield []
+        if has_unknown_shape(context.tileable):  # pragma: no cover
+            yield
 
     def process(self, index_info: IndexInfo, context: IndexHandlerContext) -> None:
         tileable = context.tileable
@@ -466,9 +466,9 @@ class TensorBoolIndexHandler(_BoolIndexHandler):
     def preprocess(self, index_info: IndexInfo, context: IndexHandlerContext) -> None:
         # check both input tileable and index object itself
         if has_unknown_shape(context.tileable):
-            yield []
-        if has_unknown_shape(index_info.raw_index):
-            yield []
+            yield
+        if has_unknown_shape(index_info.raw_index):  # pragma: no cover
+            yield
 
     def process(self, index_info: IndexInfo, context: IndexHandlerContext) -> None:
         tileable = context.tileable
@@ -555,8 +555,8 @@ class NDArrayFancyIndexHandler(_FancyIndexHandler):
 
         # check if all ndarrays
         super().preprocess(index_info, context)
-        if has_unknown_shape(context.tileable):
-            yield []
+        if has_unknown_shape(context.tileable):  # pragma: no cover
+            yield
 
         fancy_index_infos = context.get_indexes(index_info.index_type)
         # unify shapes of all fancy indexes
@@ -778,11 +778,15 @@ class TensorFancyIndexHandler(_FancyIndexHandler):
         )
         chunk_index_to_fancy_index_chunks = OrderedDict()
         chunk_index_to_raw_positions = OrderedDict()
-        for chunk_index in itertools.product(
-            *(range(tileable.chunk_shape[ax]) for ax in axes)
-        ):
+        out_indices = list(
+            itertools.product(*(range(tileable.chunk_shape[ax]) for ax in axes))
+        )
+        for chunk_index in out_indices:
             reduce_op = FancyIndexingDistribute(
-                stage=OperandStage.reduce, axes=axes, dtype=proxy_chunk.dtype
+                stage=OperandStage.reduce,
+                axes=axes,
+                dtype=proxy_chunk.dtype,
+                n_reducers=len(out_indices),
             )
             # chunks of fancy indexes on each axis
             kws = [
@@ -916,9 +920,10 @@ class TensorFancyIndexHandler(_FancyIndexHandler):
             ).new_chunk(to_shuffle_chunks, shape=(), order=TensorOrder.C_ORDER)
 
             it = itertools.count()
-            for reduce_index in itertools.product(
-                *(range(s) for s in fancy_indexes[0].chunk_shape)
-            ):
+            out_indices = list(
+                itertools.product(*(range(s) for s in fancy_indexes[0].chunk_shape))
+            )
+            for ordinal, reduce_index in enumerate(out_indices):
                 fancy_index_chunk = fancy_indexes[0].cix[reduce_index]
                 concat_reduce_op = FancyIndexingConcat(
                     stage=OperandStage.reduce,
@@ -927,6 +932,7 @@ class TensorFancyIndexHandler(_FancyIndexHandler):
                     dtype=proxy_chunk.dtype,
                     sparse=to_shuffle_chunks[0].issparse(),
                     reducer_index=(next(it),),
+                    n_reducers=len(out_indices),
                 )
                 reduce_chunk_shape = (
                     other_shape[:to_concat_axis]

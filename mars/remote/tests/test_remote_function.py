@@ -19,9 +19,11 @@ import pandas as pd
 import pytest
 
 from ... import dataframe as md
+from ... import get_context
+from ... import oscar as mo
 from ... import tensor as mt
 from ...core import tile
-from ...deploy.oscar.session import get_default_session
+from ...session import get_default_session
 from ...learn.utils import shuffle
 from ...lib.mmh3 import hash as mmh3_hash
 from .. import spawn, ExecutableTuple
@@ -67,6 +69,9 @@ def test_remote_function(setup):
     with pytest.raises(TypeError):
         spawn(f2, (r1, r2), kwargs=())
 
+    with pytest.raises(ValueError, match="Unexpected kw: k"):
+        spawn(f2, (r1, r2), k=1)
+
     session_id = session.session_id
 
     def f():
@@ -74,6 +79,62 @@ def test_remote_function(setup):
         return mt.ones((2, 3)).sum().to_numpy()
 
     assert spawn(f).execute().fetch() == 6
+
+
+def test_context(setup_cluster):
+    def get_workers():
+        ctx = get_context()
+        return ctx.get_worker_addresses()
+
+    def f1(worker: str):
+        ctx = get_context()
+        assert worker == ctx.worker_address
+        return np.random.rand(3, 3)
+
+    def f2(data_key: str, worker: str):
+        ctx = get_context()
+        assert worker == ctx.worker_address
+        meta = ctx.get_chunks_meta([data_key], fields=["bands"])[0]
+        assert len(meta) == 1
+        ctx.get_chunks_result([data_key], fetch_only=True)
+        # fetched, two workers have the data
+        meta = ctx.get_chunks_meta([data_key], fields=["bands"])[0]
+        assert len(meta["bands"]) == 2
+
+    workers = spawn(get_workers).execute().fetch()
+    assert len(workers) == len(set(workers)) > 1
+
+    r1 = spawn(f1, args=(workers[0],), expect_worker=workers[0]).execute()
+    data_key = r1._fetch_infos(fields=["data_key"])["data_key"][0]
+    r2 = spawn(f2, args=(data_key, workers[1]), expect_worker=workers[1])
+    r2.execute()
+
+    def get_bands():
+        ctx = get_context()
+        return [b for b in ctx.get_worker_bands() if b[1].startswith("numa-")]
+
+    def f3(band: tuple):
+        ctx = get_context()
+        assert band == ctx.band
+        return np.random.rand(3, 3)
+
+    def f4(data_key: str, band: tuple):
+        ctx = get_context()
+        assert band == ctx.band
+        meta = ctx.get_chunks_meta([data_key], fields=["bands"])[0]
+        assert len(meta) == 1
+        ctx.get_chunks_result([data_key], fetch_only=True)
+        # fetched, two bands have the data
+        meta = ctx.get_chunks_meta([data_key], fields=["bands"])[0]
+        assert len(meta["bands"]) == 2
+
+    bands = spawn(get_bands).execute().fetch()
+    assert len(bands) == len(set(bands)) > 1
+
+    r3 = spawn(f3, args=(bands[0],), expect_band=bands[0]).execute()
+    data_key = r3._fetch_infos(fields=["data_key"])["data_key"][0]
+    r4 = spawn(f4, args=(data_key, bands[1]), expect_band=bands[1])
+    r4.execute()
 
 
 def test_multi_output(setup):
@@ -188,3 +249,16 @@ def test_none_outputs(setup):
     r4 = spawn(f, args=(r2, r3))
 
     assert r4.execute().fetch() is None
+
+
+def test_remote_with_unpickable(setup_cluster):
+    def f(*_):
+        class Unpickleable:
+            def __reduce__(self):
+                raise ValueError
+
+        raise KeyError(Unpickleable())
+
+    with pytest.raises(mo.SendMessageFailed):
+        d = spawn(f, retry_when_fail=False)
+        d.execute()

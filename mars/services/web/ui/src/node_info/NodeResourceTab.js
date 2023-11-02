@@ -1,5 +1,5 @@
 /*
- * Copyright 1999-2021 Alibaba Group Holding Ltd.
+ * Copyright 1999-2022 Alibaba Group Holding Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -166,11 +166,6 @@ export default class NodeResourceTab extends React.Component {
         <div>Loading</div>
       );
     }
-    if (!this.state.loaded) {
-      return (
-        <div>Loading</div>
-      );
-    }
     return (
       <div>
         <Title component="h3">Bands</Title>
@@ -194,7 +189,7 @@ export default class NodeResourceTab extends React.Component {
             </TableRow>
           </TableHead>
           <TableBody>
-            {this.state.detail.iowait &&
+            {Boolean(this.state.detail.iowait) &&
               <TableRow>
                 <TableCell>IO Wait</TableCell>
                 <TableCell>{this.state.detail.iowait}</TableCell>
@@ -224,7 +219,7 @@ export default class NodeResourceTab extends React.Component {
             </TableRow>
           </TableBody>
         </Table>
-        {this.state.detail.disk.partitions &&
+        {Boolean(this.state.detail.disk.partitions) &&
           <React.Fragment>
             <Title component="h3">Disks</Title>
             <Table>
@@ -240,7 +235,7 @@ export default class NodeResourceTab extends React.Component {
             </Table>
           </React.Fragment>
         }
-        {Object.keys(this.state.detail.quota).length &&
+        {Object.keys(this.state.detail.quota).length > 0 &&
           <React.Fragment>
             <Title component="h3">Quota</Title>
             <Table>
@@ -271,7 +266,7 @@ export default class NodeResourceTab extends React.Component {
             </Table>
           </React.Fragment>
         }
-        {Object.keys(this.state.detail.slot).length &&
+        {Object.keys(this.state.detail.slot).length > 0 &&
           <React.Fragment>
             <Title component="h3">Slot</Title>
             <Table>
@@ -292,7 +287,7 @@ export default class NodeResourceTab extends React.Component {
             </Table>
           </React.Fragment>
         }
-        {Object.keys(this.state.detail.storage).length &&
+        {Object.keys(this.state.detail.storage).length > 0 &&
           <React.Fragment>
             <Title component="h3">Storage</Title>
             <Table>

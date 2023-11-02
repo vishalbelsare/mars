@@ -143,7 +143,7 @@ cdef class DirectedGraph:
         try:
             return list(self._successors[n])
         except KeyError:
-            return KeyError(f'Node {n} does not exist in the directed graph')
+            raise KeyError(f'Node {n} does not exist in the directed graph')
 
     def iter_predecessors(self, n):
         try:
@@ -313,7 +313,12 @@ cdef class DirectedGraph:
     def _extract_operands(self, node):
         return [node.op]
 
-    def to_dot(self, graph_attrs=None, node_attrs=None, trunc_key=5, result_chunk_keys=None):
+    def to_dot(
+        self,
+        graph_attrs=None,
+        node_attrs=None,
+        trunc_key=5, result_chunk_keys=None, show_columns=False):
+
         sio = StringIO()
         sio.write('digraph {\n')
         sio.write('splines=curved\n')
@@ -330,6 +335,15 @@ cdef class DirectedGraph:
         operand_style = '[shape=circle]'
 
         visited = set()
+
+        def get_col_names(obj):
+            if hasattr(obj, "dtypes"):
+                return f"\"{','.join(list(obj.dtypes.index))}\""
+            elif hasattr(obj, "name"):
+                return f"\"{obj.name}\""
+            else:
+                return "\"N/A\""
+
         for node in self.iter_nodes():
             for op in self._extract_operands(node):
                 op_name = type(op).__name__
@@ -339,31 +353,48 @@ cdef class DirectedGraph:
                     continue
                 for input_chunk in (op.inputs or []):
                     if input_chunk.key not in visited:
-                        sio.write(f'"Chunk:{input_chunk.key[:trunc_key]}" {chunk_style}\n')
+                        sio.write(f'"Chunk:{self._gen_chunk_key(input_chunk, trunc_key)}" {chunk_style}\n')
                         visited.add(input_chunk.key)
                     if op.key not in visited:
                         sio.write(f'"{op_name}:{op.key[:trunc_key]}" {operand_style}\n')
                         visited.add(op.key)
-                    sio.write(f'"Chunk:{input_chunk.key[:trunc_key]}" -> "{op_name}:{op.key[:5]}"\n')
+                    sio.write(f'"Chunk:{self._gen_chunk_key(input_chunk, trunc_key)}" -> '
+                              f'"{op_name}:{op.key[:trunc_key]}"\n')
 
                 for output_chunk in (op.outputs or []):
                     if output_chunk.key not in visited:
                         tmp_chunk_style = chunk_style
                         if result_chunk_keys and output_chunk.key in result_chunk_keys:
                             tmp_chunk_style = '[shape=box,style=filled,fillcolor=cadetblue1]'
-                        sio.write(f'"Chunk:{output_chunk.key[:trunc_key]}" {tmp_chunk_style}\n')
+                        sio.write(f'"Chunk:{self._gen_chunk_key(output_chunk, trunc_key)}" {tmp_chunk_style}\n')
                         visited.add(output_chunk.key)
                     if op.key not in visited:
                         sio.write(f'"{op_name}:{op.key[:trunc_key]}" {operand_style}\n')
                         visited.add(op.key)
-                    sio.write(f'"{op_name}:{op.key[:trunc_key]}" -> "Chunk:{output_chunk.key[:5]}"\n')
+                    sio.write(f'"{op_name}:{op.key[:trunc_key]}" -> '
+                              f'"Chunk:{self._gen_chunk_key(output_chunk, trunc_key)}"')
+                    if show_columns:
+                        sio.write(f' [ label={get_col_names(output_chunk)} ]')
+                    sio.write("\n")
 
         sio.write('}')
         return sio.getvalue()
 
+    @classmethod
+    def _gen_chunk_key(cls, chunk, trunc_key):
+        if "_" in chunk.key:
+            key, index = chunk.key.split("_", 1)
+            return "_".join([key[:trunc_key], index])
+        else:  # pragma: no cover
+            return chunk.key[:trunc_key]
+
     def _repr_svg_(self):  # pragma: no cover
         from graphviz import Source
         return Source(self.to_dot())._repr_svg_()
+    
+    def _repr_mimebundle_(self, *args, **kw):  # pragma: no cover
+        from graphviz import Source
+        return Source(self.to_dot())._repr_mimebundle_(*args, **kw)
 
     def compose(self, list keys=None):
         from ...optimizes.chunk_graph.fuse import Fusion
@@ -375,10 +406,10 @@ cdef class DirectedGraph:
 
         Fusion(self).decompose(nodes=nodes)
 
-    def view(self, filename='default', graph_attrs=None, node_attrs=None, result_chunk_keys=None):  # pragma: no cover
+    def view(self, filename='default', graph_attrs=None, node_attrs=None, result_chunk_keys=None, show_columns=False):  # pragma: no cover
         from graphviz import Source
 
-        g = Source(self.to_dot(graph_attrs, node_attrs, result_chunk_keys=result_chunk_keys))
+        g = Source(self.to_dot(graph_attrs, node_attrs, result_chunk_keys=result_chunk_keys, show_columns=show_columns))
         g.view(filename=filename, cleanup=True)
 
     def to_dag(self):

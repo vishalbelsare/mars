@@ -16,18 +16,21 @@ import asyncio
 import functools
 import logging
 import operator
+import pprint
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Union
+from typing import Dict, Optional
 
 from .... import oscar as mo
+from ....core import ExecutionError
 from ....core.graph import DAG
 from ....core.operand import Fetch, FetchShuffle
 from ....lib.aio import alru_cache
+from ....metrics import Metrics
 from ....oscar.errors import MarsError
 from ....storage import StorageLevel
-from ....utils import dataslots, get_chunk_key_to_data_keys
+from ....utils import dataslots, get_chunk_key_to_data_keys, wrap_exception
 from ...cluster import ClusterAPI
 from ...meta import MetaAPI
 from ...storage import StorageAPI
@@ -67,46 +70,68 @@ async def _retry_run(
         except (OSError, MarsError) as ex:
             if subtask_info.num_retries < subtask_info.max_retries:
                 logger.error(
-                    "Rerun the %s of subtask %s due to %s",
+                    "Rerun[%s/%s] the %s of subtask %s due to %s.",
+                    subtask_info.num_retries,
+                    subtask_info.max_retries,
                     target_async_func,
                     subtask.subtask_id,
                     ex,
                 )
                 subtask_info.num_retries += 1
                 continue
-            raise ex
+            if subtask_info.max_retries > 0:
+                message = (
+                    f"Exceed max rerun[{subtask_info.num_retries}/{subtask_info.max_retries}]:"
+                    f" {target_async_func} of subtask {subtask.subtask_id} due to {ex}."
+                )
+                logger.error(message)
+
+                raise wrap_exception(ex, wrap_name="_ExceedMaxRerun", message=message)
+            else:
+                raise ex
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            if subtask_info.num_retries < subtask_info.max_retries:
-                logger.error(
-                    "Failed to rerun the %s of subtask %s, "
-                    "num_retries: %s, max_retries: %s, unhandled exception: %s",
-                    target_async_func,
-                    subtask.subtask_id,
-                    subtask_info.num_retries,
-                    subtask_info.max_retries,
-                    ex,
+            if subtask_info.max_retries > 0:
+                message = (
+                    f"Failed to rerun the {target_async_func} of subtask {subtask.subtask_id}, "
+                    f"num_retries: {subtask_info.num_retries}, max_retries: {subtask_info.max_retries} "
+                    f"due to unhandled exception: {ex}."
                 )
-            raise ex
+                logger.error(message)
+
+                raise wrap_exception(
+                    ex, wrap_name="_UnhandledException", message=message
+                )
+            else:
+                raise ex
 
 
 def _fill_subtask_result_with_exception(
     subtask: Subtask, subtask_info: SubtaskExecutionInfo
 ):
     _, exc, tb = sys.exc_info()
+    if isinstance(exc, ExecutionError):
+        exc = exc.nested_error
+        tb = exc.__traceback__
+
+    exc_info = (type(exc), exc, tb)
     if isinstance(exc, asyncio.CancelledError):
         status = SubtaskStatus.cancelled
-        log_str = "Cancel"
+        logger.exception(
+            "Cancel run subtask %s on band %s",
+            subtask.subtask_id,
+            subtask_info.band_name,
+            exc_info=exc_info,
+        )
     else:
         status = SubtaskStatus.errored
-        log_str = "Failed to"
-    logger.exception(
-        "%s run subtask %s on band %s",
-        log_str,
-        subtask.subtask_id,
-        subtask_info.band_name,
-    )
+        logger.exception(
+            "Failed to run subtask %s on band %s",
+            subtask.subtask_id,
+            subtask_info.band_name,
+            exc_info=exc_info,
+        )
     subtask_info.result.status = status
     subtask_info.result.progress = 1.0
     subtask_info.result.error = exc
@@ -120,13 +145,25 @@ class SubtaskExecutionActor(mo.StatelessActor):
         self,
         subtask_max_retries: int = DEFAULT_SUBTASK_MAX_RETRIES,
         enable_kill_slot: bool = True,
+        data_prepare_timeout: int = 600,
     ):
         self._cluster_api = None
-        self._global_slot_ref = None
+        self._global_resource_ref = None
         self._subtask_max_retries = subtask_max_retries
         self._enable_kill_slot = enable_kill_slot
+        self._data_prepare_timeout = data_prepare_timeout
 
         self._subtask_info = dict()
+        self._submitted_subtask_count = Metrics.counter(
+            "mars.band.submitted_subtask_count",
+            "The count of submitted subtasks to the current band.",
+            ("band",),
+        )
+        self._finished_subtask_count = Metrics.counter(
+            "mars.band.finished_subtask_count",
+            "The count of finished subtasks of the current band.",
+            ("band",),
+        )
 
     async def __post_create__(self):
         self._cluster_api = await ClusterAPI.create(self.address)
@@ -134,13 +171,13 @@ class SubtaskExecutionActor(mo.StatelessActor):
     @alru_cache(cache_exceptions=False)
     async def _get_slot_manager_ref(
         self, band: str
-    ) -> Union[mo.ActorRef, BandSlotManagerActor]:
+    ) -> mo.ActorRefType[BandSlotManagerActor]:
         return await mo.actor_ref(
             BandSlotManagerActor.gen_uid(band), address=self.address
         )
 
     @alru_cache(cache_exceptions=False)
-    async def _get_band_quota_ref(self, band: str) -> Union[mo.ActorRef, QuotaActor]:
+    async def _get_band_quota_ref(self, band: str) -> mo.ActorRefType[QuotaActor]:
         return await mo.actor_ref(QuotaActor.gen_uid(band), address=self.address)
 
     async def _prepare_input_data(self, subtask: Subtask, band_name: str):
@@ -149,15 +186,10 @@ class SubtaskExecutionActor(mo.StatelessActor):
         storage_api = await StorageAPI.create(
             subtask.session_id, address=self.address, band_name=band_name
         )
-        pure_dep_keys = set()
         chunk_key_to_data_keys = get_chunk_key_to_data_keys(subtask.chunk_graph)
-        for n in subtask.chunk_graph:
-            pure_dep_keys.update(
-                inp.key
-                for inp, pure_dep in zip(n.inputs, n.op.pure_depends)
-                if pure_dep
-            )
         for chunk in subtask.chunk_graph:
+            if chunk.key in subtask.pure_depend_keys:
+                continue
             if chunk.op.gpu:  # pragma: no cover
                 to_fetch_band = band_name
             else:
@@ -178,6 +210,7 @@ class SubtaskExecutionActor(mo.StatelessActor):
         if shuffle_queries:
             # TODO(hks): The batch method doesn't accept different error arguments,
             #  combine them when it can.
+
             await storage_api.fetch.batch(*shuffle_queries)
 
     async def _collect_input_sizes(
@@ -187,7 +220,11 @@ class SubtaskExecutionActor(mo.StatelessActor):
         sizes = dict()
 
         fetch_keys = list(
-            set(n.key for n in graph.iter_indep() if isinstance(n.op, Fetch))
+            set(
+                n.key
+                for n in graph.iter_indep()
+                if isinstance(n.op, Fetch) and n.key not in subtask.pure_depend_keys
+            )
         )
         if not fetch_keys:
             return sizes
@@ -226,13 +263,17 @@ class SubtaskExecutionActor(mo.StatelessActor):
         graph = subtask.chunk_graph
 
         key_to_ops = defaultdict(set)
+        chunk_key_to_sizes = defaultdict(lambda: 0)
         for n in graph:
             key_to_ops[n.op.key].add(n.op)
+            chunk_key_to_sizes[n.key] += 1
         key_to_ops = {k: list(v) for k, v in key_to_ops.items()}
 
         # condense op key graph
         op_key_graph = DAG()
         for n in graph.topological_iter():
+            if n.key in subtask.pure_depend_keys:
+                continue
             if n.op.key not in op_key_graph:
                 op_key_graph.add_node(n.op.key)
             for succ in graph.iter_successors(n):
@@ -275,12 +316,23 @@ class SubtaskExecutionActor(mo.StatelessActor):
                 succ_ref_count[pred_op_key] -= 1
                 if succ_ref_count[pred_op_key] == 0:
                     pred_op = key_to_ops[pred_op_key][0]
+                    outs = key_to_ops[pred_op_key][0].outputs
+                    for out in outs:
+                        chunk_key_to_sizes[out.key] -= 1
                     # when clearing fetches, subtract memory size, otherwise subtract store size
                     account_idx = 1 if isinstance(pred_op, Fetch) else 0
-                    pop_result_cost = sum(
-                        size_context.pop(out.key, (0, 0))[account_idx]
-                        for out in key_to_ops[pred_op_key][0].outputs
-                    )
+                    pop_result_cost = 0
+                    for out in outs:
+                        # corner case exist when a fetch op and another op has same chunk key
+                        # but their op keys are different
+                        if chunk_key_to_sizes[out.key] == 0:
+                            pop_result_cost += size_context.pop(out.key, (0, 0))[
+                                account_idx
+                            ]
+                        else:
+                            pop_result_cost += size_context.get(out.key, (0, 0))[
+                                account_idx
+                            ]
                     total_memory_cost -= pop_result_cost
         return sum(t[0] for t in size_context.values()), max_memory_cost
 
@@ -296,11 +348,18 @@ class SubtaskExecutionActor(mo.StatelessActor):
             subtask_id=subtask.subtask_id,
             session_id=subtask.session_id,
             task_id=subtask.task_id,
+            stage_id=subtask.stage_id,
             status=SubtaskStatus.pending,
         )
         try:
-            await _retry_run(
-                subtask, subtask_info, self._prepare_input_data, subtask, band_name
+            logger.debug("Preparing data for subtask %s", subtask.subtask_id)
+            prepare_data_task = asyncio.create_task(
+                _retry_run(
+                    subtask, subtask_info, self._prepare_input_data, subtask, band_name
+                )
+            )
+            await asyncio.wait_for(
+                prepare_data_task, timeout=self._data_prepare_timeout
             )
 
             input_sizes = await self._collect_input_sizes(
@@ -312,6 +371,7 @@ class SubtaskExecutionActor(mo.StatelessActor):
             self._check_cancelling(subtask_info)
 
             batch_quota_req = {(subtask.session_id, subtask.subtask_id): calc_size}
+            logger.debug("Start actual running of subtask %s", subtask.subtask_id)
             subtask_info.result = await self._retry_run_subtask(
                 subtask, band_name, subtask_api, batch_quota_req
             )
@@ -348,6 +408,7 @@ class SubtaskExecutionActor(mo.StatelessActor):
                 slot_id = await slot_manager_ref.acquire_free_slot(
                     (subtask.session_id, subtask.subtask_id)
                 )
+                subtask_info.slot_id = slot_id
                 self._check_cancelling(subtask_info)
 
                 subtask_info.result.status = SubtaskStatus.running
@@ -356,13 +417,14 @@ class SubtaskExecutionActor(mo.StatelessActor):
                 )
                 return await asyncio.shield(aiotask)
             except asyncio.CancelledError as ex:
-                # make sure allocated slots are traced
-                if slot_id is None:  # pragma: no cover
-                    slot_id = await slot_manager_ref.get_subtask_slot(
-                        (subtask.session_id, subtask.subtask_id)
-                    )
                 try:
                     if aiotask is not None:
+                        logger.info(
+                            "Start to cancel subtask %s in slot %s on band %s.",
+                            subtask.subtask_id,
+                            slot_id,
+                            band_name,
+                        )
                         await asyncio.wait_for(
                             asyncio.shield(
                                 subtask_api.cancel_subtask_in_slot(band_name, slot_id)
@@ -370,7 +432,7 @@ class SubtaskExecutionActor(mo.StatelessActor):
                             subtask_info.kill_timeout,
                         )
                 except asyncio.TimeoutError:
-                    logger.debug(
+                    logger.info(
                         "Wait for subtask to cancel timed out (%s). "
                         "Start killing slot %d",
                         subtask_info.kill_timeout,
@@ -391,10 +453,20 @@ class SubtaskExecutionActor(mo.StatelessActor):
                     await mo.wait_actor_pool_recovered(sub_pool_address, self.address)
                 raise ex
             finally:
-                logger.debug("Subtask running ended, slot_id=%r", slot_id)
+                # make sure allocated slots are traced
+                if slot_id is None:  # pragma: no cover
+                    slot_id = await slot_manager_ref.get_subtask_slot(
+                        (subtask.session_id, subtask.subtask_id)
+                    )
+                logger.debug(
+                    "Subtask %s running ended, slot_id=%r", subtask.subtask_id, slot_id
+                )
                 if slot_id is not None:
                     await slot_manager_ref.release_free_slot(
                         slot_id, (subtask.session_id, subtask.subtask_id)
+                    )
+                    logger.debug(
+                        "Released slot %d for subtask %s", slot_id, subtask.subtask_id
                     )
                 await quota_ref.release_quotas(tuple(batch_quota_req.keys()))
 
@@ -403,16 +475,42 @@ class SubtaskExecutionActor(mo.StatelessActor):
         if subtask.retryable:
             return await _retry_run(subtask, subtask_info, _run_subtask_once)
         else:
-            return await _run_subtask_once()
+            try:
+                return await _run_subtask_once()
+            except Exception as e:
+                unretryable_op = [
+                    chunk.op
+                    for chunk in subtask.chunk_graph
+                    if not getattr(chunk.op, "retryable", True)
+                ]
+                message = (
+                    f"Run subtask failed due to {e}, the subtask {subtask.subtask_id} is "
+                    f"not retryable, it contains unretryable op: \n"
+                    f"{pprint.pformat(unretryable_op)}"
+                )
+                logger.error(message)
+
+                raise wrap_exception(
+                    e, wrap_name="_UnretryableException", message=message
+                )
 
     async def run_subtask(
         self, subtask: Subtask, band_name: str, supervisor_address: str
     ):
+        if subtask.subtask_id in self._subtask_info:  # pragma: no cover
+            raise Exception(
+                f"Subtask {subtask.subtask_id} is already running on this band[{self.address}]."
+            )
+        logger.debug(
+            "Start to schedule subtask %s on %s.", subtask.subtask_id, self.address
+        )
+        self._submitted_subtask_count.record(1, {"band": self.address})
         with mo.debug.no_message_trace():
             task = asyncio.create_task(
                 self.ref().internal_run_subtask(subtask, band_name)
             )
 
+        logger.debug("Subtask %r accepted in worker %s", subtask, self.address)
         # the extra_config may be None. the extra config overwrites the default value.
         subtask_max_retries = (
             subtask.extra_config.get("subtask_max_retries")
@@ -425,13 +523,24 @@ class SubtaskExecutionActor(mo.StatelessActor):
         self._subtask_info[subtask.subtask_id] = SubtaskExecutionInfo(
             task, band_name, supervisor_address, max_retries=subtask_max_retries
         )
-        return await task
+        result = await task
+        self._subtask_info.pop(subtask.subtask_id, None)
+        self._finished_subtask_count.record(1, {"band": self.address})
+        logger.debug("Subtask %s finished with result %s", subtask.subtask_id, result)
+        return result
 
     async def cancel_subtask(self, subtask_id: str, kill_timeout: Optional[int] = 5):
         try:
             subtask_info = self._subtask_info[subtask_id]
         except KeyError:
+            logger.info("Subtask %s not exists, skip cancel.", subtask_id)
             return
+        logger.info(
+            "Start to cancel subtask %s in slot %s, kill_timeout is %s",
+            subtask_id,
+            subtask_info.slot_id,
+            kill_timeout,
+        )
 
         kill_timeout = kill_timeout if self._enable_kill_slot else None
         if not subtask_info.cancelling:
@@ -440,3 +549,4 @@ class SubtaskExecutionActor(mo.StatelessActor):
             subtask_info.aio_task.cancel()
 
         await subtask_info.aio_task
+        self._subtask_info.pop(subtask_id, None)

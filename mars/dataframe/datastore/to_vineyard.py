@@ -17,18 +17,15 @@ import pandas as pd
 
 from ... import opcodes as OperandDef
 from ...core import OutputType
-from ...core.operand.base import SchedulingHint
-from ...serialization.serializables import StringField
+from ...serialization.serializables import FieldTypes, StringField, TupleField
 from ...tensor.datastore.to_vineyard import resolve_vineyard_socket
+from ...utils import lazy_import
 from ..operands import DataFrameOperand, DataFrameOperandMixin
 from ..utils import parse_index
 
-try:
-    import vineyard
-    from vineyard.data.dataframe import make_global_dataframe
-    from vineyard.data.utils import to_json
-except ImportError:
-    vineyard = None
+vineyard = lazy_import("vineyard")
+vy_data_df = lazy_import("vineyard.data.dataframe", rename="vy_data_df")
+vy_data_utils = lazy_import("vineyard.data.utils", rename="vy_data_utils")
 
 
 class DataFrameToVineyardChunk(DataFrameOperand, DataFrameOperandMixin):
@@ -36,6 +33,9 @@ class DataFrameToVineyardChunk(DataFrameOperand, DataFrameOperandMixin):
 
     # vineyard ipc socket
     vineyard_socket = StringField("vineyard_socket")
+
+    # a dummy attr to make sure ops have different keys
+    operator_index = TupleField("operator_index", FieldTypes.int32)
 
     def __init__(self, vineyard_socket=None, dtypes=None, **kw):
         super().__init__(
@@ -70,11 +70,10 @@ class DataFrameToVineyardChunk(DataFrameOperand, DataFrameOperandMixin):
     @classmethod
     def tile(cls, op):
         out_chunks = []
-        scheduling_hint = SchedulingHint(fuseable=False)
         dtypes = pd.Series([np.dtype("O")], index=pd.Index([0]))
         for idx, chunk in enumerate(op.inputs[0].chunks):
             chunk_op = op.copy().reset_key()
-            chunk_op.scheduling_hint = scheduling_hint
+            chunk_op.operator_index = chunk.index
             out_chunk = chunk_op.new_chunk(
                 [chunk],
                 shape=(1, 1),
@@ -129,7 +128,7 @@ class DataFrameToVineyardChunk(DataFrameOperand, DataFrameOperandMixin):
                         new_meta.add_member(k, v)
                     else:
                         new_meta[k] = v
-            new_meta["partition_index_"] = to_json(op.inputs[0].index)
+            new_meta["partition_index_"] = vy_data_utils.to_json(op.inputs[0].index)
             df_id = client.create_metadata(new_meta).id
 
         client.persist(df_id)
@@ -184,7 +183,7 @@ class DataFrameToVinyardStoreMeta(DataFrameOperand, DataFrameOperandMixin):
         # # store the result object id to execution context
         chunks = [ctx[chunk.key][0][0] for chunk in op.inputs]
         ctx[op.outputs[0].key] = pd.DataFrame(
-            {0: [make_global_dataframe(client, chunks).id]}
+            {0: [vy_data_df.make_global_dataframe(client, chunks).id]}
         )
 
 

@@ -34,19 +34,20 @@ from .....core import (
     OutputType,
 )
 from .....remote.core import RemoteFunction
+from .....resource import Resource
 from .....tensor.fetch import TensorFetch
 from .....tensor.arithmetic import TensorTreeAdd
 from .....utils import Timer
 from ....cluster import MockClusterAPI
 from ....lifecycle import MockLifecycleAPI
-from ....meta import MockMetaAPI
+from ....meta import MockMetaAPI, MockWorkerMetaAPI
 from ....session import MockSessionAPI
 from ....storage import MockStorageAPI
 from ....storage.handler import StorageHandlerActor
 from ....subtask import MockSubtaskAPI, Subtask, SubtaskStatus
 from ....task.supervisor.manager import TaskManagerActor
 from ....mutable import MockMutableAPI
-from ...supervisor import GlobalSlotManagerActor
+from ...supervisor import GlobalResourceManagerActor
 from ...worker import SubtaskExecutionActor, QuotaActor, BandSlotManagerActor
 
 
@@ -117,15 +118,18 @@ class MockBandSlotManagerActor(BandSlotManagerActor, CancelDetectActorMixin):
         self._delay_function = name
 
 
-class MockGlobalSlotManagerActor(GlobalSlotManagerActor, CancelDetectActorMixin):
+class MockGlobalResourceManagerActor(
+    GlobalResourceManagerActor, CancelDetectActorMixin
+):
     async def __post_create__(self):
         pass
 
     async def __pre_destroy__(self):
         pass
 
-    async def update_subtask_slots(
-        self, band, session_id: str, subtask_id: str, slots: int
+    @mo.extensible
+    async def update_subtask_resources(
+        self, band, session_id: str, subtask_id: str, resources: Resource
     ):
         pass
 
@@ -151,10 +155,14 @@ async def actor_pool(request):
     async with pool:
         session_id = "test_session"
         await MockClusterAPI.create(
-            pool.external_address, band_to_slots={"numa-0": n_slots}
+            pool.external_address,
+            band_to_resource={"numa-0": Resource(num_cpus=n_slots)},
         )
         await MockSessionAPI.create(pool.external_address, session_id=session_id)
         meta_api = await MockMetaAPI.create(session_id, pool.external_address)
+        worker_meta_api = await MockWorkerMetaAPI.create(
+            session_id, pool.external_address
+        )
         await MockLifecycleAPI.create(session_id, pool.external_address)
         await MockSubtaskAPI.create(pool.external_address)
         await MockMutableAPI.create(session_id, pool.external_address)
@@ -190,9 +198,9 @@ async def actor_pool(request):
         )
 
         # create global slot manager actor
-        global_slot_ref = await mo.create_actor(
-            MockGlobalSlotManagerActor,
-            uid=GlobalSlotManagerActor.default_uid(),
+        global_resource_ref = await mo.create_actor(
+            MockGlobalResourceManagerActor,
+            uid=GlobalResourceManagerActor.default_uid(),
             address=pool.external_address,
         )
 
@@ -204,11 +212,11 @@ async def actor_pool(request):
         )
 
         try:
-            yield pool, session_id, meta_api, storage_api, execution_ref
+            yield pool, session_id, meta_api, worker_meta_api, storage_api, execution_ref
         finally:
             await mo.destroy_actor(task_manager_ref)
             await mo.destroy_actor(band_slot_ref)
-            await mo.destroy_actor(global_slot_ref)
+            await mo.destroy_actor(global_resource_ref)
             await mo.destroy_actor(quota_ref)
             await mo.destroy_actor(execution_ref)
             await MockStorageAPI.cleanup(pool.external_address)
@@ -220,7 +228,7 @@ async def actor_pool(request):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("actor_pool", [(1, True)], indirect=True)
 async def test_execute_tensor(actor_pool):
-    pool, session_id, meta_api, storage_api, execution_ref = actor_pool
+    pool, session_id, meta_api, worker_meta_api, storage_api, execution_ref = actor_pool
 
     data1 = np.random.rand(10, 10)
     data2 = np.random.rand(10, 10)
@@ -273,7 +281,7 @@ async def test_execute_tensor(actor_pool):
     assert quota[(subtask.session_id, subtask.subtask_id)] == data1.nbytes
 
     # check if metas are correct
-    result_meta = await meta_api.get_chunk_meta(result_chunk.key)
+    result_meta = await worker_meta_api.get_chunk_meta(result_chunk.key)
     assert result_meta["object_id"] == result_chunk.key
     assert result_meta["shape"] == result.shape
 
@@ -295,7 +303,7 @@ _cancel_phases = [
     indirect=["actor_pool"],
 )
 async def test_execute_with_cancel(actor_pool, cancel_phase):
-    pool, session_id, meta_api, storage_api, execution_ref = actor_pool
+    pool, session_id, meta_api, worker_meta_api, storage_api, execution_ref = actor_pool
     delay_fetch_event = asyncio.Event()
     delay_wait_event = asyncio.Event()
 
@@ -391,18 +399,51 @@ async def test_execute_with_cancel(actor_pool, cancel_phase):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actor_pool", [(1, True)], indirect=True)
+async def test_execute_with_pure_deps(actor_pool):
+    pool, session_id, meta_api, worker_meta_api, storage_api, execution_ref = actor_pool
+
+    dep = TensorFetch(key="input1", dtype=np.dtype(int)).new_chunk([])
+
+    def main_fun():
+        return session_id
+
+    remote_result = RemoteFunction(
+        function=main_fun, function_args=[], function_kwargs={}
+    ).new_chunk([dep])
+    # mark `dep` as pure dependency
+    remote_result.op._pure_depends = [True]
+    chunk_graph = ChunkGraph([remote_result])
+    chunk_graph.add_node(dep)
+    chunk_graph.add_node(remote_result)
+    chunk_graph.add_edge(dep, remote_result)
+
+    subtask = Subtask(
+        f"test_subtask_{uuid.uuid4()}", session_id=session_id, chunk_graph=chunk_graph
+    )
+    # subtask shall run well without data of `dep` available
+    await execution_ref.run_subtask(subtask, "numa-0", pool.external_address)
+    res = await storage_api.get(remote_result.key)
+    assert res == session_id
+
+
 def test_estimate_size():
     from ..execution import SubtaskExecutionActor
     from .....dataframe.arithmetic import DataFrameAdd
     from .....dataframe.fetch import DataFrameFetch
     from .....dataframe.utils import parse_index
 
-    index_value = parse_index(pd.Int64Index([10, 20, 30]))
+    index_value = parse_index(pd.Index([10, 20, 30], dtype=np.int64))
 
-    input1 = DataFrameFetch(output_types=[OutputType.series],).new_chunk(
+    input1 = DataFrameFetch(
+        output_types=[OutputType.series],
+    ).new_chunk(
         [], _key="INPUT1", shape=(np.nan,), dtype=np.dtype("O"), index_value=index_value
     )
-    input2 = DataFrameFetch(output_types=[OutputType.series],).new_chunk(
+    input2 = DataFrameFetch(
+        output_types=[OutputType.series],
+    ).new_chunk(
         [], _key="INPUT2", shape=(np.nan,), dtype=np.dtype("O"), index_value=index_value
     )
     result_chunk = DataFrameAdd(
@@ -435,7 +476,7 @@ def test_estimate_size():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("actor_pool", [(1, False)], indirect=True)
 async def test_cancel_without_kill(actor_pool):
-    pool, session_id, meta_api, storage_api, execution_ref = actor_pool
+    pool, session_id, meta_api, worker_meta_api, storage_api, execution_ref = actor_pool
     executed_file = os.path.join(
         tempfile.gettempdir(), f"mars_test_cancel_without_kill_{os.getpid()}.tmp"
     )

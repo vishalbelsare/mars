@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import os
 import tempfile
 import time
@@ -41,15 +42,16 @@ from .... import tensor as mt
 from .... import dataframe as md
 from ....config import option_context
 from ....tests.core import require_cudf, require_ray
-from ....utils import arrow_array_to_objects, lazy_import
+from ....utils import arrow_array_to_objects, lazy_import, pd_release_version
+from ...utils import ray_deprecate_ml_dataset
 from ..dataframe import from_pandas as from_pandas_df
 from ..series import from_pandas as from_pandas_series
 from ..index import from_pandas as from_pandas_index, from_tileable
 from ..from_tensor import dataframe_from_tensor, dataframe_from_1d_tileables
 from ..from_records import from_records
 
-
 ray = lazy_import("ray")
+_date_range_use_inclusive = pd_release_version[:2] >= (1, 4)
 
 
 def test_from_pandas_dataframe_execution(setup):
@@ -292,7 +294,7 @@ def test_from_tensor_execution(setup):
     tensor5 = mt.ones((10, 10), chunk_size=3)
     df5 = dataframe_from_tensor(tensor5, index=np.arange(0, 20, 2))
     result5 = df5.execute().fetch()
-    pdf_expected = pd.DataFrame(tensor5.execute().fetch(), index=np.arange(0, 20, 2))
+    pdf_expected = pd.DataFrame(np.ones((10, 10)), index=np.arange(0, 20, 2))
     pd.testing.assert_frame_equal(pdf_expected, result5)
 
     # from tensor with given index that is a tensor
@@ -357,6 +359,11 @@ def test_from_tensor_execution(setup):
     pdf_expected = pd.DataFrame(
         OrderedDict(raws8), index=pd.date_range("2020-1-1", periods=8)
     )
+    pd.testing.assert_frame_equal(result, pdf_expected)
+
+    df12 = dataframe_from_1d_tileables({"a": [md.Series([1, 2, 3]).sum() + 1]})
+    result = df12.execute().fetch()
+    pdf_expected = pd.DataFrame({"a": [pd.Series([1, 2, 3]).sum() + 1]})
     pd.testing.assert_frame_equal(result, pdf_expected)
 
 
@@ -506,7 +513,7 @@ def test_read_csv_execution(setup):
                 "col3": np.arange(100),
             }
         )
-        df.iloc[20:, :] = pd.NA
+        df.iloc[:100, :] = pd.NA
         df.to_csv(file_path)
 
         pdf = pd.read_csv(file_path, index_col=0)
@@ -515,9 +522,7 @@ def test_read_csv_execution(setup):
         pd.testing.assert_frame_equal(pdf, result)
 
         # dtypes is inferred as expected
-        pd.testing.assert_series_equal(
-            mdf.dtypes, pd.Series(["float64", "object", "int64"], index=df.columns)
-        )
+        pd.testing.assert_series_equal(mdf.dtypes, pdf.dtypes)
 
     # test compression
     with tempfile.TemporaryDirectory() as tempdir:
@@ -546,19 +551,30 @@ def test_read_csv_execution(setup):
         pd.testing.assert_frame_equal(pdf, mdf2)
 
     # test multiple files
-    with tempfile.TemporaryDirectory() as tempdir:
-        df = pd.DataFrame(np.random.rand(300, 3), columns=["a", "b", "c"])
+    for merge_small_file_option in [{"n_sample_file": 1}, None]:
+        with tempfile.TemporaryDirectory() as tempdir:
+            df = pd.DataFrame(np.random.rand(300, 3), columns=["a", "b", "c"])
 
-        file_paths = [os.path.join(tempdir, f"test{i}.csv") for i in range(3)]
-        df[:100].to_csv(file_paths[0])
-        df[100:200].to_csv(file_paths[1])
-        df[200:].to_csv(file_paths[2])
+            file_paths = [os.path.join(tempdir, f"test{i}.csv") for i in range(3)]
+            df[:100].to_csv(file_paths[0])
+            df[100:200].to_csv(file_paths[1])
+            df[200:].to_csv(file_paths[2])
 
-        mdf = md.read_csv(file_paths, index_col=0).execute().fetch()
-        pd.testing.assert_frame_equal(df, mdf)
+            mdf = (
+                md.read_csv(
+                    file_paths,
+                    index_col=0,
+                    merge_small_file_options=merge_small_file_option,
+                )
+                .execute()
+                .fetch()
+            )
+            pd.testing.assert_frame_equal(df, mdf)
 
-        mdf2 = md.read_csv(file_paths, index_col=0, chunk_bytes=50).execute().fetch()
-        pd.testing.assert_frame_equal(df, mdf2)
+            mdf2 = (
+                md.read_csv(file_paths, index_col=0, chunk_bytes=50).execute().fetch()
+            )
+            pd.testing.assert_frame_equal(df, mdf2)
 
     # test wildcards in path
     with tempfile.TemporaryDirectory() as tempdir:
@@ -672,6 +688,19 @@ def test_read_csv_gpu_execution(setup_gpu):
         pd.testing.assert_frame_equal(
             pdf.reset_index(drop=True), mdf2.to_pandas().reset_index(drop=True)
         )
+
+
+def test_read_csv_with_specific_names(setup):
+    with tempfile.TemporaryDirectory() as tempdir:
+        file_path = os.path.join(tempdir, "test_names.csv")
+        df = pd.DataFrame(
+            np.array(np.random.randint(0, 10, size=(10, 3))), columns=["a", "b", "c"]
+        )
+        df.to_csv(file_path, index=False)
+
+        pdf = pd.read_csv(file_path, names=["b", "a", "c"], header=0)
+        mdf = md.read_csv(file_path, names=["b", "a", "c"], header=0).execute().fetch()
+        pd.testing.assert_frame_equal(pdf, mdf)
 
 
 def test_read_csv_without_index(setup):
@@ -819,7 +848,7 @@ def test_read_sql_execution(setup):
             result = r.execute().fetch()
             pd.testing.assert_frame_equal(result, expected)
 
-            table = sa.Table(table_name, m, autoload=True, autoload_with=engine)
+            table = sa.Table(table_name, m, autoload_with=engine)
             r = md.read_sql_table(
                 table,
                 engine,
@@ -897,45 +926,63 @@ def test_read_sql_use_arrow_dtype(setup):
         )
 
 
+@pytest.mark.pd_compat
 def test_date_range_execution(setup):
-    for closed in [None, "left", "right"]:
+    chunk_sizes = [None, 3]
+    inclusives = ["both", "neither", "left", "right"]
+
+    if _date_range_use_inclusive:
+        with pytest.warns(FutureWarning, match="closed"):
+            md.date_range("2020-1-1", periods=10, closed="right")
+
+    for chunk_size, inclusive in itertools.product(chunk_sizes, inclusives):
+        kw = dict()
+        if _date_range_use_inclusive:
+            kw["inclusive"] = inclusive
+        else:
+            if inclusive == "neither":
+                continue
+            elif inclusive == "both":
+                inclusive = None
+            kw["closed"] = inclusive
+
         # start, periods, freq
-        dr = md.date_range("2020-1-1", periods=10, chunk_size=3, closed=closed)
+        dr = md.date_range("2020-1-1", periods=10, chunk_size=chunk_size, **kw)
 
         result = dr.execute().fetch()
-        expected = pd.date_range("2020-1-1", periods=10, closed=closed)
+        expected = pd.date_range("2020-1-1", periods=10, **kw)
         pd.testing.assert_index_equal(result, expected)
 
         # end, periods, freq
-        dr = md.date_range(end="2020-1-10", periods=10, chunk_size=3, closed=closed)
+        dr = md.date_range(end="2020-1-10", periods=10, chunk_size=chunk_size, **kw)
 
         result = dr.execute().fetch()
-        expected = pd.date_range(end="2020-1-10", periods=10, closed=closed)
+        expected = pd.date_range(end="2020-1-10", periods=10, **kw)
         pd.testing.assert_index_equal(result, expected)
 
         # start, end, freq
-        dr = md.date_range("2020-1-1", "2020-1-10", chunk_size=3, closed=closed)
+        dr = md.date_range("2020-1-1", "2020-1-10", chunk_size=chunk_size, **kw)
 
         result = dr.execute().fetch()
-        expected = pd.date_range("2020-1-1", "2020-1-10", closed=closed)
+        expected = pd.date_range("2020-1-1", "2020-1-10", **kw)
         pd.testing.assert_index_equal(result, expected)
 
         # start, end and periods
         dr = md.date_range(
-            "2020-1-1", "2020-1-10", periods=19, chunk_size=3, closed=closed
+            "2020-1-1", "2020-1-10", periods=19, chunk_size=chunk_size, **kw
         )
 
         result = dr.execute().fetch()
-        expected = pd.date_range("2020-1-1", "2020-1-10", periods=19, closed=closed)
+        expected = pd.date_range("2020-1-1", "2020-1-10", periods=19, **kw)
         pd.testing.assert_index_equal(result, expected)
 
         # start, end and freq
         dr = md.date_range(
-            "2020-1-1", "2020-1-10", freq="12H", chunk_size=3, closed=closed
+            "2020-1-1", "2020-1-10", freq="12H", chunk_size=chunk_size, **kw
         )
 
         result = dr.execute().fetch()
-        expected = pd.date_range("2020-1-1", "2020-1-10", freq="12H", closed=closed)
+        expected = pd.date_range("2020-1-1", "2020-1-10", freq="12H", **kw)
         pd.testing.assert_index_equal(result, expected)
 
     # test timezone
@@ -973,9 +1020,24 @@ def test_date_range_execution(setup):
     expected = pd.date_range(start="1/1/2018", periods=5, freq="M")
     pd.testing.assert_index_equal(result, expected)
 
+    dr = md.date_range(start="2018/01/01", end="2018/07/01", freq="M")
+    result = dr.execute().fetch()
+    expected = pd.date_range(start="2018/01/01", end="2018/07/01", freq="M")
+    pd.testing.assert_index_equal(result, expected)
 
-@pytest.mark.skipif(pa is None, reason="pyarrow not installed")
-def test_read_parquet_arrow(setup):
+
+parquet_engines = ["auto"]
+if pa is not None:
+    parquet_engines.append("pyarrow")
+if fastparquet is not None:
+    parquet_engines.append("fastparquet")
+
+
+@pytest.mark.skipif(
+    len(parquet_engines) == 1, reason="pyarrow and fastparquet are not installed"
+)
+@pytest.mark.parametrize("engine", parquet_engines)
+def test_read_parquet_arrow(setup, engine):
     test_df = pd.DataFrame(
         {
             "a": np.arange(10).astype(np.int64, copy=False),
@@ -988,59 +1050,107 @@ def test_read_parquet_arrow(setup):
         file_path = os.path.join(tempdir, "test.csv")
         test_df.to_parquet(file_path)
 
-        df = md.read_parquet(file_path)
+        df = md.read_parquet(file_path, engine=engine)
         result = df.execute().fetch()
         pd.testing.assert_frame_equal(result, test_df)
         # size_res = self.executor.execute_dataframe(df, mock=True)
         # assert sum(s[0] for s in size_res) > test_df.memory_usage(deep=True).sum()
 
-    with tempfile.TemporaryDirectory() as tempdir:
-        file_path = os.path.join(tempdir, "test.parquet")
-        test_df.to_parquet(file_path, row_group_size=3)
+    if engine != "fastparquet":
+        with tempfile.TemporaryDirectory() as tempdir:
+            file_path = os.path.join(tempdir, "test.parquet")
+            test_df.to_parquet(file_path, row_group_size=3)
 
-        df = md.read_parquet(file_path, groups_as_chunks=True, columns=["a", "b"])
-        result = df.execute().fetch()
-        pd.testing.assert_frame_equal(
-            result.reset_index(drop=True), test_df[["a", "b"]]
-        )
+            df = md.read_parquet(
+                file_path, groups_as_chunks=True, columns=["a", "b"], engine=engine
+            )
+            result = df.execute().fetch()
+            pd.testing.assert_frame_equal(
+                result.reset_index(drop=True), test_df[["a", "b"]]
+            )
 
-    with tempfile.TemporaryDirectory() as tempdir:
-        file_path = os.path.join(tempdir, "test.parquet")
-        test_df.to_parquet(file_path, row_group_size=5)
+    if engine != "fastparquet":
+        with tempfile.TemporaryDirectory() as tempdir:
+            file_path = os.path.join(tempdir, "test.parquet")
+            test_df.to_parquet(file_path, row_group_size=5)
 
-        df = md.read_parquet(
-            file_path,
-            groups_as_chunks=True,
-            use_arrow_dtype=True,
-            incremental_index=True,
-        )
-        result = df.execute().fetch()
-        assert isinstance(df.dtypes.iloc[1], md.ArrowStringDtype)
-        assert isinstance(result.dtypes.iloc[1], md.ArrowStringDtype)
-        pd.testing.assert_frame_equal(arrow_array_to_objects(result), test_df)
+            df = md.read_parquet(
+                file_path,
+                groups_as_chunks=True,
+                use_arrow_dtype=True,
+                incremental_index=True,
+                engine=engine,
+            )
+            result = df.execute().fetch()
+            assert isinstance(df.dtypes.iloc[1], md.ArrowStringDtype)
+            assert isinstance(result.dtypes.iloc[1], md.ArrowStringDtype)
+            pd.testing.assert_frame_equal(arrow_array_to_objects(result), test_df)
 
     # test wildcards in path
+    for merge_small_file_option in [{"n_sample_file": 1}, None]:
+        with tempfile.TemporaryDirectory() as tempdir:
+            df = pd.DataFrame(
+                {
+                    "a": np.arange(300).astype(np.int64, copy=False),
+                    "b": [f"s{i}" for i in range(300)],
+                    "c": np.random.rand(300),
+                }
+            )
+
+            file_paths = [os.path.join(tempdir, f"test{i}.parquet") for i in range(3)]
+            df[:100].to_parquet(file_paths[0], row_group_size=50)
+            df[100:200].to_parquet(file_paths[1], row_group_size=30)
+            df[200:].to_parquet(file_paths[2])
+
+            mdf = md.read_parquet(f"{tempdir}/*.parquet", engine=engine)
+            r = mdf.execute().fetch()
+            pd.testing.assert_frame_equal(df, r.sort_values("a").reset_index(drop=True))
+
+            mdf = md.read_parquet(f"{tempdir}", engine=engine)
+            r = mdf.execute().fetch()
+            pd.testing.assert_frame_equal(df, r.sort_values("a").reset_index(drop=True))
+
+            file_list = [os.path.join(tempdir, name) for name in os.listdir(tempdir)]
+            mdf = md.read_parquet(file_list, engine=engine)
+            r = mdf.execute().fetch()
+            pd.testing.assert_frame_equal(df, r.sort_values("a").reset_index(drop=True))
+
+            # test `use_arrow_dtype=True`
+            mdf = md.read_parquet(
+                f"{tempdir}/*.parquet", engine=engine, use_arrow_dtype=True
+            )
+            result = mdf.execute().fetch()
+            assert isinstance(mdf.dtypes.iloc[1], md.ArrowStringDtype)
+            assert isinstance(result.dtypes.iloc[1], md.ArrowStringDtype)
+
+            if engine != "fastparquet":
+                mdf = md.read_parquet(
+                    f"{tempdir}/*.parquet",
+                    groups_as_chunks=True,
+                    engine=engine,
+                    merge_small_file_options=merge_small_file_option,
+                )
+                r = mdf.execute().fetch()
+                pd.testing.assert_frame_equal(
+                    df, r.sort_values("a").reset_index(drop=True)
+                )
+
+    # test partitioned
     with tempfile.TemporaryDirectory() as tempdir:
         df = pd.DataFrame(
             {
-                "a": np.arange(300).astype(np.int64, copy=False),
+                "a": np.random.rand(300),
                 "b": [f"s{i}" for i in range(300)],
-                "c": np.random.rand(300),
+                "c": np.random.choice(["a", "b", "c"], (300,)),
             }
         )
-
-        file_paths = [os.path.join(tempdir, f"test{i}.parquet") for i in range(3)]
-        df[:100].to_parquet(file_paths[0], row_group_size=50)
-        df[100:200].to_parquet(file_paths[1], row_group_size=30)
-        df[200:].to_parquet(file_paths[2])
-
-        mdf = md.read_parquet(f"{tempdir}/*.parquet")
-        r = mdf.execute().fetch()
-        pd.testing.assert_frame_equal(df, r.sort_values("a").reset_index(drop=True))
-
-        mdf = md.read_parquet(f"{tempdir}/*.parquet", groups_as_chunks=True)
-        r = mdf.execute().fetch()
-        pd.testing.assert_frame_equal(df, r.sort_values("a").reset_index(drop=True))
+        df.to_parquet(tempdir, partition_cols=["c"])
+        mdf = md.read_parquet(tempdir, engine=engine)
+        r = mdf.execute().fetch().astype(df.dtypes)
+        pd.testing.assert_frame_equal(
+            df.sort_values("a").reset_index(drop=True),
+            r.sort_values("a").reset_index(drop=True),
+        )
 
 
 @pytest.mark.skipif(fastparquet is None, reason="fastparquet not installed")
@@ -1065,7 +1175,75 @@ def test_read_parquet_fast_parquet(setup):
         # assert sum(s[0] for s in size_res) > test_df.memory_usage(deep=True).sum()
 
 
+@require_cudf
+def test_read_parquet_gpu_execution(setup_gpu):
+    with tempfile.TemporaryDirectory() as tempdir:
+        file_path = os.path.join(tempdir, "test.parquet")
+
+        df = pd.DataFrame(
+            {
+                "col1": np.random.rand(100),
+                "col2": np.random.choice(["a", "b", "c"], (100,)),
+                "col3": np.arange(100),
+            }
+        )
+        df.to_parquet(file_path, index=False)
+
+        pdf = pd.read_parquet(file_path)
+        mdf = md.read_parquet(file_path, gpu=True).execute().fetch()
+        pd.testing.assert_frame_equal(
+            pdf.reset_index(drop=True), mdf.to_pandas().reset_index(drop=True)
+        )
+
+        mdf2 = md.read_parquet(file_path, gpu=True).execute().fetch()
+        pd.testing.assert_frame_equal(
+            pdf.reset_index(drop=True), mdf2.to_pandas().reset_index(drop=True)
+        )
+
+        mdf3 = md.read_parquet(file_path, gpu=True).head(3).execute().fetch()
+        pd.testing.assert_frame_equal(
+            pdf.reset_index(drop=True).head(3), mdf3.to_pandas().reset_index(drop=True)
+        )
+
+    with tempfile.TemporaryDirectory() as tempdir:
+        file_path = os.path.join(tempdir, "test.parquet")
+        test_df = pd.DataFrame(
+            {
+                "a": np.arange(10).astype(np.int64, copy=False),
+                "b": [f"s{i}" for i in range(10)],
+                "c": np.random.rand(10),
+            }
+        )
+        test_df.to_parquet(file_path, row_group_size=3)
+
+        df = md.read_parquet(
+            file_path, groups_as_chunks=True, columns=["a", "b"], gpu=True
+        )
+        result = df.execute().fetch().to_pandas()
+        pd.testing.assert_frame_equal(
+            result.reset_index(drop=True), test_df[["a", "b"]]
+        )
+
+    # test partitioned
+    with tempfile.TemporaryDirectory() as tempdir:
+        df = pd.DataFrame(
+            {
+                "a": np.random.rand(300),
+                "b": [f"s{i}" for i in range(300)],
+                "c": np.random.choice(["a", "b", "c"], (300,)),
+            }
+        )
+        df.to_parquet(tempdir, partition_cols=["c"])
+        mdf = md.read_parquet(tempdir, gpu=True)
+        r = mdf.execute().fetch().to_pandas().astype(df.dtypes)
+        pd.testing.assert_frame_equal(
+            df.sort_values("a").reset_index(drop=True),
+            r.sort_values("a").reset_index(drop=True),
+        )
+
+
 @require_ray
+@pytest.mark.skip_ray_dag  # raydataset is not compatible with Ray DAG
 def test_read_raydataset(ray_start_regular, ray_create_mars_cluster):
     test_df1 = pd.DataFrame(
         {
@@ -1081,11 +1259,41 @@ def test_read_raydataset(ray_start_regular, ray_create_mars_cluster):
     )
     df = pd.concat([test_df1, test_df2])
     ds = ray.data.from_pandas_refs([ray.put(test_df1), ray.put(test_df2)])
-    mdf = md.read_raydataset(ds)
+    mdf = md.read_ray_dataset(ds)
     assert df.equals(mdf.execute().fetch())
+
+    n = 10000
+    pdf = pd.DataFrame({"a": list(range(n)), "b": list(range(n, 2 * n))})
+    df = md.DataFrame(pdf)
+
+    # Convert mars dataframe to ray dataset
+    ds = md.to_ray_dataset(df)
+    pd.testing.assert_frame_equal(ds.to_pandas(), df.to_pandas())
+    ds2 = ds.filter(lambda row: row["a"] % 2 == 0)
+    assert ds2.take(5) == [{"a": 2 * i, "b": n + 2 * i} for i in range(5)]
+
+    # Convert ray dataset to mars dataframe
+    df2 = md.read_ray_dataset(ds2)
+    pd.testing.assert_frame_equal(
+        df2.head(5).to_pandas(),
+        pd.DataFrame({"a": list(range(0, 10, 2)), "b": list(range(n, n + 10, 2))}),
+    )
+
+    # Test Arrow Dataset
+    pdf2 = pd.DataFrame({c: range(5) for c in "abc"})
+    ds3 = ray.data.from_arrow([pa.Table.from_pandas(pdf2) for _ in range(3)])
+    df3 = md.read_ray_dataset(ds3)
+    pd.testing.assert_frame_equal(
+        df3.head(5).to_pandas(),
+        pdf2,
+    )
 
 
 @require_ray
+@pytest.mark.skipif(
+    ray_deprecate_ml_dataset in (True, None),
+    reason="Ray (>=2.0) has deprecated MLDataset.",
+)
 def test_read_ray_mldataset(ray_start_regular, ray_create_mars_cluster):
     test_dfs = [
         pd.DataFrame(

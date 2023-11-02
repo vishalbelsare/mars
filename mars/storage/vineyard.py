@@ -27,13 +27,14 @@ from .base import StorageBackend, StorageLevel, ObjectInfo, register_storage_bac
 from .core import BufferWrappedFileObject, StorageFileObject
 
 vineyard = lazy_import("vineyard")
+vy_data_pickle = lazy_import("vineyard.data.pickle", rename="vy_data_pickle")
+vy_data_utils = lazy_import("vineyard.data.utils", rename="vy_data_utils")
 pyarrow = lazy_import("pyarrow")
 
 if sys.platform.startswith("win"):
-    vineyard = None
+    vineyard = vy_data_pickle = vy_data_utils = None
 
 logger = logging.getLogger(__name__)
-
 
 # Setup support for mars datatypes on vineyard
 
@@ -41,19 +42,19 @@ logger = logging.getLogger(__name__)
 def mars_sparse_matrix_builder(client, value, builder, **kw):
     meta = vineyard.ObjectMeta()
     meta["typename"] = "vineyard::SparseMatrix<%s>" % value.dtype.name
-    meta["shape_"] = vineyard.data.utils.to_json(value.shape)
+    meta["shape_"] = vy_data_utils.to_json(value.shape)
     meta.add_member("spmatrix", builder.run(client, value.spmatrix, **kw))
     return client.create_metadata(meta)
 
 
 def mars_sparse_matrix_resolver(obj, resolver) -> sparse.SparseNDArray:
     meta = obj.meta
-    shape = vineyard.data.utils.from_json(meta["shape_"])
+    shape = vy_data_utils.from_json(meta["shape_"])
     spmatrix = resolver.run(obj.member("spmatrix"))
     return sparse.matrix.SparseMatrix(spmatrix, shape=shape)
 
 
-if vineyard is not None:
+def _register_vineyard_matrices():
     vineyard.core.default_builder_context.register(
         sparse.matrix.SparseMatrix, mars_sparse_matrix_builder
     )
@@ -78,13 +79,11 @@ class VineyardFileObject(BufferWrappedFileObject):
         super().__init__(object_id, mode, size=size)
 
     def _read_init(self):
-        self._reader = vineyard.data.pickle.PickledReader(
-            self._client.get(self._object_id)
-        )
+        self._reader = vy_data_pickle.PickledReader(self._client.get(self._object_id))
         self._size = self._reader.store_size
 
     def _write_init(self):
-        self._writer = vineyard.data.pickle.PickledWriter(self._size)
+        self._writer = vy_data_pickle.PickledWriter(self._size)
 
     @property
     def buffer(self):
@@ -116,8 +115,11 @@ class VineyardFileObject(BufferWrappedFileObject):
 @register_storage_backend
 class VineyardStorage(StorageBackend):
     name = "vineyard"
+    is_seekable = False
 
     def __init__(self, vineyard_size: int, vineyard_socket: str = None):
+        _register_vineyard_matrices()
+
         self._size = vineyard_size
         self._vineyard_socket = vineyard_socket
         self._client = vineyard.connect(vineyard_socket)
@@ -127,6 +129,7 @@ class VineyardStorage(StorageBackend):
     async def setup(cls, **kwargs) -> Tuple[Dict, Dict]:
         loop = asyncio.get_running_loop()
         etcd_endpoints = kwargs.pop("etcd_endpoints", "127.0.0.1:2379")
+        etcd_prefix = kwargs.pop("etcd_prefix", "vineyard")
         vineyard_size = kwargs.pop("vineyard_size", "1Gi")
         vineyard_socket = kwargs.pop("vineyard_socket", None)
         vineyardd_path = kwargs.pop("vineyardd_path", None)
@@ -141,10 +144,11 @@ class VineyardStorage(StorageBackend):
             vineyard_store = None
         else:
             vineyard_store = vineyard.deploy.local.start_vineyardd(
-                etcd_endpoints,
-                vineyardd_path,
-                vineyard_size,
-                vineyard_socket,
+                etcd_endpoints=etcd_endpoints,
+                etcd_prefix=etcd_prefix,
+                vineyardd_path=vineyardd_path,
+                size=vineyard_size,
+                socket=vineyard_socket,
                 rpc=False,
             )
             vineyard_socket = (
@@ -183,7 +187,7 @@ class VineyardStorage(StorageBackend):
     @implements(StorageBackend.get)
     async def get(self, object_id, **kwargs) -> object:
         if kwargs:  # pragma: no cover
-            raise NotImplementedError('Got unsupported args: {",".join(kwargs)}')
+            raise NotImplementedError(f'Got unsupported args: {",".join(kwargs)}')
 
         return self._client.get(object_id)
 

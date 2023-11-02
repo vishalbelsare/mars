@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...serialization.serializables import FieldTypes, TupleField
+from ...serialization.serializables import BoolField, FieldTypes, TupleField
 from ...utils import tokenize
 from .core import EntityData, Entity
 
@@ -20,15 +20,22 @@ from .core import EntityData, Entity
 class ChunkData(EntityData):
     __slots__ = ()
 
+    is_broadcaster = BoolField("is_broadcaster", default=False)
+    # If the operand is a shuffle mapper, this flag indicates whether the current chunk is mapper chunk when
+    # the operand produce multiple chunks such as TensorUnique.
+    is_mapper = BoolField("is_mapper", default=None)
     # optional fields
     _index = TupleField("index", FieldTypes.uint32)
 
     def __repr__(self):
         if self.op.stage is None:
-            return f"Chunk <op={type(self.op).__name__}, " f"key={self.key}>"
+            return (
+                f"{type(self).__name__} <op={type(self.op).__name__}, "
+                f"key={self.key}>"
+            )
         else:
             return (
-                f"Chunk <op={type(self.op).__name__}, "
+                f"{type(self).__name__} <op={type(self.op).__name__}, "
                 f"stage={self.op.stage.name}, key={self.key}>"
             )
 
@@ -53,6 +60,9 @@ class ChunkData(EntityData):
 
 class Chunk(Entity):
     _allow_data_type_ = (ChunkData,)
+
+    def __repr__(self):
+        return f"{type(self).__name__}({self._data.__repr__()})"
 
 
 CHUNK_TYPE = (Chunk, ChunkData)

@@ -18,19 +18,17 @@ import pandas as pd
 import pytest
 
 from ..... import dataframe as md
+from .....conftest import MARS_CI_BACKEND
 from .....deploy.oscar.ray import new_cluster
-from .....deploy.oscar.session import new_session
+from .....session import new_session
 from .....tests.core import require_ray
 from .....utils import lazy_import
+from ....utils import ray_deprecate_ml_dataset
 from ....contrib import raydataset as mdd
 
-
 ray = lazy_import("ray")
-ml_dataset = lazy_import("ray.util.data")
-try:
-    import xgboost_ray
-except ImportError:  # pragma: no cover
-    xgboost_ray = None
+ml_dataset = lazy_import("ray.util.data", rename="ml_dataset")
+xgboost_ray = lazy_import("xgboost_ray")
 try:
     import sklearn
 except ImportError:  # pragma: no cover
@@ -40,11 +38,11 @@ except ImportError:  # pragma: no cover
 @pytest.fixture
 async def create_cluster(request):
     client = await new_cluster(
-        "test_cluster",
-        supervisor_mem=1 * 1024 ** 3,
-        worker_num=4,
-        worker_cpu=2,
-        worker_mem=1 * 1024 ** 3,
+        supervisor_mem=256 * 1024**2,
+        worker_num=2,
+        worker_cpu=1,
+        worker_mem=256 * 1024**2,
+        backend=MARS_CI_BACKEND,
     )
     async with client:
         yield client
@@ -52,7 +50,11 @@ async def create_cluster(request):
 
 @require_ray
 @pytest.mark.asyncio
-async def test_dataset_related_classes(ray_large_cluster):
+@pytest.mark.skipif(
+    ray_deprecate_ml_dataset in (True, None),
+    reason="Ray (>=2.0) has deprecated MLDataset.",
+)
+async def test_dataset_related_classes(ray_start_regular_shared):
     from ..mldataset import ChunkRefBatch
 
     # in order to pass checks
@@ -72,13 +74,19 @@ async def test_dataset_related_classes(ray_large_cluster):
 
 @require_ray
 @pytest.mark.asyncio
-@pytest.mark.parametrize("test_option", [[5, 5], [5, 4], [None, None]])
-async def test_convert_to_ray_mldataset(ray_large_cluster, create_cluster, test_option):
+@pytest.mark.parametrize("chunk_size_and_num_shards", [[5, 5], [5, 4], [None, None]])
+@pytest.mark.skipif(
+    ray_deprecate_ml_dataset in (True, None),
+    reason="Ray (>=2.0) has deprecated MLDataset.",
+)
+async def test_convert_to_ray_mldataset(
+    ray_start_regular_shared, create_cluster, chunk_size_and_num_shards
+):
     assert create_cluster.session
-    session = new_session(address=create_cluster.address, backend="oscar", default=True)
+    session = new_session(address=create_cluster.address, backend="ray")
     with session:
         value = np.random.rand(10, 10)
-        chunk_size, num_shards = test_option
+        chunk_size, num_shards = chunk_size_and_num_shards
         df: md.DataFrame = md.DataFrame(value, chunk_size=chunk_size)
         df.execute()
 
@@ -89,12 +97,16 @@ async def test_convert_to_ray_mldataset(ray_large_cluster, create_cluster, test_
 @require_ray
 @pytest.mark.asyncio
 @pytest.mark.skipif(xgboost_ray is None, reason="xgboost_ray not installed")
-async def test_mars_with_xgboost(ray_large_cluster, create_cluster):
+@pytest.mark.skipif(
+    ray_deprecate_ml_dataset in (True, None),
+    reason="Ray (>=2.0) has deprecated MLDataset.",
+)
+async def test_mars_with_xgboost(ray_start_regular_shared, create_cluster):
     from xgboost_ray import RayDMatrix, RayParams, train, predict
     from sklearn.datasets import load_breast_cancer
 
     assert create_cluster.session
-    session = new_session(address=create_cluster.address, backend="oscar", default=True)
+    session = new_session(address=create_cluster.address, backend="ray")
     with session:
         train_x, train_y = load_breast_cancer(return_X_y=True, as_frame=True)
         df: md.DataFrame = md.concat(

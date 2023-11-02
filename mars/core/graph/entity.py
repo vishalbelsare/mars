@@ -13,12 +13,13 @@
 # limitations under the License.
 
 from abc import ABCMeta, abstractmethod
-from typing import List, Dict, Union, Iterable
+from typing import List, Dict, Tuple, Union, Iterable
 
 from ...core import Tileable, Chunk
 from ...serialization.core import buffered
 from ...serialization.serializables import Serializable, DictField, ListField, BoolField
 from ...serialization.serializables.core import SerializableSerializer
+from ...utils import tokenize
 from .core import DAG
 
 
@@ -34,6 +35,21 @@ class EntityGraph(DAG, metaclass=ABCMeta):
         results
         """
 
+    @results.setter
+    @abstractmethod
+    def results(self, new_results):
+        """
+        Set result tileables or chunks.
+
+        Parameters
+        ----------
+        new_results
+
+        Returns
+        -------
+
+        """
+
     def copy(self) -> "EntityGraph":
         graph = super().copy()
         graph.results = self.results.copy()
@@ -42,6 +58,11 @@ class EntityGraph(DAG, metaclass=ABCMeta):
 
 class TileableGraph(EntityGraph, Iterable[Tileable]):
     _result_tileables: List[Tileable]
+    # logic key is a unique and deterministic key for `TileableGraph`. For
+    # multiple runs the logic key will remain same if the computational logic
+    # doesn't change. And it can be used to some optimization when running a
+    # same `execute`, like HBO.
+    _logic_key: str
 
     def __init__(self, result_tileables: List[Tileable] = None):
         super().__init__()
@@ -58,6 +79,22 @@ class TileableGraph(EntityGraph, Iterable[Tileable]):
     @results.setter
     def results(self, new_results):
         self._result_tileables = new_results
+
+    @property
+    def logic_key(self):
+        if not hasattr(self, "_logic_key") or self._logic_key is None:
+            token_keys = []
+            for node in self.bfs():
+                logic_key = node.op.get_logic_key()
+                if hasattr(node.op, "logic_key") and node.op.logic_key is None:
+                    node.op.logic_key = logic_key
+                token_keys.append(
+                    tokenize(logic_key, **node.extra_params)
+                    if node.extra_params
+                    else logic_key
+                )
+            self._logic_key = tokenize(*token_keys)
+        return self._logic_key
 
 
 class ChunkGraph(EntityGraph, Iterable[Chunk]):
@@ -118,19 +155,15 @@ class SerializableGraph(Serializable):
 
 
 class GraphSerializer(SerializableSerializer):
-    serializer_name = "graph"
-
     @buffered
-    def serialize(self, obj: Union[TileableGraph, ChunkGraph], context: Dict):
+    def serial(self, obj: Union[TileableGraph, ChunkGraph], context: Dict):
         serializable_graph = SerializableGraph.from_graph(obj)
-        return (yield from super().serialize(serializable_graph, context))
+        return (), [serializable_graph], False
 
-    def deserialize(
-        self, header: Dict, buffers: List, context: Dict
+    def deserial(
+        self, serialized: Tuple, context: Dict, subs: List
     ) -> Union[TileableGraph, ChunkGraph]:
-        serializable_graph: SerializableGraph = (
-            yield from super().deserialize(header, buffers, context)
-        )
+        serializable_graph: SerializableGraph = subs[0]
         return serializable_graph.to_graph()
 
 

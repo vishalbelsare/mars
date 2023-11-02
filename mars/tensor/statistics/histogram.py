@@ -119,7 +119,7 @@ class HistBinScottSelector(HistBinSelector):
     """
 
     def __call__(self):
-        return (24.0 * np.pi ** 0.5 / self._x.size) ** (1.0 / 3.0) * mt.std(self._x)
+        return (24.0 * np.pi**0.5 / self._x.size) ** (1.0 / 3.0) * mt.std(self._x)
 
 
 class HistBinStoneSelector(HistBinSelector):
@@ -509,7 +509,7 @@ class TensorHistogramBinEdges(TensorOperand, TensorOperandMixin):
         bins = op.bins
 
         if isinstance(bins, str):
-            if has_unknown_shape(op.input):
+            if has_unknown_shape(a):
                 yield
         if (
             (a.size > 0 or np.isnan(a.size))
@@ -520,7 +520,7 @@ class TensorHistogramBinEdges(TensorOperand, TensorOperandMixin):
             input_max = a.max(keepdims=True)
             input_min, input_max = yield from recursive_tile(input_min, input_max)
             chunks = [input_min.chunks[0], input_max.chunks[0]]
-            yield chunks
+            yield chunks + a.chunks
             range_results = ctx.get_chunks_result([c.key for c in chunks])
             # make sure returned bounds are valid
             if all(x.size > 0 for x in range_results):

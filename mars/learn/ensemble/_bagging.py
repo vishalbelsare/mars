@@ -37,7 +37,6 @@ from ...core.context import Context
 from ...core.operand import OperandStage
 from ...dataframe.core import DATAFRAME_TYPE
 from ...dataframe.utils import parse_index
-from ...deploy.oscar.session import execute
 from ...serialization.serializables import (
     AnyField,
     BoolField,
@@ -50,6 +49,7 @@ from ...serialization.serializables import (
     ReferenceField,
     FieldTypes,
 )
+from ...session import execute
 from ...tensor.core import TENSOR_CHUNK_TYPE
 from ...tensor.random import RandomStateField
 from ...tensor.utils import gen_random_seeds
@@ -133,7 +133,6 @@ class BaggingSample(LearnShuffle, LearnOperandMixin):
     feature_random_state = RandomStateField("feature_random_state")
 
     reducer_ratio: float = Float32Field("reducer_ratio")
-    n_reducers: int = Int64Field("n_reducers", default=None)
     column_offset: int = Int64Field("column_offset", default=None)
 
     chunk_shape: Tuple[int] = TupleField("chunk_shape", FieldTypes.int64)
@@ -295,7 +294,7 @@ class BaggingSample(LearnShuffle, LearnOperandMixin):
 
         n_reducers = (
             op.n_reducers
-            if op.n_reducers is not None
+            if getattr(op, "n_reducers", None)
             else max(1, int(in_sample.chunk_shape[0] * op.reducer_ratio))
         )
 
@@ -357,6 +356,8 @@ class BaggingSample(LearnShuffle, LearnOperandMixin):
             new_op = op.copy().reset_key()
             new_op.random_state = None
             new_op.stage = OperandStage.reduce
+            new_op.reducer_ordinal = idx
+            new_op.n_reducers = n_reducers
             new_op.chunk_shape = in_sample.chunk_shape
             new_op.n_estimators = op.n_estimators // n_reducers
             if remain_reducers:
@@ -535,8 +536,9 @@ class BaggingSample(LearnShuffle, LearnOperandMixin):
                 feature_idx_array,
             ),
         ) in result_store.items():
-            ctx[out_samples.key, (reducer_id, 0)] = tuple(
-                samples + labels + weights + feature_idx_array
+            ctx[out_samples.key, (reducer_id, 0)] = (
+                ctx.get_current_chunk().index,
+                tuple(samples + labels + weights + feature_idx_array),
             )
 
     @classmethod
@@ -544,10 +546,6 @@ class BaggingSample(LearnShuffle, LearnOperandMixin):
         out_data, out_labels, out_weights, out_feature_indices = _extract_bagging_io(
             op.outputs, op, output=True
         )
-
-        input_keys = op.inputs[0].op.source_keys
-        input_idxes = op.inputs[0].op.source_idxes
-
         sample_holder = [
             np.empty(op.chunk_shape, dtype=object) for _ in range(op.n_estimators)
         ]
@@ -570,10 +568,11 @@ class BaggingSample(LearnShuffle, LearnOperandMixin):
             else None
         )
 
-        for input_key, input_idx in zip(input_keys, input_idxes):
+        input_indexes = [idx for idx, _ in op.iter_mapper_data(ctx)]
+        for input_key, input_idx in zip(op.iter_mapper_keys(), input_indexes):
             add_feature_index = input_idx[0] == 0
             add_label_weight = input_idx[1] == op.chunk_shape[1] - 1
-            chunk_data = ctx[input_key, out_data.index]
+            chunk_data = ctx[input_key, out_data.index][-1]
 
             num_groups = 1
             if add_feature_index and op.with_feature_indices:
@@ -659,7 +658,7 @@ class BaggingSampleReindex(LearnOperand, LearnOperandMixin):
             inputs.append(feature_indices)
             params["shape"] = (data.shape[0], np.nan)
         if isinstance(data, DATAFRAME_TYPE):
-            params["index_value"] = parse_index(pd.Int64Index([]), data.key)
+            params["index_value"] = parse_index(pd.Index([], dtype=np.int64), data.key)
         return self.new_tileable(inputs, **params)
 
     @classmethod
@@ -707,7 +706,7 @@ class BaggingSampleReindex(LearnOperand, LearnOperandMixin):
                 params["index"] = (chunks[0].index[0], chunks[0].index[2])
                 if isinstance(t_data, DATAFRAME_TYPE):
                     params["index_value"] = parse_index(
-                        pd.Int64Index([]), chunks[0].key
+                        pd.Index([], dtype=np.int64), chunks[0].key
                     )
                 inputs = chunks.tolist()
                 return new_op.new_chunk(inputs, **params)

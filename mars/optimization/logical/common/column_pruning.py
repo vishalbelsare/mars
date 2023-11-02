@@ -12,33 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from abc import ABCMeta, abstractmethod
 from typing import Any, List
 
+from ..core import (
+    OperandBasedOptimizationRule,
+    OptimizationRecord,
+    OptimizationRecordType,
+)
 from ....core import OperandType, TileableType, CHUNK_TYPE
 from ....dataframe.datasource.core import ColumnPruneSupportedDataSourceMixin
 from ....dataframe.utils import parse_index
 from ....utils import implements
-from ..core import OptimizationRule, OptimizationRecord, OptimizationRecordType
 
 
-class PruneDataSource(OptimizationRule, metaclass=ABCMeta):
+class PruneDataSource(OperandBasedOptimizationRule, metaclass=ABCMeta):
     def _all_successor_prune_pushdown(self, successors: List[TileableType]):
         for succ in successors:
-            rule_types = self._optimizer_cls.get_rule_types(type(succ.op))
-            if rule_types is None:
+            prune_rule_types = [
+                rule_type
+                for rule_type in self._rule_type_to_op_types
+                if issubclass(rule_type, PruneDataSource)
+                and isinstance(succ.op, tuple(self._rule_type_to_op_types[rule_type]))
+            ]
+            if not prune_rule_types:
                 return False
-            for rule_type in rule_types:
-                if not issubclass(rule_type, PruneDataSource):
-                    return False
-                rule = rule_type(self._graph, self._records, self._optimizer_cls)
+
+            for rule_type in prune_rule_types:
+                rule = self._cached_rule(rule_type)
                 if not rule._need_prune(succ.op):
                     return False
         return True
 
-    @implements(OptimizationRule.match)
-    def match(self, op: OperandType) -> bool:
+    @implements(OperandBasedOptimizationRule.match_operand)
+    def match_operand(self, op: OperandType) -> bool:
         node = op.outputs[0]
         input_node = self._graph.predecessors(node)[0]
         successors = self._graph.successors(input_node)
@@ -72,7 +79,7 @@ class PruneDataSource(OptimizationRule, metaclass=ABCMeta):
 
     def _merge_selected_columns(self, selected_columns: List[Any], op: OperandType):
         input_node = self._graph.predecessors(op.outputs[0])[0]
-        original_node = self._records.get_original_chunk(input_node)
+        original_node = self._records.get_original_entity(input_node)
         if original_node is None:
             # not pruned before
             original_all_columns = input_node.dtypes.index.tolist()
@@ -91,8 +98,8 @@ class PruneDataSource(OptimizationRule, metaclass=ABCMeta):
             # even though no columns pruned
             return [c for c in original_all_columns if c in pruned_columns_set]
 
-    @implements(OptimizationRule.apply)
-    def apply(self, op: OperandType):
+    @implements(OperandBasedOptimizationRule.apply_to_operand)
+    def apply_to_operand(self, op: OperandType):
         node = op.outputs[0]
         data_source_node = self._graph.predecessors(node)[0]
 
@@ -144,7 +151,7 @@ class PruneDataSource(OptimizationRule, metaclass=ABCMeta):
             new_outputs = [new_data_source_node]
         else:
             selected_columns: List[Any] = self._get_selected_columns(op)
-            original_node = self._records.get_original_chunk(data_source_node)
+            original_node = self._records.get_original_entity(data_source_node)
             if original_node is not None:
                 # pruned before
                 dtypes = original_node.dtypes

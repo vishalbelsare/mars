@@ -101,6 +101,7 @@ def test_copyto_execution(setup):
     assert res.flags["C_CONTIGUOUS"] is False
 
 
+@pytest.mark.ray_dag
 def test_astype_execution(setup):
     raw = np.random.random((10, 5))
     arr = tensor(raw, chunk_size=3)
@@ -335,6 +336,7 @@ def test_where_execution(setup):
     np.testing.assert_array_equal(res, np.where(raw_x < 5, 2, -1))
 
 
+@pytest.mark.ray_dag
 def test_reshape_execution(setup):
     raw_data = np.random.rand(5, 10, 30)
     x = tensor(raw_data, chunk_size=8)
@@ -814,6 +816,7 @@ def test_tile_execution(setup):
     np.testing.assert_equal(res, expected)
 
 
+@pytest.mark.ray_dag
 def test_isin_execution(setup):
     element = 2 * arange(4, chunk_size=1).reshape((2, 2))
     test_elements = [1, 2, 4, 8]
@@ -982,6 +985,7 @@ def test_searchsorted_execution(setup):
             np.testing.assert_array_equal(res, expected)
 
 
+@pytest.mark.ray_dag
 def test_unique_execution(setup):
     rs = np.random.RandomState(0)
     raw = rs.randint(10, size=(10,))
@@ -1144,6 +1148,7 @@ def test_to_cpu_execution(setup_gpu):
     np.testing.assert_array_equal(res, raw)
 
 
+@pytest.mark.ray_dag
 def test_sort_execution(setup):
     # only 1 chunk when axis = -1
     raw = np.random.rand(100, 10)
@@ -1313,6 +1318,7 @@ def test_sort_execution(setup):
     np.testing.assert_array_equal(res, np.sort(raw[raw < 1]))
 
 
+@pytest.mark.ray_dag
 def test_sort_indices_execution(setup):
     # only 1 chunk when axis = -1
     raw = np.random.rand(100, 10)
@@ -1340,6 +1346,7 @@ def test_sort_indices_execution(setup):
     np.testing.assert_array_equal(sr, raw[si])
 
 
+@pytest.mark.ray_dag
 def test_argsort(setup):
     # only 1 chunk when axis = -1
     raw = np.random.rand(100, 10)
@@ -1367,6 +1374,7 @@ def test_argsort(setup):
     np.testing.assert_array_equal(np.sort(raw, axis=0), raw[r])
 
 
+@pytest.mark.ray_dag
 def test_partition_execution(setup):
     # only 1 chunk when axis = -1
     raw = np.random.rand(100, 10)
@@ -1523,6 +1531,7 @@ def test_partition_execution(setup):
     np.testing.assert_array_equal(res[:, kth_res], sort_res[:, kth_res])
 
 
+@pytest.mark.ray_dag
 def test_partition_indices_execution(setup):
     # only 1 chunk when axis = -1
     raw = np.random.rand(100, 10)
@@ -1554,6 +1563,7 @@ def test_partition_indices_execution(setup):
     np.testing.assert_array_equal(np.sort(raw)[kth], pr[kth])
 
 
+@pytest.mark.ray_dag
 def test_argpartition_execution(setup):
     # only 1 chunk when axis = -1
     raw = np.random.rand(100, 10)
@@ -1755,6 +1765,7 @@ def test_trapz_execution(setup):
             np.testing.assert_almost_equal(result, expected)
 
 
+@pytest.mark.ray_dag
 def test_shape(setup):
     raw = np.random.RandomState(0).rand(4, 3)
     x = mt.tensor(raw, chunk_size=2)
@@ -1777,6 +1788,7 @@ def test_shape(setup):
     assert result == expected
 
 
+@pytest.mark.ray_dag
 def test_rebalance_execution(setup):
     session = setup
 
@@ -1956,4 +1968,24 @@ def test_in1d_execute(setup, chunk_size, invert):
     ar = mt.in1d(ar1, ar2, invert=invert)
     result = ar.execute().fetch()
     expected = np.in1d(raw1, raw2, invert=invert)
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize("chunk_size", [3, 5])
+def test_setdiff1d_execute(setup, chunk_size):
+    rs = np.random.RandomState(0)
+    raw1 = rs.randint(10, size=10)
+    ar1 = mt.tensor(raw1, chunk_size=5)
+    raw2 = np.arange(5)
+    ar2 = mt.tensor(raw2, chunk_size=chunk_size)
+    ar = mt.setdiff1d(ar1, ar2)
+    result = ar.execute().fetch()
+    expected = np.setdiff1d(raw1, raw2)
+    np.testing.assert_array_equal(result, expected)
+
+    raw3 = rs.shuffle(rs.choice(np.arange(100), 10))
+    ar3 = mt.tensor(raw3, chunk_size=5)
+    ar = mt.setdiff1d(ar3, ar2, assume_unique=True)
+    result = ar.execute().fetch()
+    expected = np.setdiff1d(raw3, raw2, assume_unique=True)
     np.testing.assert_array_equal(result, expected)

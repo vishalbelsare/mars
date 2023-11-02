@@ -18,11 +18,13 @@ import pandas as pd
 from ... import opcodes as OperandDef
 from ...core import OutputType
 from ...serialization.serializables import KeyField, AnyField, Int8Field, Int64Field
-from ...utils import has_unknown_shape
+from ...utils import has_unknown_shape, no_default, pd_release_version
 from ..operands import DataFrameOperand, DataFrameOperandMixin
 from ..utils import parse_index, build_df, build_series, validate_axis
 
 _need_consolidate = pd.__version__ in ("1.1.0", "1.3.0", "1.3.1")
+_enable_no_default = pd_release_version[:2] > (1, 1)
+_with_column_freq_bug = (1, 2, 0) <= pd_release_version < (1, 4, 3)
 
 
 class DataFrameShift(DataFrameOperand, DataFrameOperandMixin):
@@ -227,13 +229,13 @@ class DataFrameShift(DataFrameOperand, DataFrameOperandMixin):
                         else:
                             to_concats.append(to_concat)
 
-                    if len(to_concats) > 1:
+                    if len(to_concats) == 1:
+                        to_shift_chunk = to_concats[0]
+                    else:
                         concat_op = DataFrameConcat(
                             axis=axis, output_types=[OutputType.dataframe]
                         )
                         to_shift_chunk = concat_op.new_chunk(to_concats)
-                    else:
-                        to_shift_chunk = to_concats[0]
 
                     chunk_op = op.copy().reset_key()
                     if axis == 1:
@@ -297,9 +299,7 @@ class DataFrameShift(DataFrameOperand, DataFrameOperandMixin):
                 to_concats = [c]
                 left = abs(op.periods)
                 while left > 0 and 0 <= prev_i < inp.chunk_shape[0]:
-                    prev_chunk = inp.cix[
-                        prev_i,
-                    ]
+                    prev_chunk = inp.cix[prev_i,]
                     size = min(left, prev_chunk.shape[0])
                     left -= size
                     prev_i = prev_i - 1 if inc else prev_i + 1
@@ -316,11 +316,11 @@ class DataFrameShift(DataFrameOperand, DataFrameOperandMixin):
                     else:
                         to_concats.append(to_concat)
 
-                if len(to_concats) > 1:
+                if len(to_concats) == 1:
+                    to_concat = to_concats[0]
+                else:
                     concat_op = DataFrameConcat(output_types=[OutputType.series])
                     to_concat = concat_op.new_chunk(to_concats)
-                else:
-                    to_concat = to_concats[0]
 
                 out_chunk = chunk_op.new_chunk(
                     [to_concat],
@@ -376,7 +376,7 @@ class DataFrameShift(DataFrameOperand, DataFrameOperandMixin):
                 slc[axis] = slice(out.shape[axis])
 
             result = result.iloc[tuple(slc)]
-            assert result.shape == out.shape
+            assert result.shape == out.shape, (result.shape, out.shape)
 
         ctx[out.key] = result
 
@@ -456,7 +456,13 @@ def shift(df_or_series, periods=1, freq=None, axis=0, fill_value=None):
     axis = validate_axis(axis, df_or_series)
     if periods == 0:
         return df_or_series.copy()
-
+    if fill_value is no_default:  # pragma: no cover
+        if not _enable_no_default or (
+            _with_column_freq_bug and axis == 1 and freq is not None
+        ):
+            # pandas shift shows different behavior for axis=1 when freq is specified,
+            # see https://github.com/pandas-dev/pandas/issues/47039 for details.
+            fill_value = None
     op = DataFrameShift(periods=periods, freq=freq, axis=axis, fill_value=fill_value)
     return op(df_or_series)
 

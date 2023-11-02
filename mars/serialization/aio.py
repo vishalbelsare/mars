@@ -12,19 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import struct
 from io import BytesIO
 from typing import Any
 
+import cloudpickle
 import numpy as np
 
 from ..utils import lazy_import
-from .core import pickle, serialize, deserialize
+from .core import serialize_with_spawn, deserialize
 
-cupy = lazy_import("cupy", globals=globals())
-cudf = lazy_import("cudf", globals=globals())
+cupy = lazy_import("cupy")
+cudf = lazy_import("cudf")
 
-DEFAULT_SERIALIZATION_VERSION = 0
+DEFAULT_SERIALIZATION_VERSION = 1
+DEFAULT_SPAWN_THRESHOLD = 100
 BUFFER_SIZES_NAME = "buf_sizes"
 
 
@@ -33,8 +36,10 @@ class AioSerializer:
         self._obj = obj
         self._compress = compress
 
-    def _get_buffers(self):
-        headers, buffers = serialize(self._obj)
+    async def _get_buffers(self):
+        headers, buffers = await serialize_with_spawn(
+            self._obj, spawn_threshold=DEFAULT_SPAWN_THRESHOLD
+        )
 
         def _is_cuda_buffer(buf):  # pragma: no cover
             if cupy is not None and cudf is not None:
@@ -51,13 +56,13 @@ class AioSerializer:
                 return False
 
         is_cuda_buffers = [_is_cuda_buffer(buf) for buf in buffers]
-        headers["is_cuda_buffers"] = np.array(is_cuda_buffers)
+        headers[0]["is_cuda_buffers"] = np.array(is_cuda_buffers)
 
         # add buffer lengths into headers
-        headers[BUFFER_SIZES_NAME] = [
-            getattr(buf, "nbytes", len(buf)) for buf in buffers
+        headers[0][BUFFER_SIZES_NAME] = [
+            buf.nbytes if hasattr(buf, "nbytes") else len(buf) for buf in buffers
         ]
-        header = pickle.dumps(headers)
+        header = cloudpickle.dumps(headers)
 
         # gen header buffer
         header_bio = BytesIO()
@@ -77,7 +82,13 @@ class AioSerializer:
         return out_buffers
 
     async def run(self):
-        return self._get_buffers()
+        return await self._get_buffers()
+
+
+MALFORMED_MSG = """\
+Received malformed data, please check Mars version on both side,
+if error occurs when using `mars.new_session('http://web_ip:web_port'),
+please check if web port is right."""
 
 
 class AioDeserializer:
@@ -103,7 +114,7 @@ class AioDeserializer:
             raise EOFError("Received empty bytes")
         version = struct.unpack("B", header_bytes[:1])[0]
         # now we only have default version
-        assert version == DEFAULT_SERIALIZATION_VERSION
+        assert version == DEFAULT_SERIALIZATION_VERSION, MALFORMED_MSG
         # header length
         header_length = struct.unpack("<Q", header_bytes[1:9])[0]
         # compress
@@ -111,13 +122,18 @@ class AioDeserializer:
         return await self._readexactly(header_length)
 
     async def _get_obj(self):
-        header = pickle.loads(await self._get_obj_header_bytes())
+        header = cloudpickle.loads(await self._get_obj_header_bytes())
         # get buffer size
-        buffer_sizes = header.pop(BUFFER_SIZES_NAME)
+        buffer_sizes = header[0].pop(BUFFER_SIZES_NAME)
         # get buffers
         buffers = [await self._readexactly(size) for size in buffer_sizes]
+        # get num of objs
+        num_objs = header[0].get("_N", 0)
 
-        return deserialize(header, buffers)
+        if num_objs <= DEFAULT_SPAWN_THRESHOLD:
+            return deserialize(header, buffers)
+        else:
+            return await asyncio.to_thread(deserialize, header, buffers)
 
     async def run(self):
         return await self._get_obj()
@@ -125,10 +141,10 @@ class AioDeserializer:
     async def get_size(self):
         # extract header
         header_bytes = await self._get_obj_header_bytes()
-        header = pickle.loads(header_bytes)
+        header = cloudpickle.loads(header_bytes)
         # get buffer size
-        buffer_sizes = header.pop(BUFFER_SIZES_NAME)
+        buffer_sizes = header[0].pop(BUFFER_SIZES_NAME)
         return 11 + len(header_bytes) + sum(buffer_sizes)
 
     async def get_header(self):
-        return pickle.loads(await self._get_obj_header_bytes())
+        return cloudpickle.loads(await self._get_obj_header_bytes())

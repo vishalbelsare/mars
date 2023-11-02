@@ -15,6 +15,7 @@
 import os
 import tempfile
 import shutil
+import string
 from collections import OrderedDict
 
 import numpy as np
@@ -22,8 +23,12 @@ import pandas as pd
 import pytest
 
 from .... import tensor as mt
+from ....config import option_context
 from ....core import tile
-from ...core import IndexValue, DatetimeIndex, Int64Index, Float64Index
+from ....tests.core import require_ray
+from ....utils import lazy_import
+from ...core import IndexValue, DatetimeIndex, Int64Index, Float64Index, MultiIndex
+from ..core import merge_small_files
 from ..dataframe import from_pandas as from_pandas_df
 from ..date_range import date_range
 from ..from_records import from_records
@@ -36,14 +41,13 @@ from ..index import from_pandas as from_pandas_index, from_tileable
 from ..read_csv import read_csv, DataFrameReadCSV
 from ..read_sql import read_sql_table, read_sql_query, DataFrameReadSQL
 from ..read_raydataset import (
-    read_raydataset,
+    read_ray_dataset,
     DataFrameReadRayDataset,
     read_ray_mldataset,
     DataFrameReadMLDataset,
 )
+from ...utils import ray_deprecate_ml_dataset
 from ..series import from_pandas as from_pandas_series
-from ....tests.core import require_ray
-from ....utils import lazy_import
 
 
 ray = lazy_import("ray")
@@ -136,6 +140,30 @@ def test_from_pandas_dataframe():
     assert df2.chunks[3].index_value._index_value._slice == slice(8, 10, 2)
     pd.testing.assert_frame_equal(df2.chunks[5].op.data, df2.op.data.iloc[4:, 8:])
     assert df2.chunks[3].index_value._index_value._slice == slice(8, 10, 2)
+
+    raw = pd.DataFrame(
+        {
+            "a": [
+                string.printable[i : i + 15]
+                for i in np.random.randint(len(string.printable), size=100)
+            ],
+            "b": np.random.rand(100),
+        }
+    )
+    with option_context({"chunk_store_limit": raw["a"].memory_usage(deep=True) / 10}):
+        df = tile(from_pandas_df(raw))
+        # see GH#2985, empty chunks are wrongly generated
+        assert len([ns for ns in df.nsplits[1] if ns == 0]) == 0
+
+
+def test_from_pandas_dataframe_with_multi_index():
+    index = pd.MultiIndex.from_tuples([("k1", "v1")], names=["X", "Y"])
+    data = np.random.randint(0, 100, size=(1, 3))
+    pdf = pd.DataFrame(data, columns=["A", "B", "C"], index=index)
+    df = from_pandas_df(pdf, chunk_size=4)
+    assert isinstance(df.index, MultiIndex)
+    assert df.index.names == ["X", "Y"]
+    assert df.index.name is None
 
 
 def test_from_pandas_series():
@@ -237,7 +265,7 @@ def test_from_tensor():
     tensor = mt.random.rand(10, 10, chunk_size=5)
     df = dataframe_from_tensor(tensor)
     assert isinstance(df.index_value._index_value, IndexValue.RangeIndex)
-    assert df.op.dtypes[0] == tensor.dtype
+    assert df.dtypes[0] == tensor.dtype
 
     df = tile(df)
     assert len(df.chunks) == 4
@@ -265,18 +293,10 @@ def test_from_tensor():
     # from tensor with given index
     df = dataframe_from_tensor(tensor, index=np.arange(0, 20, 2))
     df = tile(df)
-    pd.testing.assert_index_equal(
-        df.chunks[0].index_value.to_pandas(), pd.Index(np.arange(0, 10, 2))
-    )
-    pd.testing.assert_index_equal(
-        df.chunks[1].index_value.to_pandas(), pd.Index(np.arange(0, 10, 2))
-    )
-    pd.testing.assert_index_equal(
-        df.chunks[2].index_value.to_pandas(), pd.Index(np.arange(10, 20, 2))
-    )
-    pd.testing.assert_index_equal(
-        df.chunks[3].index_value.to_pandas(), pd.Index(np.arange(10, 20, 2))
-    )
+    pd.testing.assert_index_equal(df.chunks[0].op.index, pd.Index(np.arange(0, 10, 2)))
+    pd.testing.assert_index_equal(df.chunks[1].op.index, pd.Index(np.arange(0, 10, 2)))
+    pd.testing.assert_index_equal(df.chunks[2].op.index, pd.Index(np.arange(10, 20, 2)))
+    pd.testing.assert_index_equal(df.chunks[3].op.index, pd.Index(np.arange(10, 20, 2)))
 
     # from tensor with index that is a tensor as well
     df = dataframe_from_tensor(tensor, index=mt.arange(0, 20, 2))
@@ -352,14 +372,12 @@ def test_from_tensor():
     pd.testing.assert_index_equal(series.index_value.to_pandas(), pd.RangeIndex(4))
 
     series = series_from_tensor(mt.random.rand(4), index=[1, 2, 3])
-    pd.testing.assert_index_equal(series.index_value.to_pandas(), pd.Index([1, 2, 3]))
+    pd.testing.assert_index_equal(series.op.index, pd.Index([1, 2, 3]))
 
     series = series_from_tensor(
         mt.random.rand(4), index=pd.Index([1, 2, 3], name="my_index")
     )
-    pd.testing.assert_index_equal(
-        series.index_value.to_pandas(), pd.Index([1, 2, 3], name="my_index")
-    )
+    pd.testing.assert_index_equal(series.op.index, pd.Index([1, 2, 3], name="my_index"))
     assert series.index_value.name == "my_index"
 
     with pytest.raises(TypeError):
@@ -511,7 +529,7 @@ def test_read_sql():
 
 
 @require_ray
-def test_read_raydataset(ray_start_regular):
+def test_read_ray_dataset(ray_start_regular):
     test_df1 = pd.DataFrame(
         {
             "a": np.arange(10).astype(np.int64, copy=False),
@@ -526,7 +544,7 @@ def test_read_raydataset(ray_start_regular):
     )
     df = pd.concat([test_df1, test_df2])
     ds = ray.data.from_pandas_refs([ray.put(test_df1), ray.put(test_df2)])
-    mdf = read_raydataset(ds)
+    mdf = read_ray_dataset(ds)
 
     assert mdf.shape[1] == 2
     pd.testing.assert_index_equal(df.columns, mdf.columns_value.to_pandas())
@@ -580,6 +598,10 @@ def test_date_range():
 
 
 @require_ray
+@pytest.mark.skipif(
+    ray_deprecate_ml_dataset in (True, None),
+    reason="Ray (>=2.0) has deprecated MLDataset.",
+)
 def test_read_ray_mldataset(ray_start_regular):
     test_df1 = pd.DataFrame(
         {
@@ -610,3 +632,28 @@ def test_read_ray_mldataset(ray_start_regular):
     assert len(mdf.chunks) == 2
     for chunk in mdf.chunks:
         assert isinstance(chunk.op, DataFrameReadMLDataset)
+
+
+def test_merge_small_files():
+    raw = pd.DataFrame(np.random.rand(16, 4))
+    df = tile(from_pandas_df(raw, chunk_size=4))
+
+    chunk_size = 4 * 4 * 8
+    # number of chunks < 10
+    assert df is merge_small_files(df, n_sample_file=10)
+    # merged_chunk_size
+    assert df is merge_small_files(
+        df, n_sample_file=2, merged_file_size=chunk_size + 0.1
+    )
+
+    df2 = merge_small_files(df, n_sample_file=2, merged_file_size=2 * chunk_size)
+    assert len(df2.chunks) == 2
+    assert df2.chunks[0].shape == (8, 4)
+    pd.testing.assert_index_equal(
+        df2.chunks[0].index_value.to_pandas(), pd.RangeIndex(8)
+    )
+    assert df2.chunks[1].shape == (8, 4)
+    pd.testing.assert_index_equal(
+        df2.chunks[1].index_value.to_pandas(), pd.RangeIndex(8, 16)
+    )
+    assert df2.nsplits == ((8, 8), (4,))

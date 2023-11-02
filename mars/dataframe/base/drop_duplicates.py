@@ -18,7 +18,7 @@ import pandas as pd
 from ... import opcodes
 from ...core.operand import OperandStage
 from ...serialization.serializables import BoolField
-from ...utils import lazy_import
+from ...utils import lazy_import, calc_nsplits
 from ..operands import OutputType
 from ..utils import (
     parse_index,
@@ -28,7 +28,7 @@ from ..utils import (
 )
 from ._duplicate import DuplicateOperand, validate_subset
 
-cudf = lazy_import("cudf", globals=globals())
+cudf = lazy_import("cudf")
 
 
 class DataFrameDropDuplicates(DuplicateOperand):
@@ -120,10 +120,11 @@ class DataFrameDropDuplicates(DuplicateOperand):
         tiled = super()._tile_shuffle(op, inp)[0]
         put_back_chunks = tiled.chunks
         if op.ignore_index:
+            yield put_back_chunks
             put_back_chunks = standardize_range_index(put_back_chunks)
         new_op = op.copy()
         params = tiled.params
-        params["nsplits"] = tiled.nsplits
+        params["nsplits"] = calc_nsplits({c.index: c.shape for c in put_back_chunks})
         params["chunks"] = put_back_chunks
         return new_op.new_tileables(op.inputs, kws=[params])
 
@@ -201,6 +202,7 @@ class DataFrameDropDuplicates(DuplicateOperand):
         elif out.op.output_types[0] == OutputType.series:
             assert inp.shape[1] == 1
             ret = inp.iloc[:, 0]
+            ret.name = out.name
         else:
             ret = inp
 
@@ -312,14 +314,14 @@ def series_drop_duplicates(series, keep="first", inplace=False, method="auto"):
     Generate a Series with duplicated entries.
 
     >>> import mars.dataframe as md
-    >>> s = md.Series(['lama', 'cow', 'lama', 'beetle', 'lama', 'hippo'],
+    >>> s = md.Series(['lame', 'cow', 'lame', 'beetle', 'lame', 'hippo'],
     ...               name='animal')
     >>> s.execute()
-    0      lama
+    0      lame
     1       cow
-    2      lama
+    2      lame
     3    beetle
-    4      lama
+    4      lame
     5     hippo
     Name: animal, dtype: object
 
@@ -328,7 +330,7 @@ def series_drop_duplicates(series, keep="first", inplace=False, method="auto"):
     set of duplicated entries. The default value of keep is 'first'.
 
     >>> s.drop_duplicates().execute()
-    0      lama
+    0      lame
     1       cow
     3    beetle
     5     hippo
@@ -340,7 +342,7 @@ def series_drop_duplicates(series, keep="first", inplace=False, method="auto"):
     >>> s.drop_duplicates(keep='last').execute()
     1       cow
     3    beetle
-    4      lama
+    4      lame
     5     hippo
     Name: animal, dtype: object
 
@@ -357,7 +359,7 @@ def series_drop_duplicates(series, keep="first", inplace=False, method="auto"):
     """
     if method not in ("auto", "tree", "shuffle", None):
         raise ValueError(
-            "method could only be one of " "'auto', 'tree', 'shuffle' or None"
+            "method could only be one of 'auto', 'tree', 'shuffle' or None"
         )
     op = DataFrameDropDuplicates(keep=keep, method=method)
     return op(series, inplace=inplace)
@@ -391,20 +393,20 @@ def index_drop_duplicates(index, keep="first", method="auto"):
 
     >>> import mars.dataframe as md
 
-    >>> idx = md.Index(['lama', 'cow', 'lama', 'beetle', 'lama', 'hippo'])
+    >>> idx = md.Index(['lame', 'cow', 'lame', 'beetle', 'lame', 'hippo'])
 
     The `keep` parameter controls  which duplicate values are removed.
     The value 'first' keeps the first occurrence for each
     set of duplicated entries. The default value of keep is 'first'.
 
     >>> idx.drop_duplicates(keep='first').execute()
-    Index(['lama', 'cow', 'beetle', 'hippo'], dtype='object')
+    Index(['lame', 'cow', 'beetle', 'hippo'], dtype='object')
 
     The value 'last' keeps the last occurrence for each set of duplicated
     entries.
 
     >>> idx.drop_duplicates(keep='last').execute()
-    Index(['cow', 'beetle', 'lama', 'hippo'], dtype='object')
+    Index(['cow', 'beetle', 'lame', 'hippo'], dtype='object')
 
     The value ``False`` discards all sets of duplicated entries.
 
@@ -413,7 +415,7 @@ def index_drop_duplicates(index, keep="first", method="auto"):
     """
     if method not in ("auto", "tree", "shuffle", None):
         raise ValueError(
-            "method could only be one of " "'auto', 'tree', 'shuffle' or None"
+            "method could only be one of 'auto', 'tree', 'shuffle' or None"
         )
     op = DataFrameDropDuplicates(keep=keep, method=method)
     return op(index)

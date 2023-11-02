@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import base64
 import json
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from ....core import TileableGraph, Tileable
-from ....lib.aio import alru_cache
+from ....lib.tbcode import load_traceback_code, dump_traceback_code
 from ....utils import serialize_serializable, deserialize_serializable
 from ...web import web_api, MarsServiceWebAPIHandler, MarsWebAPIClientMixin
 from ..core import TaskResult, TaskStatus
@@ -27,7 +28,7 @@ from .core import AbstractTaskAPI
 def _json_serial_task_result(result: Optional[TaskResult]):
     if result is None:
         return {}
-    return {
+    res_json = {
         "task_id": result.task_id,
         "session_id": result.session_id,
         "stage_id": result.stage_id,
@@ -35,22 +36,26 @@ def _json_serial_task_result(result: Optional[TaskResult]):
         "end_time": result.end_time,
         "progress": result.progress,
         "status": result.status.value,
-        "error": base64.b64encode(serialize_serializable(result.error)).decode()
-        if result.error is not None
-        else None,
-        "traceback": base64.b64encode(serialize_serializable(result.traceback)).decode()
-        if result.traceback is not None
-        else None,
+        "profiling": result.profiling,
     }
+    if result.error is not None:
+        res_json["error"] = base64.b64encode(
+            serialize_serializable(result.error)
+        ).decode()
+        res_json["traceback"] = base64.b64encode(
+            serialize_serializable(result.traceback)
+        ).decode()
+        res_json["traceback_code"] = dump_traceback_code(result.traceback)
+    return res_json
 
 
 def _json_deserial_task_result(d: dict) -> Optional[TaskResult]:
     if not d:
         return None
-    if d["error"] is not None:
+    if "error" in d:
         d["error"] = deserialize_serializable(base64.b64decode(d["error"]))
-    if d["traceback"] is not None:
         d["traceback"] = deserialize_serializable(base64.b64decode(d["traceback"]))
+        load_traceback_code(d.pop("traceback_code"))
     d["status"] = TaskStatus(d["status"])
     return TaskResult(**d)
 
@@ -58,19 +63,10 @@ def _json_deserial_task_result(d: dict) -> Optional[TaskResult]:
 class TaskWebAPIHandler(MarsServiceWebAPIHandler):
     _root_pattern = "/api/session/(?P<session_id>[^/]+)/task"
 
-    @alru_cache(cache_exceptions=False)
-    async def _get_cluster_api(self):
-        from ...cluster import ClusterAPI
-
-        return await ClusterAPI.create(self._supervisor_addr)
-
-    @alru_cache(cache_exceptions=False)
     async def _get_oscar_task_api(self, session_id: str):
         from .oscar import TaskAPI
 
-        cluster_api = await self._get_cluster_api()
-        [address] = await cluster_api.get_supervisors_by_keys([session_id])
-        return await TaskAPI.create(session_id, address)
+        return await self._get_api_by_key(TaskAPI, session_id)
 
     @web_api("", method="post")
     async def submit_tileable_graph(self, session_id: str):
@@ -78,22 +74,22 @@ class TaskWebAPIHandler(MarsServiceWebAPIHandler):
             deserialize_serializable(self.request.body) if self.request.body else None
         )
 
-        task_name = body_args.get("task_name", None) or None
         fuse_enabled = body_args.get("fuse")
 
         graph = body_args["graph"]
         extra_config = body_args.get("extra_config", None)
+        if extra_config:
+            extra_config = deserialize_serializable(extra_config)
 
         oscar_api = await self._get_oscar_task_api(session_id)
         task_id = await oscar_api.submit_tileable_graph(
             graph,
-            task_name=task_name,
             fuse_enabled=fuse_enabled,
             extra_config=extra_config,
         )
         self.write(task_id)
 
-    @web_api("", method="get")
+    @web_api("", method="get", cache_blocking=True)
     async def get_task_results(self, session_id: str):
         progress = bool(int(self.get_argument("progress", "0")))
         oscar_api = await self._get_oscar_task_api(session_id)
@@ -101,14 +97,17 @@ class TaskWebAPIHandler(MarsServiceWebAPIHandler):
         self.write(json.dumps({"tasks": [_json_serial_task_result(r) for r in res]}))
 
     @web_api(
-        "(?P<task_id>[^/]+)", method="get", arg_filter={"action": "fetch_tileables"}
+        "(?P<task_id>[^/]+)",
+        method="get",
+        arg_filter={"action": "fetch_tileables"},
+        cache_blocking=True,
     )
     async def get_fetch_tileables(self, session_id: str, task_id: str):
         oscar_api = await self._get_oscar_task_api(session_id)
         res = await oscar_api.get_fetch_tileables(task_id)
         self.write(serialize_serializable(res))
 
-    @web_api("(?P<task_id>[^/]+)", method="get")
+    @web_api("(?P<task_id>[^/]+)", method="get", cache_blocking=True)
     async def get_task_result(self, session_id: str, task_id: str):
         oscar_api = await self._get_oscar_task_api(session_id)
         res = await oscar_api.get_task_result(task_id)
@@ -118,19 +117,24 @@ class TaskWebAPIHandler(MarsServiceWebAPIHandler):
         "(?P<task_id>[^/]+)/tileable_graph",
         method="get",
         arg_filter={"action": "get_tileable_graph_as_json"},
+        cache_blocking=True,
     )
     async def get_tileable_graph_as_json(self, session_id: str, task_id: str):
         oscar_api = await self._get_oscar_task_api(session_id)
         res = await oscar_api.get_tileable_graph_as_json(task_id)
         self.write(json.dumps(res))
 
-    @web_api("(?P<task_id>[^/]+)/tileable_detail", method="get")
+    @web_api("(?P<task_id>[^/]+)/tileable_detail", method="get", cache_blocking=True)
     async def get_tileable_details(self, session_id: str, task_id: str):
         oscar_api = await self._get_oscar_task_api(session_id)
         res = await oscar_api.get_tileable_details(task_id)
         self.write(json.dumps(res))
 
-    @web_api("(?P<task_id>[^/]+)/(?P<tileable_id>[^/]+)/subtask", method="get")
+    @web_api(
+        "(?P<task_id>[^/]+)/(?P<tileable_id>[^/]+)/subtask",
+        method="get",
+        cache_blocking=True,
+    )
     async def get_tileable_subtasks(
         self, session_id: str, task_id: str, tileable_id: str
     ):
@@ -141,7 +145,12 @@ class TaskWebAPIHandler(MarsServiceWebAPIHandler):
         )
         self.write(json.dumps(res))
 
-    @web_api("(?P<task_id>[^/]+)", method="get", arg_filter={"action": "progress"})
+    @web_api(
+        "(?P<task_id>[^/]+)",
+        method="get",
+        arg_filter={"action": "progress"},
+        cache_blocking=True,
+    )
     async def get_task_progress(self, session_id: str, task_id: str):
         oscar_api = await self._get_oscar_task_api(session_id)
         res = await oscar_api.get_task_progress(task_id)
@@ -159,8 +168,18 @@ class TaskWebAPIHandler(MarsServiceWebAPIHandler):
         timeout = self.get_argument("timeout", None) or None
         timeout = float(timeout) if timeout is not None else None
         oscar_api = await self._get_oscar_task_api(session_id)
-        res = await oscar_api.wait_task(task_id, timeout)
-        self.write(json.dumps(_json_serial_task_result(res)))
+        if timeout:
+            try:
+                res = await asyncio.wait_for(
+                    asyncio.shield(oscar_api.wait_task(task_id, timeout)),
+                    timeout=timeout,
+                )
+                self.write(json.dumps(_json_serial_task_result(res)))
+            except asyncio.TimeoutError:
+                self.write(json.dumps({}))
+        else:
+            res = await oscar_api.wait_task(task_id, timeout)
+            self.write(json.dumps(_json_serial_task_result(res)))
 
     @web_api("(?P<task_id>[^/]+)", method="delete")
     async def cancel_task(self, session_id: str, task_id: str):
@@ -172,9 +191,12 @@ web_handlers = {TaskWebAPIHandler.get_root_pattern(): TaskWebAPIHandler}
 
 
 class WebTaskAPI(AbstractTaskAPI, MarsWebAPIClientMixin):
-    def __init__(self, session_id: str, address: str):
+    def __init__(
+        self, session_id: str, address: str, request_rewriter: Callable = None
+    ):
         self._session_id = session_id
         self._address = address.rstrip("/")
+        self.request_rewriter = request_rewriter
 
     async def get_task_results(self, progress: bool = False) -> List[TaskResult]:
         path = f"{self._address}/api/session/{self._session_id}/task"
@@ -188,7 +210,6 @@ class WebTaskAPI(AbstractTaskAPI, MarsWebAPIClientMixin):
     async def submit_tileable_graph(
         self,
         graph: TileableGraph,
-        task_name: str = None,
         fuse_enabled: bool = True,
         extra_config: dict = None,
     ) -> str:
@@ -198,7 +219,6 @@ class WebTaskAPI(AbstractTaskAPI, MarsWebAPIClientMixin):
         )
         body = serialize_serializable(
             {
-                "task_name": task_name if task_name else "",
                 "fuse": fuse_enabled,
                 "graph": graph,
                 "extra_config": extra_config_ser,
@@ -210,7 +230,7 @@ class WebTaskAPI(AbstractTaskAPI, MarsWebAPIClientMixin):
             headers={"Content-Type": "application/octet-stream"},
             data=body,
         )
-        return res.body.decode()
+        return res.body.decode().strip()
 
     async def get_fetch_tileables(self, task_id: str) -> List[Tileable]:
         path = (
@@ -240,9 +260,11 @@ class WebTaskAPI(AbstractTaskAPI, MarsWebAPIClientMixin):
 
     async def wait_task(self, task_id: str, timeout: float = None):
         path = f"{self._address}/api/session/{self._session_id}/task/{task_id}"
-        params = {"action": "wait", "timeout": str(timeout or "")}
+        # increase client timeout to handle network overhead during entire request
+        client_timeout = timeout + 3 if timeout else 0
+        params = {"action": "wait", "timeout": "" if timeout is None else str(timeout)}
         res = await self._request_url(
-            "GET", path, params=params, request_timeout=timeout or 0
+            "GET", path, params=params, request_timeout=client_timeout
         )
         return _json_deserial_task_result(json.loads(res.body.decode()))
 
@@ -264,7 +286,6 @@ class WebTaskAPI(AbstractTaskAPI, MarsWebAPIClientMixin):
     async def get_tileable_subtasks(
         self, task_id: str, tileable_id: str, with_input_output: bool
     ):
-
         with_input_output = "true" if with_input_output else "false"
         path = f"{self._address}/api/session/{self._session_id}/task/{task_id}/{tileable_id}/subtask"
         params = {

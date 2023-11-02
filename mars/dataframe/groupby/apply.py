@@ -17,57 +17,83 @@ import pandas as pd
 
 from ... import opcodes
 from ...core import OutputType
+from ...core.context import get_context
 from ...core.custom_log import redirect_custom_log
-from ...serialization.serializables import TupleField, DictField, FunctionField
-from ...utils import enter_current_session, quiet_stdio
+from ...serialization.serializables import (
+    AnyField,
+    BoolField,
+    TupleField,
+    DictField,
+    FunctionField,
+    StringField,
+)
+from ...core.operand import OperatorLogicKeyGeneratorMixin
+from ...utils import enter_current_session, quiet_stdio, get_func_token, tokenize
 from ..operands import DataFrameOperandMixin, DataFrameOperand
 from ..utils import (
+    auto_merge_chunks,
     build_empty_df,
     build_empty_series,
     parse_index,
     validate_output_types,
     make_dtypes,
     make_dtype,
+    clean_up_func,
+    restore_func,
 )
 
 
-class GroupByApply(DataFrameOperand, DataFrameOperandMixin):
+class GroupByApplyLogicKeyGeneratorMixin(OperatorLogicKeyGeneratorMixin):
+    def _get_logic_key_token_values(self):
+        token_values = super()._get_logic_key_token_values()
+        if self.func:
+            return token_values + [get_func_token(self.func)]
+        else:  # pragma: no cover
+            return token_values
+
+
+class GroupByApply(
+    DataFrameOperand, DataFrameOperandMixin, GroupByApplyLogicKeyGeneratorMixin
+):
     _op_type_ = opcodes.APPLY
     _op_module_ = "dataframe.groupby"
 
-    _func = FunctionField("func")
-    _args = TupleField("args")
-    _kwds = DictField("kwds")
+    func = FunctionField("func")
+    args = TupleField("args", default_factory=tuple)
+    kwds = DictField("kwds", default_factory=dict)
+    maybe_agg = BoolField("maybe_agg", default=None)
+    logic_key = StringField("logic_key", default=None)
+    func_key = AnyField("func_key", default=None)
+    need_clean_up_func = BoolField("need_clean_up_func", default=False)
 
-    def __init__(self, func=None, args=None, kwds=None, output_types=None, **kw):
-        super().__init__(
-            _func=func, _args=args, _kwds=kwds, _output_types=output_types, **kw
-        )
+    def __init__(self, output_types=None, **kw):
+        super().__init__(_output_types=output_types, **kw)
 
-    @property
-    def func(self):
-        return self._func
-
-    @property
-    def args(self):
-        return getattr(self, "_args", None) or ()
-
-    @property
-    def kwds(self):
-        return getattr(self, "_kwds", None) or dict()
+    def _update_key(self):
+        values = [v for v in self._values_ if v is not self.func] + [
+            get_func_token(self.func)
+        ]
+        self._obj_set("_key", tokenize(type(self).__name__, *values))
+        return self
 
     @classmethod
     @redirect_custom_log
     @enter_current_session
     def execute(cls, ctx, op):
+        restore_func(ctx, op)
         in_data = ctx[op.inputs[0].key]
         out = op.outputs[0]
         if not in_data:
             if op.output_types[0] == OutputType.dataframe:
                 ctx[op.outputs[0].key] = build_empty_df(op.outputs[0].dtypes)
-            else:
+            elif op.output_types[0] == OutputType.series:
                 ctx[op.outputs[0].key] = build_empty_series(
                     op.outputs[0].dtype, name=out.name
+                )
+            else:
+                raise ValueError(
+                    "Chunk can not be empty except for dataframe/series, "
+                    "please specify output types"
                 )
             return
 
@@ -90,12 +116,11 @@ class GroupByApply(DataFrameOperand, DataFrameOperandMixin):
                 )
             else:
                 applied.columns.name = None
-        else:
-            applied.name = out.name
         ctx[out.key] = applied
 
     @classmethod
     def tile(cls, op):
+        clean_up_func(op)
         in_groupby = op.inputs[0]
         out_df = op.outputs[0]
 
@@ -105,7 +130,11 @@ class GroupByApply(DataFrameOperand, DataFrameOperandMixin):
 
             new_op = op.copy().reset_key()
             new_op.tileable_op_key = op.key
-            if op.output_types[0] == OutputType.dataframe:
+            if op.output_types[0] == OutputType.df_or_series:
+                chunks.append(
+                    new_op.new_chunk(inp_chunks, index=c.index, collapse_axis=1)
+                )
+            elif op.output_types[0] == OutputType.dataframe:
                 chunks.append(
                     new_op.new_chunk(
                         inp_chunks,
@@ -135,17 +164,35 @@ class GroupByApply(DataFrameOperand, DataFrameOperandMixin):
             kw["nsplits"] = ((np.nan,) * len(chunks), (out_df.shape[1],))
         else:
             kw["nsplits"] = ((np.nan,) * len(chunks),)
-        return new_op.new_tileables([in_groupby], **kw)
+        ret = new_op.new_tileable([in_groupby], **kw)
+        if not op.maybe_agg:
+            return [ret]
+        else:
+            # auto merge small chunks if df.groupby().apply(func)
+            # may be an aggregation operation
+            yield ret.chunks  # trigger execution for chunks
+            return [auto_merge_chunks(get_context(), ret)]
 
     def _infer_df_func_returns(
-        self, in_groupby, in_df, dtypes, dtype=None, name=None, index=None
+        self, in_groupby, in_df, dtypes=None, dtype=None, name=None, index=None
     ):
         index_value, output_type, new_dtypes = None, None, None
+
+        if self.output_types is not None and (dtypes is not None or dtype is not None):
+            ret_dtypes = dtypes if dtypes is not None else (dtype, name)
+            ret_index_value = parse_index(index) if index is not None else None
+            return ret_dtypes, ret_index_value
 
         try:
             infer_df = in_groupby.op.build_mock_groupby().apply(
                 self.func, *self.args, **self.kwds
             )
+
+            if len(infer_df) <= 2:
+                # we create mock df with 4 rows, 2 groups
+                # if return df has 2 rows, we assume that
+                # it's an aggregation operation
+                self.maybe_agg = True
 
             # todo return proper index when sort=True is implemented
             index_value = parse_index(infer_df.index[:0], in_df.key, self.func)
@@ -176,6 +223,8 @@ class GroupByApply(DataFrameOperand, DataFrameOperandMixin):
 
     def __call__(self, groupby, dtypes=None, dtype=None, name=None, index=None):
         in_df = groupby
+        if self.output_types and self.output_types[0] == OutputType.df_or_series:
+            return self.new_df_or_series([groupby])
         while in_df.op.output_types[0] not in (OutputType.dataframe, OutputType.series):
             in_df = in_df.inputs[0]
 
@@ -223,6 +272,7 @@ def groupby_apply(
     dtype=None,
     name=None,
     index=None,
+    skip_infer=None,
     **kwargs,
 ):
     """
@@ -262,6 +312,9 @@ def groupby_apply(
     index : Index, default None
         Specify index of returned object. See `Notes` for more details.
 
+    skip_infer: bool, default False
+        Whether infer dtypes when dtypes or output_type is not specified.
+
     args, kwargs : tuple and dict
         Optional positional and keyword arguments to pass to `func`.
 
@@ -296,6 +349,8 @@ def groupby_apply(
     output_types = validate_output_types(
         output_types=output_types, output_type=output_type, object_type=object_type
     )
+    if output_types is None and skip_infer:
+        output_types = [OutputType.df_or_series]
 
     dtypes = make_dtypes(dtypes)
     dtype = make_dtype(dtype)

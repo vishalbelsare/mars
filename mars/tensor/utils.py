@@ -35,7 +35,7 @@ from ..core import ExecutableTuple, recursive_tile
 from ..utils import lazy_import
 from ..lib.mmh3 import hash_from_buffer
 
-cp = lazy_import("cupy", globals=globals(), rename="cp")
+cp = lazy_import("cupy", rename="cp")
 
 
 def normalize_shape(shape):
@@ -229,7 +229,7 @@ def inject_dtype(dtype):
     return inner
 
 
-def infer_dtype(np_func, empty=True, reverse=False, check=True):
+def infer_dtype(np_func, multi_outputs=False, empty=True, reverse=False, check=True):
     def make_arg(arg):
         if empty:
             return np.empty((1,) * max(1, arg.ndim), dtype=arg.dtype)
@@ -267,7 +267,10 @@ def infer_dtype(np_func, empty=True, reverse=False, check=True):
                 # that implements __tensor_ufunc__
                 try:
                     with np.errstate(all="ignore"):
-                        dtype = np_func(*args, **np_kw).dtype
+                        if multi_outputs:
+                            dtype = np_func(*args, **np_kw)[0].dtype
+                        else:
+                            dtype = np_func(*args, **np_kw).dtype
                 except:  # noqa: E722
                     dtype = None
 
@@ -330,7 +333,7 @@ def replace_ellipsis(index, ndim):
     )
 
 
-def calc_sliced_size(size, sliceobj):
+def calc_sliced_size(size: int, sliceobj: slice) -> int:
     if np.isnan(size):
         return np.nan
 
@@ -669,9 +672,7 @@ def check_random_state(seed):
         return mtrand.RandomState.from_numpy(seed)
     if isinstance(seed, mtrand.RandomState):
         return seed
-    raise ValueError(
-        f"{seed} cannot be used to seed a mt.random.RandomState" " instance"
-    )
+    raise ValueError(f"{seed} cannot be used to seed a mt.random.RandomState instance")
 
 
 def filter_inputs(inputs):
@@ -773,7 +774,7 @@ def fetch_corner_data(tensor, session=None):
     # the tensor must have been executed,
     # thus the size could not be NaN
     if tensor.size > threshold:
-        # two edges for each exis
+        # two edges for each axis
         indices_iter = list(itertools.product(*(range(2) for _ in range(tensor.ndim))))
         corners = np.empty(shape=(2,) * tensor.ndim, dtype=object)
         shape = [0 for _ in range(tensor.ndim)]

@@ -158,8 +158,8 @@ class TensorPartition(TensorOperand, ParallelPartitionMixin):
             _need_align=need_align,
             _return_value=return_value,
             _return_indices=return_indices,
-            _dtype=dtype,
-            _gpu=gpu,
+            dtype=dtype,
+            gpu=gpu,
             **kw,
         )
 
@@ -458,7 +458,7 @@ class CalcPartitionsInfo(TensorOperand, TensorPSRSOperandMixin):
     _size = Int32Field("size")
 
     def __init__(self, kth=None, size=None, dtype=None, gpu=None, **kw):
-        super().__init__(_kth=kth, _size=size, _dtype=dtype, _gpu=gpu, **kw)
+        super().__init__(_kth=kth, _size=size, dtype=dtype, gpu=gpu, **kw)
 
     @property
     def kth(self):
@@ -672,7 +672,7 @@ def _validate_partition_arguments(a, kth, axis, kind, order, kw):
     need_align = kw.pop("need_align", None)
     if len(kw) > 0:
         raise TypeError(
-            "partition() got an unexpected keyword " f"argument '{next(iter(kw))}'"
+            f"partition() got an unexpected keyword argument '{next(iter(kw))}'"
         )
 
     return a, kth, axis, kind, order, need_align

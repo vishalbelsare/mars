@@ -21,6 +21,7 @@ import pytest
 
 from ..... import tensor as mt
 from ..... import dataframe as md
+from .....deploy.oscar.local import new_cluster
 
 try:
     import lightgbm
@@ -45,11 +46,25 @@ x_sparse[np.arange(n_rows), np.random.randint(n_columns, size=n_rows)] = np.nan
 X_sparse = mt.tensor(x_sparse, chunk_size=chunk_size).tosparse(missing=np.nan)[filter]
 
 
+@pytest.mark.parametrize(indirect=True)
+@pytest.fixture
+async def create_cluster():
+    start_method = os.environ.get("POOL_START_METHOD", None)
+    client = await new_cluster(
+        subprocess_start_method=start_method,
+        n_worker=2,
+        n_cpu=4,
+        use_uvloop=False,
+    )
+    async with client:
+        yield client
+
+
 @pytest.mark.skipif(lightgbm is None, reason="LightGBM not installed")
-def test_local_classifier(setup):
+def test_local_classifier(create_cluster):
     y_data = (y * 10).astype(mt.int32)
     classifier = LGBMClassifier(n_estimators=2)
-    classifier.fit(X, y_data, eval_set=[(X, y_data)], verbose=True)
+    classifier.fit(X, y_data, eval_set=[(X, y_data)])
     prediction = classifier.predict(X)
 
     assert prediction.ndim == 1
@@ -60,9 +75,7 @@ def test_local_classifier(setup):
     # test sparse tensor
     X_sparse_data = X_sparse
     classifier = LGBMClassifier(n_estimators=2)
-    classifier.fit(
-        X_sparse_data, y_data, eval_set=[(X_sparse_data, y_data)], verbose=True
-    )
+    classifier.fit(X_sparse_data, y_data, eval_set=[(X_sparse_data, y_data)])
     prediction = classifier.predict(X_sparse_data)
 
     assert prediction.ndim == 1
@@ -79,7 +92,7 @@ def test_local_classifier(setup):
     # test dataframe
     X_df_data = X_df
     classifier = LGBMClassifier(n_estimators=2)
-    classifier.fit(X_df_data, y_data, verbose=True)
+    classifier.fit(X_df_data, y_data)
     prediction = classifier.predict(X_df_data)
 
     assert prediction.ndim == 1
@@ -95,7 +108,7 @@ def test_local_classifier(setup):
     y_df = md.DataFrame(y_data)
     for weight in weights:
         classifier = LGBMClassifier(n_estimators=2)
-        classifier.fit(X, y_df, sample_weight=weight, verbose=True)
+        classifier.fit(X, y_df, sample_weight=weight)
         prediction = classifier.predict(X)
 
         assert prediction.ndim == 1
@@ -103,14 +116,12 @@ def test_local_classifier(setup):
 
     # should raise error if weight.ndim > 1
     with pytest.raises(ValueError):
-        LGBMClassifier(n_estimators=2).fit(
-            X, y_df, sample_weight=mt.random.rand(1, 1), verbose=True
-        )
+        LGBMClassifier(n_estimators=2).fit(X, y_df, sample_weight=mt.random.rand(1, 1))
 
     # test binary classifier
     new_y = (y_data > 0.5).astype(mt.int32)
     classifier = LGBMClassifier(n_estimators=2)
-    classifier.fit(X, new_y, verbose=True)
+    classifier.fit(X, new_y)
 
     prediction = classifier.predict(X)
     assert prediction.ndim == 1
@@ -124,7 +135,7 @@ def test_local_classifier(setup):
     X_np = X.execute().fetch()
     new_y_np = new_y.execute().fetch()
     raw_classifier = lightgbm.LGBMClassifier(n_estimators=2)
-    raw_classifier.fit(X_np, new_y_np, verbose=True)
+    raw_classifier.fit(X_np, new_y_np)
 
     classifier = LGBMClassifier(raw_classifier)
     label_result = classifier.predict(X_df)
@@ -147,7 +158,7 @@ def test_local_classifier_from_to_parquet(setup):
 
     # test with existing model
     classifier = lightgbm.LGBMClassifier(n_estimators=2)
-    classifier.fit(X, y, verbose=True)
+    classifier.fit(X, y)
 
     with tempfile.TemporaryDirectory() as d:
         result_dir = os.path.join(d, "result")
@@ -170,3 +181,64 @@ def test_local_classifier_from_to_parquet(setup):
         expected = classifier.predict(X)
         expected = np.stack([1 - expected, expected]).argmax(axis=0)
         np.testing.assert_array_equal(ret, expected)
+
+
+@pytest.mark.skipif(lightgbm is None, reason="LightGBM not installed")
+def test_classifier_on_multiple_machines(setup):
+    from .._train import LGBMTrain
+
+    class MockLGMBTrain(LGBMTrain):
+        @classmethod
+        def execute(cls, ctx, op: "LGBMTrain"):
+            super().execute(ctx, op)
+            # Note: There may be a list result when running on multiple
+            # machines, here just make an array of length 1 to simulate
+            # this scenario.
+            ctx[op.outputs[0].key] = [ctx[op.outputs[0].key]]
+
+    from ..core import LGBMModelType
+    from .._train import train
+    from ....utils import check_consistent_length
+
+    class MockLGBMClassifier(LGBMClassifier, lightgbm.LGBMClassifier):
+        def fit(
+            self,
+            X,
+            y,
+            sample_weight=None,
+            init_score=None,
+            eval_set=None,
+            eval_sample_weight=None,
+            eval_init_score=None,
+            session=None,
+            run_kwargs=None,
+            **kwargs,
+        ):
+            check_consistent_length(X, y, session=session, run_kwargs=run_kwargs)
+            params = self.get_params(True)
+            model = train(
+                params,
+                self._wrap_train_tuple(X, y, sample_weight, init_score),
+                eval_sets=self._wrap_eval_tuples(
+                    eval_set, eval_sample_weight, eval_init_score
+                ),
+                model_type=LGBMModelType.CLASSIFIER,
+                session=session,
+                run_kwargs=run_kwargs,
+                train_cls=MockLGMBTrain,
+                **kwargs,
+            )
+
+            self.set_params(**model.get_params())
+            self._copy_extra_params(model, self)
+            return self
+
+    y_data = (y * 10).astype(mt.int32)
+    classifier = MockLGBMClassifier(n_estimators=2)
+    classifier.fit(X, y_data, eval_set=[(X, y_data)])
+    prediction = classifier.predict(X)
+
+    assert prediction.ndim == 1
+    assert prediction.shape[0] == len(X)
+
+    assert isinstance(prediction, mt.Tensor)

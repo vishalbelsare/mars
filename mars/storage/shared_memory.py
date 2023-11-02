@@ -36,7 +36,6 @@ try:
             if os.name != "nt" and fd >= 0:
                 os.close(fd)
 
-
 except ImportError:  # pragma: no cover
     # allow shared_memory package to be absent
     SharedMemory = SharedMemoryForRead = None
@@ -127,7 +126,7 @@ class SharedMemoryStorage(StorageBackend):
     @staticmethod
     @implements(StorageBackend.teardown)
     async def teardown(**kwargs):
-        object_ids = kwargs.get("object_ids")
+        object_ids = kwargs.get("object_ids") or ()
         for object_id in object_ids:
             try:
                 shm = SharedMemory(name=object_id)
@@ -148,7 +147,7 @@ class SharedMemoryStorage(StorageBackend):
     @implements(StorageBackend.get)
     async def get(self, object_id, **kwargs) -> object:
         if kwargs:  # pragma: no cover
-            raise NotImplementedError('Got unsupported args: {",".join(kwargs)}')
+            raise NotImplementedError(f'Got unsupported args: {",".join(kwargs)}')
 
         shm_file = SharedMemoryFileObject(object_id, mode="r")
 
@@ -186,6 +185,9 @@ class SharedMemoryStorage(StorageBackend):
         except FileNotFoundError:
             if sys.platform == "win32":
                 # skip file not found error for windows
+                pass
+            elif sys.version_info[:2] < (3, 8):  # pragma: no cover
+                # skip file not found error in python 3.7.x or below
                 pass
             else:  # pragma: no cover
                 raise

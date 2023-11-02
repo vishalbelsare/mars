@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import fnmatch
 import functools
 import inspect
+import itertools
 import logging
 import os
 import sys
+import time
 import types
 from typing import Dict
 
@@ -39,9 +42,9 @@ from ..core.operand import OperandStage
 from ..utils import lazy_import
 
 
-cupy = lazy_import("cupy", globals=globals())
-cudf = lazy_import("cudf", globals=globals())
-ray = lazy_import("ray", globals=globals())
+cupy = lazy_import("cupy")
+cudf = lazy_import("cudf")
+ray = lazy_import("ray")
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +278,11 @@ class ObjectCheckMixin:
 
     @staticmethod
     def assert_dtype_consistent(expected_dtype, real_dtype):
+        cate_dtypes = [pd.CategoricalDtype]
+        if cudf:
+            cate_dtypes.append(cudf.CategoricalDtype)
+        cate_dtypes = tuple(cate_dtypes)
+
         if isinstance(real_dtype, pd.DatetimeTZDtype):
             real_dtype = real_dtype.base
         if expected_dtype != real_dtype:
@@ -283,8 +291,8 @@ class ObjectCheckMixin:
                 return
             if expected_dtype is None:
                 raise AssertionError("Expected dtype cannot be None")
-            if isinstance(real_dtype, pd.CategoricalDtype) and isinstance(
-                expected_dtype, pd.CategoricalDtype
+            if isinstance(real_dtype, cate_dtypes) and isinstance(
+                expected_dtype, cate_dtypes
             ):
                 return
             if not np.can_cast(real_dtype, expected_dtype) and not np.can_cast(
@@ -314,7 +322,15 @@ class ObjectCheckMixin:
         if not hasattr(expected, "dtype"):
             return
         if self._check_options["check_dtypes"]:
-            self.assert_dtype_consistent(expected.dtype, real.dtype)
+            try:
+                self.assert_dtype_consistent(expected.dtype, real.dtype)
+            except AssertionError as ex:
+                if hasattr(expected, "op"):
+                    raise AssertionError(
+                        f"dtype assertion error: {ex}, source operand {expected.op}"
+                    )
+                else:
+                    raise
         if self._check_options["check_shape"]:
             self.assert_shape_consistent(expected.shape, real.shape)
 
@@ -488,3 +504,77 @@ class ObjectCheckMixin:
             self.assert_index_consistent(expected, real)
         elif isinstance(expected, (CATEGORICAL_TYPE, CATEGORICAL_CHUNK_TYPE)):
             self.assert_categorical_consistent(expected, real)
+
+
+DICT_NOT_EMPTY = type("DICT_NOT_EMPTY", (object,), {})  # is check works for deepcopy
+
+
+def check_dict_structure_same(a, b, prefix=None):
+    def _p(k):
+        if prefix is None:
+            return k
+        return ".".join(str(i) for i in prefix + [k])
+
+    for ai, bi in itertools.zip_longest(
+        a.items(), b.items(), fillvalue=("_KEY_NOT_EXISTS_", None)
+    ):
+        if ai[0] != bi[0]:
+            if "*" in ai[0]:
+                pattern, target = ai[0], bi[0]
+            elif "*" in bi[0]:
+                pattern, target = bi[0], ai[0]
+            else:
+                raise KeyError(f"Key {_p(ai[0])} != {_p(bi[0])}")
+            if not fnmatch.fnmatch(target, pattern):
+                raise KeyError(f"Key {_p(target)} not match {_p(pattern)}")
+
+        if ai[1] is DICT_NOT_EMPTY:
+            target = bi[1]
+        elif bi[1] is DICT_NOT_EMPTY:
+            target = ai[1]
+        else:
+            target = None
+        if target is not None:
+            if not isinstance(target, dict):
+                raise TypeError(f"Value type of {_p(ai[0])} is not a dict.")
+            if not target:
+                raise TypeError(f"Value of {_p(ai[0])} empty.")
+            continue
+
+        if type(ai[1]) is not type(bi[1]):
+            raise TypeError(f"Value type of {_p(ai[0])} mismatch {ai[1]} != {bi[1]}")
+        if isinstance(ai[1], dict):
+            check_dict_structure_same(
+                ai[1], bi[1], [ai[0]] if prefix is None else prefix + [ai[0]]
+            )
+
+
+async def wait_for_condition(
+    condition_predictor, timeout=10, retry_interval_ms=100, **kwargs
+):  # pragma: no cover
+    """Wait until a condition is met or time out with an exception.
+
+    Args:
+        condition_predictor: A function that predicts the condition.
+        timeout: Maximum timeout in seconds.
+        retry_interval_ms: Retry interval in milliseconds.
+
+    Raises:
+        RuntimeError: If the condition is not met before the timeout expires.
+    """
+    start = time.time()
+    last_ex = None
+    while time.time() - start <= timeout:
+        try:
+            pred = condition_predictor(**kwargs)
+            if inspect.isawaitable(pred):
+                pred = await pred
+            if pred:
+                return
+        except Exception as ex:
+            last_ex = ex
+        time.sleep(retry_interval_ms / 1000.0)
+    message = "The condition wasn't met before the timeout expired."
+    if last_ex is not None:
+        message += f" Last exception: {last_ex}"
+    raise RuntimeError(message)

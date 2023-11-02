@@ -18,6 +18,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Union
 
 from ... import oscar as mo
+from ...serialization import AioDeserializer
 from ...storage import StorageLevel, get_storage_backend
 from ...storage.core import StorageFileObject
 from ...typing import BandType
@@ -33,24 +34,24 @@ from .core import (
 )
 from .errors import DataNotExist, NoDataToSpill
 
-cupy = lazy_import("cupy", globals=globals())
-cudf = lazy_import("cudf", globals=globals())
+cupy = lazy_import("cupy")
+cudf = lazy_import("cudf")
 
 logger = logging.getLogger(__name__)
 
 
-class StorageHandlerActor(mo.StatelessActor):
+class StorageHandlerActor(mo.Actor):
     """
     Storage handler actor, provide methods like `get`, `put`, etc.
-    This actor is stateless and created on worker's sub pools.
+    This actor is stateful and created on worker's sub pools.
     """
 
     def __init__(
         self,
         storage_init_params: Dict,
-        data_manager_ref: Union[DataManagerActor, mo.ActorRef],
+        data_manager_ref: mo.ActorRefType[DataManagerActor],
         spill_manager_refs,
-        quota_refs: Dict[StorageLevel, Union[StorageQuotaActor, mo.ActorRef]],
+        quota_refs: Dict[StorageLevel, mo.ActorRefType[StorageQuotaActor]],
         band_name: str = "numa-0",
     ):
         from .spill import SpillManagerActor
@@ -58,7 +59,7 @@ class StorageHandlerActor(mo.StatelessActor):
         self._storage_init_params = storage_init_params
         self._data_manager_ref = data_manager_ref
         self._spill_manager_refs: Dict[
-            StorageLevel, Union[SpillManagerActor, mo.ActorRef]
+            StorageLevel, mo.ActorRefType[SpillManagerActor]
         ] = spill_manager_refs
         self._quota_refs = quota_refs
         self._band_name = band_name
@@ -82,8 +83,24 @@ class StorageHandlerActor(mo.StatelessActor):
                 if client.level & level:
                     clients[level] = client
 
-    async def _get_data(self, data_info, conditions):
-        if conditions is None:
+    def is_seekable(self, level: StorageLevel):
+        if level is None:
+            level = self.highest_level
+        return self._clients[level].is_seekable
+
+    async def _get_data(self, data_info: DataInfo, conditions: List[Any]):
+        if data_info.offset is not None:
+            reader = await self._clients[data_info.level].open_reader(
+                data_info.object_id
+            )
+            await reader.seek(data_info.offset)
+            res = await AioDeserializer(reader).run()
+            if conditions is not None:
+                try:
+                    res = res.iloc[tuple(conditions)]
+                except AttributeError:  # pragma: no cover
+                    res = res[tuple(conditions)]
+        elif conditions is None:
             res = yield self._clients[data_info.level].get(data_info.object_id)
         else:
             try:
@@ -91,9 +108,7 @@ class StorageHandlerActor(mo.StatelessActor):
                     data_info.object_id, conditions=conditions
                 )
             except NotImplementedError:
-                data = yield await self._clients[data_info.level].get(
-                    data_info.object_id
-                )
+                data = yield self._clients[data_info.level].get(data_info.object_id)
                 try:
                     sliced_value = data.iloc[tuple(conditions)]
                 except AttributeError:
@@ -141,9 +156,24 @@ class StorageHandlerActor(mo.StatelessActor):
             conditions_list.append(conditions)
         data_infos = await self._data_manager_ref.get_data_info.batch(*infos)
         results = []
+        writer_args = [
+            (info.object_id, info.level)
+            for info in data_infos
+            if info is not None and info.offset is not None
+        ]
+        object_id_to_reader = dict()
+        for object_id, level in writer_args:
+            object_id_to_reader[object_id] = await self._clients[level].open_reader(
+                object_id
+            )
         for data_info, conditions in zip(data_infos, conditions_list):
             if data_info is None:
                 results.append(None)
+            elif data_info.offset is not None:
+                reader = object_id_to_reader[data_info.object_id]
+                await reader.seek(data_info.offset)
+                result = await AioDeserializer(reader).run()
+                results.append(result)
             else:
                 result = yield self._get_data(data_info, conditions)
                 results.append(result)
@@ -228,12 +258,6 @@ class StorageHandlerActor(mo.StatelessActor):
         await self.notify_spillable_space(level)
         return data_infos
 
-    def _get_data_infos_arg(self, session_id: str, data_key: str, error: str = "raise"):
-        infos = self._data_manager_ref.get_data_infos.delay(
-            session_id, data_key, self._band_name, error
-        )
-        return infos, session_id, data_key
-
     async def delete_object(
         self,
         session_id: str,
@@ -242,6 +266,7 @@ class StorageHandlerActor(mo.StatelessActor):
         object_id: Any,
         level: StorageLevel,
     ):
+        data_key = await self._data_manager_ref.get_store_key(session_id, data_key)
         await self._data_manager_ref.delete_data_info(
             session_id, data_key, level, self._band_name
         )
@@ -253,47 +278,80 @@ class StorageHandlerActor(mo.StatelessActor):
         if error not in ("raise", "ignore"):  # pragma: no cover
             raise ValueError("error must be raise or ignore")
 
-        infos = await self._data_manager_ref.get_data_infos(
-            session_id, data_key, self._band_name, error
-        )
-        if not infos:
-            return
-
-        for info in infos:
-            level = info.level
-            await self._data_manager_ref.delete_data_info(
-                session_id, data_key, level, self._band_name
+        data_key = await self._data_manager_ref.get_store_key(session_id, data_key)
+        if isinstance(data_key, list):
+            # delete mapper main key
+            data_keys = data_key
+        else:
+            data_keys = [data_key]
+        for data_key in data_keys:
+            all_infos = await self._data_manager_ref.get_data_infos(
+                session_id, data_key, self._band_name, error
             )
-            await self._clients[level].delete(info.object_id)
-            await self._quota_refs[level].release_quota(info.store_size)
+            if not all_infos:
+                return
+
+            key_to_infos = (
+                all_infos if isinstance(all_infos, dict) else {data_key: all_infos}
+            )
+
+            for key, infos in key_to_infos.items():
+                for info in infos:
+                    level = info.level
+                    await self._data_manager_ref.delete_data_info(
+                        session_id, key, level, self._band_name
+                    )
+                    await self._clients[level].delete(info.object_id)
+                    await self._quota_refs[level].release_quota(info.store_size)
 
     @delete.batch
     async def batch_delete(self, args_list, kwargs_list):
-        get_infos = []
         session_id = None
+        error = None
         data_keys = []
         for args, kwargs in zip(args_list, kwargs_list):
-            infos, session_id, data_key = self._get_data_infos_arg(*args, **kwargs)
-            get_infos.append(infos)
-            data_keys.append(data_key)
-        infos_list = await self._data_manager_ref.get_data_infos.batch(*get_infos)
+            session_id, data_key, error = self.delete.bind(*args, **kwargs)
+            data_keys.append(
+                self._data_manager_ref.get_store_key.delay(session_id, data_key)
+            )
+        store_keys = await self._data_manager_ref.get_store_key.batch(*data_keys)
+        data_keys = set()
+        for k in store_keys:
+            if isinstance(k, list):
+                data_keys.update(set(k))
+            else:
+                data_keys.add(k)
+
+        infos_list = await self._data_manager_ref.get_data_infos.batch(
+            *[
+                self._data_manager_ref.get_data_infos.delay(
+                    session_id, data_key, self._band_name, error
+                )
+                for data_key in data_keys
+            ]
+        )
 
         delete_infos = []
         to_removes = []
         level_sizes = defaultdict(lambda: 0)
-        for infos, data_key in zip(infos_list, data_keys):
-            if not infos:
+        for all_infos, data_key in zip(infos_list, data_keys):
+            if not all_infos:
                 # data not exist and error == 'ignore'
                 continue
-            for info in infos:
-                level = info.level
-                delete_infos.append(
-                    self._data_manager_ref.delete_data_info.delay(
-                        session_id, data_key, level, info.band
+            key_to_infos = (
+                all_infos if isinstance(all_infos, dict) else {data_key: all_infos}
+            )
+
+            for key, infos in key_to_infos.items():
+                for info in infos:
+                    level = info.level
+                    delete_infos.append(
+                        self._data_manager_ref.delete_data_info.delay(
+                            session_id, key, level, info.band
+                        )
                     )
-                )
-                to_removes.append((level, info.object_id))
-                level_sizes[level] += info.store_size
+                    to_removes.append((level, info.object_id))
+                    level_sizes[level] += info.store_size
 
         if not delete_infos:
             # no data to remove
@@ -340,6 +398,8 @@ class StorageHandlerActor(mo.StatelessActor):
         level: StorageLevel,
         request_quota=True,
     ) -> WrappedStorageFileObject:
+        if level is None:
+            level = self.highest_level
         if request_quota:
             await self.request_quota_with_spill(level, size)
         writer = await self._clients[level].open_writer(size)
@@ -367,6 +427,8 @@ class StorageHandlerActor(mo.StatelessActor):
             data_keys.append(data_key)
             sizes.append(size)
         session_id, level, request_quota = extracted_args
+        if level is None:  # pragma: no cover
+            level = self.highest_level
         if request_quota:  # pragma: no cover
             await self.request_quota_with_spill(level, sum(sizes))
         writers = await asyncio.gather(
@@ -405,7 +467,7 @@ class StorageHandlerActor(mo.StatelessActor):
         remote_band: BandType,
         error: str,
     ):
-        remote_manager_ref: Union[mo.ActorRef, DataManagerActor] = await mo.actor_ref(
+        remote_manager_ref: mo.ActorRefType[DataManagerActor] = await mo.actor_ref(
             uid=DataManagerActor.default_uid(), address=remote_band[0]
         )
         get_data_infos = []
@@ -447,7 +509,7 @@ class StorageHandlerActor(mo.StatelessActor):
         from .transfer import SenderManagerActor
 
         logger.debug("Begin to fetch %s from band %s", data_keys, remote_band)
-        sender_ref: Union[mo.ActorRef, SenderManagerActor] = await mo.actor_ref(
+        sender_ref: mo.ActorRefType[SenderManagerActor] = await mo.actor_ref(
             address=remote_band[0], uid=SenderManagerActor.gen_uid(remote_band[1])
         )
         await sender_ref.send_batch_data(
@@ -501,10 +563,13 @@ class StorageHandlerActor(mo.StatelessActor):
                 missing_keys.append(data_key)
         if address is None or band_name is None:
             # some mapper keys are absent, specify error='ignore'
+            # remember that meta only records those main keys
             get_metas = [
                 (
                     meta_api.get_chunk_meta.delay(
-                        data_key, fields=["bands"], error="ignore"
+                        data_key[0] if isinstance(data_key, tuple) else data_key,
+                        fields=["bands"],
+                        error="ignore",
                     )
                 )
                 for data_key in missing_keys
@@ -515,6 +580,7 @@ class StorageHandlerActor(mo.StatelessActor):
             metas = await meta_api.get_chunk_meta.batch(*get_metas)
         else:  # pragma: no cover
             metas = [{"bands": [(address, band_name)]}] * len(missing_keys)
+        assert len(metas) == len(missing_keys)
         for data_key, bands in zip(missing_keys, metas):
             if bands is not None:
                 remote_keys[bands["bands"][0]].add(data_key)
@@ -537,14 +603,20 @@ class StorageHandlerActor(mo.StatelessActor):
 
         await asyncio.gather(*transfer_tasks)
 
-        append_bands_delays = []
+        set_meta_keys = set()
         for data_key in fetch_keys:
-            append_bands_delays.append(
-                meta_api.add_chunk_bands.delay(
-                    data_key, [(self.address, self._band_name)]
-                )
-            )
-        await meta_api.add_chunk_bands.batch(*append_bands_delays)
+            # skip shuffle keys
+            if isinstance(data_key, tuple):
+                set_meta_keys.add(data_key[0])
+            else:
+                set_meta_keys.add(data_key)
+        append_bands_delays = [
+            meta_api.add_chunk_bands.delay(key, [(self.address, self._band_name)])
+            for key in set_meta_keys
+        ]
+
+        if append_bands_delays:
+            await meta_api.add_chunk_bands.batch(*append_bands_delays)
 
     async def request_quota_with_spill(self, level: StorageLevel, size: int):
         if await self._quota_refs[level].request_quota(size):

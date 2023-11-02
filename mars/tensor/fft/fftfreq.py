@@ -86,7 +86,7 @@ class TensorFFTFreqChunk(TensorHasInput, TensorOperandMixin):
     _d = Float64Field("d")
 
     def __init__(self, n=None, d=None, dtype=None, **kw):
-        super().__init__(_n=n, _d=d, _dtype=dtype, **kw)
+        super().__init__(_n=n, _d=d, dtype=dtype, **kw)
 
     @property
     def n(self):
@@ -115,7 +115,7 @@ class TensorFFTFreqChunk(TensorHasInput, TensorOperandMixin):
         ctx[op.outputs[0].key] = x
 
 
-def fftfreq(n, d=1.0, gpu=False, chunk_size=None):
+def fftfreq(n, d=1.0, gpu=None, chunk_size=None):
     """
     Return the Discrete Fourier Transform sample frequencies.
 

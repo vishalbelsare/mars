@@ -13,14 +13,19 @@
 # limitations under the License.
 
 import asyncio
+import itertools
+import logging
 
 from collections import defaultdict
 from typing import Dict, List, Optional
 
 from .... import oscar as mo
+from ....lib.aio import alru_cache
 from ...meta.api import MetaAPI
 from ...storage.api import StorageAPI
 from ..errors import TileableNotTracked
+
+logger = logging.getLogger(__name__)
 
 
 class LifecycleTrackerActor(mo.Actor):
@@ -46,12 +51,17 @@ class LifecycleTrackerActor(mo.Actor):
         # remove all chunks
         await self._remove_chunks(chunk_keys)
 
+    @alru_cache
+    async def _get_task_api(self):
+        from ...task.api import TaskAPI
+
+        return await TaskAPI.create(self._session_id, self.address)
+
     @staticmethod
     def gen_uid(session_id):
         return f"{session_id}_lifecycle_tracker"
 
-    @mo.extensible
-    def track(self, tileable_key: str, chunk_keys: List[str]):
+    def _track(self, tileable_key: str, chunk_keys: List[str]):
         if tileable_key not in self._tileable_key_to_chunk_keys:
             self._tileable_key_to_chunk_keys[tileable_key] = []
         chunk_keys_set = set(self._tileable_key_to_chunk_keys[tileable_key])
@@ -64,33 +74,54 @@ class LifecycleTrackerActor(mo.Actor):
                 incref_chunk_keys.extend([chunk_key] * tileable_ref_count)
             self._tileable_key_to_chunk_keys[tileable_key].append(chunk_key)
         if incref_chunk_keys:
-            self.incref_chunks(incref_chunk_keys)
+            self._incref_chunks(incref_chunk_keys)
 
-    def incref_chunks(self, chunk_keys: List[str]):
-        for chunk_key in chunk_keys:
-            self._chunk_ref_counts[chunk_key] += 1
+    @mo.extensible
+    async def track(self, tileable_key: str, chunk_keys: List[str]):
+        return await asyncio.to_thread(self._track, tileable_key, chunk_keys)
 
-    def _get_remove_chunk_keys(self, chunk_keys: List[str]):
+    @classmethod
+    def _check_ref_counts(cls, keys: List[str], ref_counts: List[int]):
+        if ref_counts is not None and len(keys) != len(ref_counts):
+            raise ValueError(
+                f"`ref_counts` should have same size as `keys`, expect {len(keys)}, got {len(ref_counts)}"
+            )
+
+    def _incref_chunks(self, chunk_keys: List[str], counts: List[int] = None):
+        counts = counts if counts is not None else itertools.repeat(1)
+        for chunk_key, count in zip(chunk_keys, counts):
+            self._chunk_ref_counts[chunk_key] += count
+
+    async def incref_chunks(self, chunk_keys: List[str], counts: List[int] = None):
+        self._check_ref_counts(chunk_keys, counts)
+        return await asyncio.to_thread(self._incref_chunks, chunk_keys, counts=counts)
+
+    def _get_remove_chunk_keys(self, chunk_keys: List[str], counts: List[int] = None):
         to_remove_chunk_keys = []
-        for chunk_key in chunk_keys:
+        counts = counts if counts is not None else itertools.repeat(1)
+        for chunk_key, count in zip(chunk_keys, counts):
             ref_count = self._chunk_ref_counts[chunk_key]
-            ref_count -= 1
-            assert ref_count >= 0
+            ref_count -= count
+            assert ref_count >= 0, f"chunk key {chunk_key} will have negative ref count"
             self._chunk_ref_counts[chunk_key] = ref_count
             if ref_count == 0:
                 # remove
                 to_remove_chunk_keys.append(chunk_key)
         return to_remove_chunk_keys
 
-    async def decref_chunks(self, chunk_keys: List[str]):
-        to_remove_chunk_keys = self._get_remove_chunk_keys(chunk_keys)
+    async def decref_chunks(self, chunk_keys: List[str], counts: List[int] = None):
+        self._check_ref_counts(chunk_keys, counts)
+        to_remove_chunk_keys = await asyncio.to_thread(
+            self._get_remove_chunk_keys, chunk_keys, counts=counts
+        )
         # make _remove_chunks release actor lock so that multiple `decref_chunks` can run concurrently.
         yield self._remove_chunks(to_remove_chunk_keys)
 
     async def _remove_chunks(self, to_remove_chunk_keys: List[str]):
-        if not to_remove_chunk_keys:
-            return
         # get meta
+        logger.debug(
+            "Remove chunks %.500s with a refcount of zero", to_remove_chunk_keys
+        )
         get_metas = []
         for to_remove_chunk_key in to_remove_chunk_keys:
             get_metas.append(
@@ -151,27 +182,76 @@ class LifecycleTrackerActor(mo.Actor):
                 result[chunk_key] = ref_count
         return result
 
-    def incref_tileables(self, tileable_keys: List[str]):
-        for tileable_key in tileable_keys:
+    def _incref_tileables(self, tileable_keys: List[str], counts: List[int] = None):
+        counts = counts if counts is not None else itertools.repeat(1)
+        for tileable_key, count in zip(tileable_keys, counts):
             if tileable_key not in self._tileable_key_to_chunk_keys:
-                raise TileableNotTracked(
-                    f"tileable {tileable_key} " f"not tracked before"
-                )
-            self._tileable_ref_counts[tileable_key] += 1
+                raise TileableNotTracked(f"tileable {tileable_key} not tracked before")
+            self._tileable_ref_counts[tileable_key] += count
+            incref_chunk_keys = self._tileable_key_to_chunk_keys[tileable_key]
             # incref chunks for this tileable
-            self.incref_chunks(self._tileable_key_to_chunk_keys[tileable_key])
+            logger.debug(
+                "Incref chunks %.500s while increfing tileable %s",
+                incref_chunk_keys,
+                tileable_key,
+            )
+            chunk_counts = None if count == 1 else [count] * len(incref_chunk_keys)
+            self._incref_chunks(incref_chunk_keys, counts=chunk_counts)
 
-    async def decref_tileables(self, tileable_keys: List[str]):
-        decref_chunk_keys = []
-        for tileable_key in tileable_keys:
+    async def incref_tileables(
+        self, tileable_keys: List[str], counts: List[int] = None
+    ):
+        self._check_ref_counts(tileable_keys, counts)
+        return await asyncio.to_thread(
+            self._incref_tileables, tileable_keys, counts=counts
+        )
+
+    def _get_decref_chunk_keys(
+        self, tileable_keys: List[str], counts: List[int] = None
+    ) -> Dict[str, int]:
+        decref_chunk_keys = dict()
+        counts = counts if counts is not None else itertools.repeat(1)
+        for tileable_key, count in zip(tileable_keys, counts):
             if tileable_key not in self._tileable_key_to_chunk_keys:
-                raise TileableNotTracked(
-                    f"tileable {tileable_key} " f"not tracked before"
-                )
-            self._tileable_ref_counts[tileable_key] -= 1
+                raise TileableNotTracked(f"tileable {tileable_key} not tracked before")
+            self._tileable_ref_counts[tileable_key] -= count
 
-            decref_chunk_keys.extend(self._tileable_key_to_chunk_keys[tileable_key])
-        yield self.decref_chunks(decref_chunk_keys)
+            for chunk_key in self._tileable_key_to_chunk_keys[tileable_key]:
+                if chunk_key not in decref_chunk_keys:
+                    decref_chunk_keys[chunk_key] = count
+                else:
+                    decref_chunk_keys[chunk_key] += count
+        logger.debug(
+            "Decref chunks %.500s while decrefing tileables %s",
+            decref_chunk_keys,
+            tileable_keys,
+        )
+        return decref_chunk_keys
+
+    async def decref_tileables(
+        self, tileable_keys: List[str], counts: List[int] = None
+    ):
+        self._check_ref_counts(tileable_keys, counts)
+        decref_chunk_key_to_counts = await asyncio.to_thread(
+            self._get_decref_chunk_keys, tileable_keys, counts=counts
+        )
+        to_remove_chunk_keys = await asyncio.to_thread(
+            self._get_remove_chunk_keys,
+            list(decref_chunk_key_to_counts),
+            counts=list(decref_chunk_key_to_counts.values()),
+        )
+        to_remove_tileable_keys = await asyncio.to_thread(
+            list, (key for key in tileable_keys if self._tileable_ref_counts[key] <= 0)
+        )
+        coros = []
+        if to_remove_chunk_keys:
+            coros.append(self._remove_chunks(to_remove_chunk_keys))
+        if to_remove_tileable_keys:
+            task_api = await self._get_task_api()
+            coros.append(task_api.remove_tileables(to_remove_tileable_keys))
+        if coros:
+            # release actor lock
+            yield asyncio.gather(*coros)
 
     def get_tileable_ref_counts(self, tileable_keys: List[str]) -> List[int]:
         return [

@@ -14,6 +14,9 @@
 
 import asyncio
 import functools
+import logging
+import os
+import time
 from typing import Dict, List, Optional
 
 from .... import oscar as mo
@@ -22,15 +25,19 @@ from ...cluster import ClusterAPI
 from ...core import NodeRole, create_service_session, destroy_service_session
 from ..core import SessionInfo
 
+logger = logging.getLogger(__name__)
+
 
 class SessionManagerActor(mo.Actor):
     def __init__(self, service_config: Optional[Dict] = None):
         self._session_refs: Dict[str, mo.ActorRef] = dict()
         self._cluster_api: Optional[ClusterAPI] = None
         self._service_config = service_config or dict()
+        self._stored_last_idle_time = None
 
     async def __post_create__(self):
         self._cluster_api = await ClusterAPI.create(self.address)
+        self._stored_last_idle_time = time.time()
 
     async def __pre_destroy__(self):
         await asyncio.gather(
@@ -42,14 +49,26 @@ class SessionManagerActor(mo.Actor):
             raise mo.Return(self._session_refs[session_id])
 
         [address] = await self._cluster_api.get_supervisors_by_keys([session_id])
-        session_actor_ref = await mo.create_actor(
-            SessionActor,
-            session_id,
-            self._service_config,
-            address=address,
-            uid=SessionActor.gen_uid(session_id),
-            allocate_strategy=mo.allocate_strategy.Random(),
-        )
+        try:
+            session_actor_ref = await mo.create_actor(
+                SessionActor,
+                session_id,
+                self._service_config,
+                address=address,
+                uid=SessionActor.gen_uid(session_id),
+                allocate_strategy=mo.allocate_strategy.RandomSubPool(),
+            )
+        except IndexError:
+            # when there is only one supervisor process, strategy RandomSubPool
+            # fails with IndexError. So we need to retry using strategy Random.
+            session_actor_ref = await mo.create_actor(
+                SessionActor,
+                session_id,
+                self._service_config,
+                address=address,
+                uid=SessionActor.gen_uid(session_id),
+                allocate_strategy=mo.allocate_strategy.Random(),
+            )
         self._session_refs[session_id] = session_actor_ref
 
         # sync ref to other managers
@@ -87,6 +106,7 @@ class SessionManagerActor(mo.Actor):
 
     async def delete_session(self, session_id):
         session_actor_ref = self._session_refs.pop(session_id)
+        await session_actor_ref.remove()
         await mo.destroy_actor(session_actor_ref)
 
         # sync removing to other managers
@@ -97,6 +117,10 @@ class SessionManagerActor(mo.Actor):
                 supervisor_address, SessionManagerActor.default_uid()
             )
             await session_manager_ref.remove_session_ref(session_id)
+
+    async def delete_all_sessions(self):
+        for session_id in list(self._session_refs):
+            await self.delete_session(session_id)
 
     async def get_last_idle_time(self, session_id=None):
         if session_id is not None:
@@ -112,7 +136,10 @@ class SessionManagerActor(mo.Actor):
             if any(last_idle_time is None for last_idle_time in all_last_idle_time):
                 raise mo.Return(None)
             else:
-                raise mo.Return(max(all_last_idle_time))
+                self._stored_last_idle_time = max(
+                    [self._stored_last_idle_time] + all_last_idle_time
+                )
+                raise mo.Return(self._stored_last_idle_time)
 
 
 class SessionActor(mo.Actor):
@@ -141,11 +168,18 @@ class SessionActor(mo.Actor):
             address=self.address,
             uid=CustomLogMetaActor.gen_uid(self._session_id),
         )
+        logger.debug(
+            "Session %s actor created on pid: %s",
+            self._session_id,
+            os.getpid(),
+        )
 
-    async def __pre_destroy__(self):
+    async def remove(self):
         await destroy_service_session(
             NodeRole.SUPERVISOR, self._service_config, self._session_id, self.address
         )
+
+    async def __pre_destroy__(self):
         await mo.destroy_actor(self._custom_log_meta_ref)
 
     async def create_services(self):

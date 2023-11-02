@@ -28,8 +28,8 @@ from .core import StorageFileObject
 import numpy as np
 import pandas as pd
 
-cupy = lazy_import("cupy", globals=globals())
-cudf = lazy_import("cudf", globals=globals())
+cupy = lazy_import("cupy")
+cudf = lazy_import("cudf")
 
 
 _id_to_buffers = dict()
@@ -70,13 +70,13 @@ class CudaFileObject:
         self._offset = 0
         self._has_read_headers = False
         self._buffers = []
-        headers, buffers = _id_to_buffers[self._object_id]
-        self._headers = headers = headers.copy()
+        (metas, serialized), buffers = _id_to_buffers[self._object_id]
+        self._headers = headers = (metas.copy(), serialized)
         buffer_types = []
         for buf in buffers:
             if isinstance(buf, cupy.ndarray):
                 ptr, size = buf.data.ptr, buf.size
-                self._buffers.append(UnownedMemory(ptr, size, Buffer(ptr, size)))
+                self._buffers.append(UnownedMemory(ptr, size, Buffer(ptr, size=size)))
                 buffer_types.append(["cuda", size])
             elif isinstance(buf, Buffer):
                 ptr, size = buf.ptr, buf.size
@@ -90,7 +90,7 @@ class CudaFileObject:
                 size = getattr(buf, "size", len(buf))
                 self._buffers.append(buf)
                 buffer_types.append(["memory", size])
-        headers["buffer_types"] = buffer_types
+        headers[0]["buffer_types"] = buffer_types
 
     def _initialize_write(self):
         self._had_write_headers = False
@@ -137,25 +137,25 @@ class CudaFileObject:
                 return cur_buf[self._offset, self._offset + size]
 
     def write(self, content):
-        from cudf.core.buffer import Buffer
         from cupy.cuda import MemoryPointer
         from cupy.cuda.memory import UnownedMemory
+        from rmm import DeviceBuffer
 
         if not self._has_write_headers:
             self._headers = headers = pickle.loads(content)
-            buffer_types = headers["buffer_types"]
+            buffer_types = headers[0]["buffer_types"]
             for buffer_type, size in buffer_types:
                 if buffer_type == "cuda":
-                    self._buffers.append(Buffer.empty(size))
+                    self._buffers.append(DeviceBuffer(size=size))
                 else:
                     self._buffers.append(BytesIO())
             self._has_write_headers = True
             return
 
         cur_buf = self._buffers[self._cur_buffer_index]
-        cur_buf_size = self._headers["buffer_types"][self._cur_buffer_index][1]
-        if isinstance(cur_buf, Buffer):
-            cur_cupy_memory = UnownedMemory(cur_buf.ptr, len(cur_buf), cur_buf)
+        cur_buf_size = self._headers[0]["buffer_types"][self._cur_buffer_index][1]
+        if isinstance(cur_buf, DeviceBuffer):
+            cur_cupy_memory = UnownedMemory(cur_buf.ptr, cur_buf.size, cur_buf)
             cupy_pointer = MemoryPointer(cur_cupy_memory, self._offset)
 
             if isinstance(content, bytes):
@@ -165,7 +165,7 @@ class CudaFileObject:
                 )
             else:
                 source_mem = MemoryPointer(
-                    UnownedMemory(content.ptr, len(content), content), 0
+                    UnownedMemory(content.ptr, content.size, content), 0
                 )
                 content_length = source_mem.mem.size
             cupy_pointer.copy_from(source_mem, content_length)
@@ -188,7 +188,7 @@ class CudaFileObject:
 
     def _write_close(self):
         headers = self._headers
-        headers.pop("buffer_types")
+        headers[0].pop("buffer_types")
         # hold cuda buffers
 
         _id_to_buffers[self._object_id] = headers, self._buffers
@@ -212,6 +212,7 @@ class CudaFileObject:
 @register_storage_backend
 class CudaStorage(StorageBackend):
     name = "cuda"
+    is_seekable = False
 
     def __init__(self, size=None):
         self._size = size
@@ -261,11 +262,7 @@ class CudaStorage(StorageBackend):
             if isinstance(buf, cupy.ndarray):
                 new_buffers.append(DeviceBuffer(ptr=buf.data.ptr, size=buf.size))
             elif isinstance(buf, CPBuffer):
-                new_buffers.append(
-                    CPBuffer(
-                        buf.ptr, buf.size, DeviceBuffer(ptr=buf.ptr, size=buf.size)
-                    )
-                )
+                new_buffers.append(DeviceBuffer(ptr=buf.ptr, size=buf.size))
             else:
                 new_buffers.append(buf)
         return deserialize(headers, new_buffers)

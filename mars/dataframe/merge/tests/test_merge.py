@@ -14,13 +14,13 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from ....core import tile
 from ....core.operand import OperandStage
 from ...core import IndexValue
-from ...base.standardize_range_index import ChunkStandardizeRangeIndex
 from ...datasource.dataframe import from_pandas
-from .. import DataFrameMergeAlign, DataFrameShuffleMerge, concat
+from .. import DataFrameMergeAlign, DataFrameMerge, concat
 
 
 def test_merge():
@@ -48,32 +48,58 @@ def test_merge():
 
         assert df.chunk_shape == (2, 1)
         for chunk in df.chunks:
-            assert isinstance(chunk.op, DataFrameShuffleMerge)
+            assert isinstance(chunk.op, DataFrameMerge)
             assert chunk.op.how == kw.get("how", "inner")
             left, right = chunk.op.inputs
             assert isinstance(left.op, DataFrameMergeAlign)
             assert left.op.stage == OperandStage.reduce
             assert isinstance(right.op, DataFrameMergeAlign)
             assert right.op.stage == OperandStage.reduce
-            assert len(left.inputs[0].inputs) == 2
-            assert len(right.inputs[0].inputs) == 2
-            for lchunk in left.inputs[0].inputs:
+            assert len(left.inputs[0].inputs) == 4
+            assert len(right.inputs[0].inputs) == 4
+            for lchunk in left.inputs[0].inputs[:2]:
                 assert isinstance(lchunk.op, DataFrameMergeAlign)
                 assert lchunk.op.stage == OperandStage.map
                 assert lchunk.op.index_shuffle_size == 2
-                assert lchunk.op.shuffle_on == kw.get("on", None) or kw.get(
-                    "left_on", None
-                )
-            for rchunk in right.inputs[0].inputs:
+                if kw.get("on", None) or kw.get("left_on", None):
+                    # defaults to common columns
+                    assert lchunk.op.shuffle_on == kw.get("on", None) or kw.get(
+                        "left_on", None
+                    )
+            for rchunk in right.inputs[0].inputs[2:]:
                 assert isinstance(rchunk.op, DataFrameMergeAlign)
                 assert rchunk.op.stage == OperandStage.map
                 assert rchunk.op.index_shuffle_size == 2
-                assert rchunk.op.shuffle_on == kw.get("on", None) or kw.get(
-                    "right_on", None
-                )
+                if kw.get("on", None) or kw.get("right_on", None):
+                    # defaults to common columns
+                    assert rchunk.op.shuffle_on == kw.get("on", None) or kw.get(
+                        "right_on", None
+                    )
             pd.testing.assert_index_equal(
                 chunk.columns_value.to_pandas(), df.columns_value.to_pandas()
             )
+
+
+def test_merge_invalid_parameters():
+    pdf1 = pd.DataFrame(
+        np.arange(20).reshape((4, 5)) + 1, columns=["a", "b", "c", "d", "e"]
+    )
+    pdf2 = pd.DataFrame(np.arange(20).reshape((5, 4)) + 1, columns=["a", "b", "x", "y"])
+
+    df1 = from_pandas(pdf1, chunk_size=2)
+    df2 = from_pandas(pdf2, chunk_size=3)
+
+    with pytest.raises(ValueError):
+        df1.merge(df2, bloom_filter="wrong")
+
+    with pytest.raises(TypeError):
+        df1.merge(df2, bloom_filter_options="wrong")
+
+    with pytest.raises(ValueError):
+        df1.merge(df2, bloom_filter_options={"wrong": 1})
+
+    with pytest.raises(ValueError):
+        df1.merge(df2, bloom_filter_options={"filter": "wrong"})
 
 
 def test_join():
@@ -93,20 +119,20 @@ def test_join():
     ]
 
     for kw in parameters:
-        df = mdf1.join(mdf2, **kw)
+        df = mdf1.join(mdf2, auto_merge="none", bloom_filter=False, **kw)
         df = tile(df)
 
         assert df.chunk_shape == (3, 1)
         for chunk in df.chunks:
-            assert isinstance(chunk.op, DataFrameShuffleMerge)
+            assert isinstance(chunk.op, DataFrameMerge)
             assert chunk.op.how == kw.get("how", "left")
             left, right = chunk.op.inputs
             assert isinstance(left.op, DataFrameMergeAlign)
             assert left.op.stage == OperandStage.reduce
             assert isinstance(right.op, DataFrameMergeAlign)
             assert right.op.stage == OperandStage.reduce
-            assert len(left.inputs[0].inputs) == 2
-            assert len(right.inputs[0].inputs) == 3
+            assert len(left.inputs[0].inputs) == 5
+            assert len(right.inputs[0].inputs) == 5
             for lchunk in left.inputs[0].inputs:
                 assert isinstance(lchunk.op, DataFrameMergeAlign)
                 assert lchunk.op.stage == OperandStage.map
@@ -141,26 +167,26 @@ def test_join_on():
     ]
 
     for kw in parameters:
-        df = mdf1.join(mdf2, **kw)
+        df = mdf1.join(mdf2, auto_merge="none", bloom_filter=False, **kw)
         df = tile(df)
 
         assert df.chunk_shape == (3, 1)
         for chunk in df.chunks:
-            assert isinstance(chunk.op, DataFrameShuffleMerge)
+            assert isinstance(chunk.op, DataFrameMerge)
             assert chunk.op.how == kw.get("how", "left")
             left, right = chunk.op.inputs
             assert isinstance(left.op, DataFrameMergeAlign)
             assert left.op.stage == OperandStage.reduce
             assert isinstance(right.op, DataFrameMergeAlign)
             assert right.op.stage == OperandStage.reduce
-            assert len(left.inputs[0].inputs) == 2
-            assert len(right.inputs[0].inputs) == 3
-            for lchunk in left.inputs[0].inputs:
+            assert len(left.inputs[0].inputs) == 5
+            assert len(right.inputs[0].inputs) == 5
+            for lchunk in left.inputs[0].inputs[:2]:
                 assert isinstance(lchunk.op, DataFrameMergeAlign)
                 assert lchunk.op.stage == OperandStage.map
                 assert lchunk.op.index_shuffle_size == 3
                 assert lchunk.op.shuffle_on == kw.get("on", None)
-            for rchunk in right.inputs[0].inputs:
+            for rchunk in right.inputs[0].inputs[2:]:
                 assert isinstance(rchunk.op, DataFrameMergeAlign)
                 assert rchunk.op.stage == OperandStage.map
                 assert rchunk.op.index_shuffle_size == 3
@@ -234,11 +260,6 @@ def test_append():
     assert adf.shape == (20, 4)
     assert isinstance(adf.index_value.value, IndexValue.RangeIndex)
     pd.testing.assert_index_equal(adf.index_value.to_pandas(), pd.RangeIndex(20))
-
-    tiled = tile(adf)
-    assert tiled.nsplits == ((3, 3, 3, 1, 3, 3, 3, 1), (3, 1))
-    assert tiled.chunk_shape == (8, 2)
-    assert isinstance(tiled.chunks[0].op, ChunkStandardizeRangeIndex)
 
 
 def test_concat():

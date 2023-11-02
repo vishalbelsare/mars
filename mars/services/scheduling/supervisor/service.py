@@ -42,11 +42,11 @@ class SchedulingSupervisorService(AbstractService):
     """
 
     async def start(self):
-        from .globalslot import GlobalSlotManagerActor
+        from .globalresource import GlobalResourceManagerActor
 
         await mo.create_actor(
-            GlobalSlotManagerActor,
-            uid=GlobalSlotManagerActor.default_uid(),
+            GlobalResourceManagerActor,
+            uid=GlobalResourceManagerActor.default_uid(),
             address=self._address,
         )
 
@@ -67,11 +67,11 @@ class SchedulingSupervisorService(AbstractService):
             )
         )
 
-        from .globalslot import GlobalSlotManagerActor
+        from .globalresource import GlobalResourceManagerActor
 
         await mo.destroy_actor(
             mo.create_actor_ref(
-                uid=GlobalSlotManagerActor.default_uid(), address=self._address
+                uid=GlobalResourceManagerActor.default_uid(), address=self._address
             )
         )
 
@@ -81,6 +81,8 @@ class SchedulingSupervisorService(AbstractService):
         subtask_max_reschedules = scheduling_config.get(
             "subtask_max_reschedules", DEFAULT_SUBTASK_MAX_RESCHEDULES
         )
+        subtask_cancel_timeout = scheduling_config.get("subtask_cancel_timeout", 5)
+        speculation_config = scheduling_config.get("speculation", {})
 
         from .assigner import AssignerActor
 
@@ -109,14 +111,18 @@ class SchedulingSupervisorService(AbstractService):
             SubtaskManagerActor,
             session_id,
             subtask_max_reschedules,
+            subtask_cancel_timeout,
+            speculation_config,
             address=self._address,
             uid=SubtaskManagerActor.gen_uid(session_id),
         )
 
+        from ...cluster import ClusterAPI
         from .autoscale import AutoscalerActor
 
-        autoscaler_ref = await mo.actor_ref(
-            AutoscalerActor.default_uid(), address=self._address
+        cluster_api = await ClusterAPI.create(self._address)
+        [autoscaler_ref] = await cluster_api.get_supervisor_refs(
+            [AutoscalerActor.default_uid()]
         )
         await autoscaler_ref.register_session(session_id, self._address)
 

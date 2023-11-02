@@ -20,6 +20,8 @@ import time
 from typing import Union, Dict, List, Optional, AsyncGenerator
 
 from ... import oscar as mo
+from ...core.entrypoints import init_extension_entrypoints
+from ...metrics import init_metrics
 from ...oscar.backends.ray.driver import RayActorDriver
 from ...oscar.backends.ray.utils import (
     process_placement_to_address,
@@ -27,27 +29,36 @@ from ...oscar.backends.ray.utils import (
     process_address_to_placement,
 )
 from ...oscar.backends.ray.pool import RayPoolState
+from ...oscar.backends.router import Router
 from ...oscar.errors import ReconstructWorkerError
+from ...resource import Resource
 from ...services.cluster.backends.base import (
     register_cluster_backend,
     AbstractClusterBackend,
 )
 from ...services import NodeRole
-from ...utils import merge_dict, flatten_dict_to_nested_dict
-from ...utils import lazy_import
-from ..utils import load_service_config_file, get_third_party_modules_from_config
-from .service import start_supervisor, start_worker, stop_supervisor, stop_worker
-from .session import (
+from ...services.task.execution.api import ExecutionConfig
+from ...session import (
     _new_session,
     new_session,
     AbstractSession,
     ensure_isolation_created,
 )
+from ...utils import lazy_import, retry_callable
+from ..utils import (
+    load_config,
+    get_third_party_modules_from_config,
+)
+from .service import start_supervisor, start_worker, stop_supervisor, stop_worker
 from .pool import create_supervisor_actor_pool, create_worker_actor_pool
 
 ray = lazy_import("ray")
 logger = logging.getLogger(__name__)
 
+# The default config file.
+DEFAULT_CONFIG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "rayconfig.yml"
+)
 # The default value for supervisor standalone (not share node with worker).
 DEFAULT_SUPERVISOR_STANDALONE = False
 # The default value for supervisor sub pool count.
@@ -55,24 +66,7 @@ DEFAULT_SUPERVISOR_SUB_POOL_NUM = 0
 
 
 def _load_config(config: Union[str, Dict] = None):
-    # use default config
-    if isinstance(config, str):
-        filename = config
-    else:
-        d = os.path.dirname(os.path.abspath(__file__))
-        filename = os.path.join(d, "rayconfig.yml")
-    full_config = load_service_config_file(filename)
-    if config and not isinstance(config, str):
-        if not isinstance(config, Dict):  # pragma: no cover
-            raise ValueError(f"{config} is not a dict")
-        flatten_keys = set(k for k in config.keys() if isinstance(k, str) and "." in k)
-        nested_flatten_config = flatten_dict_to_nested_dict(
-            {k: config[k] for k in flatten_keys}
-        )
-        nested_config = {k: config[k] for k in config.keys() if k not in flatten_keys}
-        config = merge_dict(nested_config, nested_flatten_config, overwrite=False)
-        merge_dict(full_config, config)
-    return full_config
+    return load_config(config, default_config_file=DEFAULT_CONFIG_FILE)
 
 
 @register_cluster_backend
@@ -128,10 +122,10 @@ class RayClusterBackend(AbstractClusterBackend):
 class ClusterStateActor(mo.StatelessActor):
     def __init__(self):
         self._worker_cpu, self._worker_mem, self._config = None, None, None
-        self._pg_name, self._band_to_slot, self._worker_modules = None, None, None
+        self._pg_name, self._band_to_resource, self._worker_modules = None, None, None
         self._pg_counter = itertools.count()
         self._worker_count = 0
-        self._dynamic_created_workers = {}
+        self._workers = {}
         self._releasing_tasks = {}
         self._reconstructing_tasks = {}
 
@@ -145,7 +139,9 @@ class ClusterStateActor(mo.StatelessActor):
             config,
         )
         # TODO(chaokunyang) Support gpu
-        self._band_to_slot = {"numa-0": self._worker_cpu}
+        self._band_to_resource = {
+            "numa-0": Resource(num_cpus=self._worker_cpu, mem_bytes=self._worker_mem)
+        }
         self._worker_modules = get_third_party_modules_from_config(
             self._config, NodeRole.WORKER
         )
@@ -154,19 +150,30 @@ class ClusterStateActor(mo.StatelessActor):
         self, worker_cpu: int = None, worker_mem: int = None, timeout: int = None
     ) -> Optional[str]:
         worker_cpu = worker_cpu or self._worker_cpu
+        worker_mem = worker_mem or self._worker_mem
         bundle = {
             "CPU": worker_cpu,
-            # 'memory': worker_mem or self._worker_mem
+            # "memory": worker_mem or self._worker_mem
         }
-        band_to_slot = {"numa-0": worker_cpu}
+        band_to_resource = {
+            "numa-0": Resource(num_cpus=worker_cpu, mem_bytes=worker_mem)
+        }
         start_time = time.time()
         logger.info("Start to request worker with resource %s.", bundle)
         # TODO rescale ray placement group instead of creating new placement group
         pg_name = f"{self._pg_name}_{next(self._pg_counter)}"
         pg = ray.util.placement_group(name=pg_name, bundles=[bundle], strategy="SPREAD")
-        create_pg_timeout = timeout or 60
+        create_pg_timeout = timeout or 120
         try:
             await asyncio.wait_for(pg.ready(), timeout=create_pg_timeout)
+        except asyncio.CancelledError:  # pragma: no cover
+            logger.warning(
+                "Request worker with placement group %s in %s seconds canceled.",
+                pg.bundle_specs,
+                create_pg_timeout,
+            )
+            ray.util.remove_placement_group(pg)
+            return None
         except asyncio.TimeoutError:
             logger.warning(
                 "Request worker failed, "
@@ -182,32 +189,39 @@ class ClusterStateActor(mo.StatelessActor):
             time.time() - start_time,
         )
         worker_address = process_placement_to_address(pg_name, 0, 0)
-        worker_pool = await self.new_worker(worker_address, band_to_slot=band_to_slot)
+        worker_pool = await self.create_worker(worker_address)
+        await self.start_worker(worker_address, band_to_resource=band_to_resource)
         logger.info(
             "Request worker %s succeeds in %.4f seconds",
             worker_address,
             time.time() - start_time,
         )
-        self._dynamic_created_workers[worker_address] = (worker_pool, pg)
-        self._worker_count += 1
+        self._workers[worker_address] = (worker_pool, pg)
         return worker_address
 
-    async def new_worker(self, worker_address, band_to_slot=None):
-        self._worker_count += 1
+    async def create_worker(self, worker_address):
         start_time = time.time()
-        band_to_slot = band_to_slot or self._band_to_slot
         worker_pool = await create_worker_actor_pool(
-            worker_address, self._band_to_slot, modules=self._worker_modules
+            worker_address,
+            self._band_to_resource,
+            modules=self._worker_modules,
+            metrics=self._config.get("metrics", {}),
         )
         logger.info(
             "Create worker node %s succeeds in %.4f seconds.",
             worker_address,
             time.time() - start_time,
         )
+        return worker_pool
+
+    async def start_worker(self, worker_address, band_to_resource=None):
+        self._worker_count += 1
         start_time = time.time()
+        band_to_resource = band_to_resource or self._band_to_resource
         await start_worker(
-            worker_address, self.address, band_to_slot, config=self._config
+            worker_address, self.address, band_to_resource, config=self._config
         )
+        worker_pool = ray.get_actor(worker_address)
         await worker_pool.mark_service_ready.remote()
         logger.info(
             "Start services on worker %s succeeds in %.4f seconds.",
@@ -217,6 +231,7 @@ class ClusterStateActor(mo.StatelessActor):
         return worker_pool
 
     async def release_worker(self, address: str):
+        logger.info("Start to release worker %s", address)
         task = self._reconstructing_tasks.get(address)
         if task is not None:
             task.cancel()
@@ -228,7 +243,7 @@ class ClusterStateActor(mo.StatelessActor):
 
         async def _release_worker():
             await stop_worker(address, self._config)
-            pool, pg = self._dynamic_created_workers.pop(address)
+            pool, pg = self._workers.pop(address)
             await pool.actor_pool.remote("stop")
             if "COV_CORE_SOURCE" in os.environ:  # pragma: no cover
                 try:
@@ -236,8 +251,9 @@ class ClusterStateActor(mo.StatelessActor):
                     await pool.cleanup.remote()
                 except:  # noqa: E722  # nosec  # pylint: disable=bare-except
                     pass
-            ray.kill(pool)
+            ray.kill(pool.main_pool)
             ray.util.remove_placement_group(pg)
+            logger.info("Released worker %s", address)
 
         task = asyncio.create_task(_release_worker())
         task.add_done_callback(lambda _: self._releasing_tasks.pop(address, None))
@@ -259,7 +275,10 @@ class ClusterStateActor(mo.StatelessActor):
         async def _reconstruct_worker():
             logger.info("Reconstruct worker %s", address)
             actor = ray.get_actor(address)
-            state = await actor.state.remote()
+            # ray call will error when actor is restarting
+            state = await retry_callable(
+                actor.state.remote, ex_type=ray.exceptions.RayActorError, sync=False
+            )()
             if state == RayPoolState.SERVICE_READY:
                 logger.info("Worker %s is service ready.")
                 return
@@ -271,7 +290,7 @@ class ClusterStateActor(mo.StatelessActor):
 
             start_time = time.time()
             await start_worker(
-                address, self.address, self._band_to_slot, config=self._config
+                address, self.address, self._band_to_resource, config=self._config
             )
             await actor.mark_service_ready.remote()
             logger.info(
@@ -288,10 +307,12 @@ class ClusterStateActor(mo.StatelessActor):
 
 async def new_cluster(
     cluster_name: str = None,
-    supervisor_mem: int = 1 * 1024 ** 3,
+    supervisor_cpu: int = 1,
+    supervisor_mem: int = 1 * 1024**3,
     worker_num: int = 1,
     worker_cpu: int = 2,
-    worker_mem: int = 2 * 1024 ** 3,
+    worker_mem: int = 2 * 1024**3,
+    backend: str = None,
     config: Union[str, Dict] = None,
     **kwargs,
 ):
@@ -302,9 +323,20 @@ async def new_cluster(
         ray.init(num_cpus=16 + worker_num * worker_cpu)
     ensure_isolation_created(kwargs)
     if kwargs:  # pragma: no cover
-        raise TypeError(f"new_cluster got unexpected " f"arguments: {list(kwargs)}")
+        raise TypeError(f"new_cluster got unexpected arguments: {list(kwargs)}")
+    n_supervisor_process = kwargs.get(
+        "n_supervisor_process", DEFAULT_SUPERVISOR_SUB_POOL_NUM
+    )
     cluster = RayCluster(
-        cluster_name, supervisor_mem, worker_num, worker_cpu, worker_mem, config
+        cluster_name,
+        supervisor_cpu,
+        supervisor_mem,
+        worker_num,
+        worker_cpu,
+        worker_mem,
+        backend,
+        config,
+        n_supervisor_process=n_supervisor_process,
     )
     try:
         await cluster.start()
@@ -333,6 +365,7 @@ new_cluster_in_ray.__doc__ = new_cluster.__doc__
 def new_ray_session(
     address: str = None,
     session_id: str = None,
+    backend: str = "mars",
     default: bool = True,
     **new_cluster_kwargs,
 ) -> AbstractSession:
@@ -344,18 +377,26 @@ def new_ray_session(
         mars web server address.
     session_id: str
         session id. If not specified, will be generated automatically.
+    backend: str
+        The executor backend. Available values are "mars" and "ray", default is "mars".
     default: bool
         whether set the session as default session.
     new_cluster_kwargs:
         See `new_cluster` arguments.
     """
+    client = None
     if not address:
-        client = new_cluster_in_ray(**new_cluster_kwargs)
+        client = new_cluster_in_ray(backend=backend, **new_cluster_kwargs)
         session_id = session_id or client.session.session_id
         address = client.address
-    return new_session(
-        address=address, session_id=session_id, backend="oscar", default=default
+    session = new_session(
+        address=address, session_id=session_id, backend=backend, default=default
     )
+    session.client = client
+    if default:
+        # SyncSession set isolated_session as default session instead.
+        AbstractSession.default.client = client
+    return session
 
 
 class RayCluster:
@@ -365,19 +406,27 @@ class RayCluster:
     def __init__(
         self,
         cluster_name: str,
-        supervisor_mem: int = 4 * 1024 ** 3,
+        supervisor_cpu: Union[int, float] = 1,
+        supervisor_mem: int = 1 * 1024**3,
         worker_num: int = 1,
-        worker_cpu: int = 16,
-        worker_mem: int = 32 * 1024 ** 3,
+        worker_cpu: Union[int, float] = 2,
+        worker_mem: int = 2 * 1024**3,
+        backend: str = None,
         config: Union[str, Dict] = None,
+        n_supervisor_process: int = DEFAULT_SUPERVISOR_SUB_POOL_NUM,
     ):
+        # load third party extensions.
+        init_extension_entrypoints()
         self._cluster_name = cluster_name
+        self._supervisor_cpu = supervisor_cpu
         self._supervisor_mem = supervisor_mem
+        self._n_supervisor_process = n_supervisor_process
         self._worker_num = worker_num
         self._worker_cpu = worker_cpu
         self._worker_mem = worker_mem
+        self.backend = backend
         # load config file to dict.
-        self._config = _load_config(config)
+        self._config = load_config(config, default_config_file=DEFAULT_CONFIG_FILE)
         self.supervisor_address = None
         # Hold actor handles to avoid being freed
         self._supervisor_pool = None
@@ -388,6 +437,65 @@ class RayCluster:
         self.web_address = None
 
     async def start(self):
+        try:
+            # Python 3.8 support force argument.
+            logging.basicConfig(
+                format=ray.ray_constants.LOGGER_FORMAT, level=logging.INFO, force=True
+            )
+        except ValueError:  # pragma: no cover
+            logging.basicConfig(
+                format=ray.ray_constants.LOGGER_FORMAT, level=logging.INFO
+            )
+        execution_config = ExecutionConfig.from_config(
+            self._config, backend=self.backend
+        )
+        self.backend = execution_config.backend
+        if self.backend == "mars":
+            await self.start_oscar(
+                self._n_supervisor_process,
+                self._supervisor_cpu,
+                self._supervisor_mem,
+                self._worker_num,
+                self._worker_cpu,
+                self._worker_mem,
+            )
+        elif self.backend == "ray":
+            execution_config.merge_from(
+                ExecutionConfig.from_params(
+                    backend=self.backend,
+                    n_worker=self._worker_num,
+                    n_cpu=self._worker_num * self._worker_cpu,
+                    mem_bytes=self._worker_mem,
+                    subtask_num_cpus=self._worker_cpu,
+                    subtask_memory=self._worker_mem,
+                )
+            )
+            assert self._n_supervisor_process == 0, self._n_supervisor_process
+            await self.start_oscar(
+                self._n_supervisor_process,
+                self._supervisor_cpu,
+                self._supervisor_mem,
+                0,
+                0,
+                0,
+            )
+        else:
+            raise ValueError(f"Unsupported backend type: {self.backend}.")
+
+    async def start_oscar(
+        self,
+        n_supervisor_process,
+        supervisor_cpu,
+        supervisor_mem,
+        worker_num,
+        worker_cpu,
+        worker_mem,
+    ):
+        logger.info("Start cluster with config %s", self._config)
+        # init metrics to guarantee metrics use in driver
+        metric_configs = self._config.get("metrics", {})
+        metric_backend = metric_configs.get("backend")
+        init_metrics(metric_backend, config=metric_configs.get(metric_backend))
         address_to_resources = dict()
         supervisor_standalone = (
             self._config.get("cluster", {})
@@ -399,7 +507,7 @@ class RayCluster:
             self._config.get("cluster", {})
             .get("ray", {})
             .get("supervisor", {})
-            .get("sub_pool_num", DEFAULT_SUPERVISOR_SUB_POOL_NUM)
+            .get("sub_pool_num", n_supervisor_process)
         )
         from ...storage.ray import support_specify_owner
 
@@ -414,12 +522,12 @@ class RayCluster:
             self._config["cluster"] = dict()
         self._config["cluster"]["lookup_address"] = self.supervisor_address
         address_to_resources[node_placement_to_address(self._cluster_name, 0)] = {
-            "CPU": 1,
-            # 'memory': self._supervisor_mem
+            "CPU": supervisor_cpu,
+            # "memory": supervisor_mem,
         }
         worker_addresses = []
-        if supervisor_standalone:
-            for worker_index in range(1, self._worker_num + 1):
+        if supervisor_standalone or worker_num == 0:
+            for worker_index in range(1, worker_num + 1):
                 worker_address = process_placement_to_address(
                     self._cluster_name, worker_index, 0
                 )
@@ -428,11 +536,11 @@ class RayCluster:
                     self._cluster_name, worker_index
                 )
                 address_to_resources[worker_node_address] = {
-                    "CPU": self._worker_cpu,
-                    # 'memory': self._worker_mem
+                    "CPU": worker_cpu,
+                    # "memory": self._worker_mem,
                 }
         else:
-            for worker_index in range(self._worker_num):
+            for worker_index in range(worker_num):
                 worker_process_index = (
                     supervisor_sub_pool_num + 1 if worker_index == 0 else 0
                 )
@@ -444,8 +552,8 @@ class RayCluster:
                     self._cluster_name, worker_index
                 )
                 address_to_resources[worker_node_address] = {
-                    "CPU": self._worker_cpu,
-                    # 'memory': self._worker_mem
+                    "CPU": worker_cpu,
+                    # "memory": self._worker_mem,
                 }
         mo.setup_cluster(address_to_resources)
 
@@ -454,20 +562,45 @@ class RayCluster:
             self._config, NodeRole.SUPERVISOR
         )
 
+        # set global router an empty one.
+        Router.set_instance(Router(list(), None))
+
         # create supervisor actor pool
-        self._supervisor_pool = await create_supervisor_actor_pool(
-            self.supervisor_address,
-            n_process=supervisor_sub_pool_num,
-            main_pool_cpus=0,
-            sub_pool_cpus=0,
-            modules=supervisor_modules,
+        supervisor_pool_coro = asyncio.create_task(
+            create_supervisor_actor_pool(
+                self.supervisor_address,
+                n_process=supervisor_sub_pool_num,
+                main_pool_cpus=0,
+                sub_pool_cpus=0,
+                modules=supervisor_modules,
+                metrics=self._config.get("metrics", {}),
+            )
         )
+        worker_pools = [
+            asyncio.create_task(
+                create_worker_actor_pool(
+                    addr,
+                    {
+                        "numa-0": Resource(
+                            num_cpus=worker_cpu, mem_bytes=self._worker_mem
+                        )
+                    },
+                    modules=get_third_party_modules_from_config(
+                        self._config, NodeRole.WORKER
+                    ),
+                    metrics=self._config.get("metrics", {}),
+                )
+            )
+            for addr in worker_addresses
+        ]
+        self._supervisor_pool = await supervisor_pool_coro
         logger.info("Create supervisor on node %s succeeds.", self.supervisor_address)
         self._cluster_backend = await RayClusterBackend.create(
             NodeRole.WORKER, self.supervisor_address, self.supervisor_address
         )
+        cluster_state_ref = self._cluster_backend.get_cluster_state_ref()
         await self._cluster_backend.get_cluster_state_ref().set_config(
-            self._worker_cpu, self._worker_mem, self._config
+            worker_cpu, self._worker_mem, self._config
         )
         # start service
         await start_supervisor(self.supervisor_address, config=self._config)
@@ -475,14 +608,12 @@ class RayCluster:
             "Start services on supervisor %s succeeds.", self.supervisor_address
         )
         await self._supervisor_pool.mark_service_ready.remote()
-
-        worker_pools = await asyncio.gather(
-            *[self._cluster_backend.new_worker(addr) for addr in worker_addresses]
+        worker_pools = await asyncio.gather(*worker_pools)
+        logger.info("Create %s workers succeeds.", len(worker_pools))
+        await asyncio.gather(
+            *[cluster_state_ref.start_worker(addr) for addr in worker_addresses]
         )
-        logger.info(
-            "Create %s workers and start services on workers succeeds.",
-            len(worker_addresses),
-        )
+        logger.info("Start services on %s workers succeeds.", len(worker_addresses))
         for worker_address, worker_pool in zip(worker_addresses, worker_pools):
             self._worker_addresses.append(worker_address)
             self._worker_pools.append(worker_pool)
@@ -497,15 +628,18 @@ class RayCluster:
 
     async def stop(self):
         if not self._stopped:
-            for worker_address in self._worker_addresses:
-                await stop_worker(worker_address, self._config)
-            for pool in self._worker_pools:
-                await pool.actor_pool.remote("stop")
-            if self._supervisor_pool is not None:
-                await stop_supervisor(self.supervisor_address, self._config)
-                await self._supervisor_pool.actor_pool.remote("stop")
-            AbstractSession.reset_default()
-            RayActorDriver.stop_cluster()
+            try:
+                for worker_address in self._worker_addresses:
+                    await stop_worker(worker_address, self._config)
+                for pool in self._worker_pools:
+                    await pool.actor_pool.remote("stop")
+                if self._supervisor_pool is not None:
+                    await stop_supervisor(self.supervisor_address, self._config)
+                    await self._supervisor_pool.actor_pool.remote("stop")
+            finally:
+                AbstractSession.reset_default()
+                RayActorDriver.stop_cluster()
+                Router.set_instance(None)
             self._stopped = True
 
 
@@ -514,11 +648,17 @@ class RayClient:
         self._cluster = cluster
         self._address = cluster.supervisor_address
         self._session = session
+        # hold ray cluster by client to avoid actor handle out-of-scope
+        session.client = self
 
     @classmethod
     async def create(cls, cluster: RayCluster) -> "RayClient":
-        session = await _new_session(cluster.supervisor_address, default=True)
-        return RayClient(cluster, session)
+        session = await _new_session(
+            cluster.supervisor_address, default=True, backend=cluster.backend
+        )
+        client = RayClient(cluster, session)
+        AbstractSession.default.client = client
+        return client
 
     @property
     def address(self):
@@ -536,12 +676,8 @@ class RayClient:
         return self
 
     async def __aexit__(self, *_):
-        await self._stop()
+        await self.stop()
 
-    def stop(self):
-        isolation = ensure_isolation_created({})
-        fut = asyncio.run_coroutine_threadsafe(self._stop(), isolation.loop)
-        return fut.result()
-
-    async def _stop(self):
+    async def stop(self):
         await self._cluster.stop()
+        AbstractSession.reset_default()

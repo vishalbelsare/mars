@@ -259,6 +259,12 @@ def test_arrow_string_array_functions():
             else:
                 assert arrow_array.memory_usage(deep=True) == arrow_array.nbytes
 
+            # test unique
+            assert arrow_array.unique() == pd.Series(string_array).unique()
+            arrow_array2 = arrow_array.copy()
+            arrow_array2._force_use_pandas = True
+            assert arrow_array2.unique() == pd.Series(string_array).unique()
+
             # test isna
             np.testing.assert_array_equal(
                 has_na_arrow_array.isna(), has_na_string_array.isna()
@@ -463,6 +469,7 @@ def test_to_pandas():
 
     # test df method
     df4 = df2.groupby("b").sum()
+    df4.index = df4.index.astype(object)
     expected = df.groupby("b").sum()
     pd.testing.assert_frame_equal(df4, expected)
 
@@ -473,3 +480,7 @@ def test_to_pandas():
     s2 = df2["b"].str[:2]
     expected = df["b"].astype("string").str[:2]
     pd.testing.assert_series_equal(s2, expected)
+
+    # test reverse conversion to arrow
+    arrow_data = pa.RecordBatch.from_pandas(df2)
+    assert arrow_data.num_rows == len(df2)

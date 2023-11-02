@@ -18,8 +18,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from ..sort import DataFrameGroupbySortShuffle
 from .... import dataframe as md
 from .... import opcodes
+from ....config import option_context
 from ....core import OutputType, tile
 from ....core.operand import OperandStage
 from ...core import DataFrameGroupBy, SeriesGroupBy, DataFrame
@@ -118,7 +120,7 @@ def test_groupby_agg():
         }
     )
     mdf = md.DataFrame(df, chunk_size=2)
-    r = mdf.groupby("c2").sum(method="shuffle")
+    r = mdf.groupby("c2", sort=False).sum(method="shuffle")
 
     assert isinstance(r.op, DataFrameGroupByAgg)
     assert isinstance(r, DataFrame)
@@ -139,9 +141,55 @@ def test_groupby_agg():
         agg_chunk = chunk.inputs[0].inputs[0].inputs[0].inputs[0]
         assert agg_chunk.op.stage == OperandStage.map
 
+    r = mdf.groupby(
+        "c2",
+    ).sum(method="shuffle")
+
+    assert isinstance(r.op, DataFrameGroupByAgg)
+    assert isinstance(r, DataFrame)
+
+    r = tile(r)
+    assert len(r.chunks) == 5
+    for chunk in r.chunks:
+        assert isinstance(chunk.op, DataFrameGroupByAgg)
+        assert chunk.op.stage == OperandStage.agg
+        assert isinstance(chunk.inputs[0].op, DataFrameGroupbySortShuffle)
+        assert chunk.inputs[0].op.stage == OperandStage.reduce
+        assert isinstance(chunk.inputs[0].inputs[0].op, DataFrameShuffleProxy)
+        assert isinstance(
+            chunk.inputs[0].inputs[0].inputs[0].op, DataFrameGroupbySortShuffle
+        )
+        assert chunk.inputs[0].inputs[0].inputs[0].op.stage == OperandStage.map
+
+        agg_chunk = chunk.inputs[0].inputs[0].inputs[0].inputs[0]
+        assert agg_chunk.op.stage == OperandStage.map
+
     # test unknown method
     with pytest.raises(ValueError):
         mdf.groupby("c2").sum(method="not_exist")
+
+
+def test_groupby_auto_on_cluster():
+    rs = np.random.RandomState(0)
+    raw = pd.DataFrame(
+        {
+            "c1": rs.randint(20, size=100),
+            "c2": rs.choice(["a", "b", "c"], (100,)),
+            "c3": rs.rand(100),
+        }
+    )
+    # test DataFrameGroupByAgg._tile_auto_on_distributed
+    with option_context({"chunk_store_limit": 80}):
+        # chunk_store_limit is 30, each chunk's size is 8,
+        # will combine once, then shuffle 5 combined chunk
+        mdf = md.DataFrame(raw, chunk_size=5)
+        tiled_mdf = tile(mdf)
+        r = mdf.groupby("c2").sum()
+        func_infos = DataFrameGroupByAgg._compile_funcs(r.op, mdf)
+        tiled = DataFrameGroupByAgg._build_tree_and_shuffle_chunks(
+            r.op, tiled_mdf, r, func_infos, tiled_mdf.chunks[:4], [8] * 4
+        )[0]
+        assert len(tiled.chunks) == 5
 
 
 def test_groupby_apply():
@@ -152,6 +200,9 @@ def test_groupby_apply():
             "c": list("aabaaddce"),
         }
     )
+
+    def apply_call_with_err(_):
+        raise ValueError
 
     def apply_df(df):
         return df.sort_index()
@@ -164,6 +215,14 @@ def test_groupby_apply():
         return s.sort_index()
 
     mdf = md.DataFrame(df1, chunk_size=3)
+
+    # when dtype and output_type specified, apply function
+    # shall not be called
+    applied = mdf.groupby("b").apply(
+        apply_call_with_err, output_type="series", dtype=int
+    )
+    assert applied.dtype == int
+    assert applied.op.output_types[0] == OutputType.series
 
     with pytest.raises(TypeError):
         mdf.groupby("b").apply(apply_df_with_error)
@@ -199,7 +258,11 @@ def test_groupby_apply():
     assert applied.chunks[0].shape == (np.nan,)
     assert applied.chunks[0].dtype == df1.a.dtype
 
-    applied = tile(mdf.groupby("b").apply(lambda df: df.a.sum()))
+    applied = mdf.groupby("b").apply(lambda df: df.a.sum())
+    assert applied.op.maybe_agg is True
+    # force set to pass test
+    applied.op.maybe_agg = None
+    applied = tile(applied)
     assert applied.dtype == df1.a.dtype
     assert applied.shape == (np.nan,)
     assert applied.op._op_type_ == opcodes.APPLY
@@ -363,3 +426,101 @@ def test_groupby_cum():
         assert len(r.chunks) == 4
         assert r.shape == (len(series1),)
         assert r.chunks[0].shape == (np.nan,)
+
+
+def test_groupby_fill():
+    df1 = pd.DataFrame(
+        [
+            [1, 1, 10],
+            [1, 1, np.nan],
+            [1, 1, np.nan],
+            [1, 2, np.nan],
+            [1, 2, 20],
+            [1, 2, np.nan],
+            [1, 3, np.nan],
+            [1, 3, np.nan],
+        ],
+        columns=["one", "two", "three"],
+    )
+    mdf = md.DataFrame(df1, chunk_size=3)
+
+    r = tile(mdf.groupby(["one", "two"]).ffill())
+    assert r.op.output_types[0] == OutputType.dataframe
+    assert r.shape == (len(df1), 1)
+    assert len(r.chunks) == 3
+    assert r.chunks[0].shape == (np.nan, 1)
+    assert r.dtypes.index.tolist() == ["three"]
+
+    r = tile(mdf.groupby(["two"]).bfill())
+    assert r.op.output_types[0] == OutputType.dataframe
+    assert r.shape == (len(df1), 2)
+    assert len(r.chunks) == 3
+    assert r.chunks[0].shape == (np.nan, 2)
+    assert r.dtypes.index.tolist() == ["one", "three"]
+
+    r = tile(mdf.groupby(["two"]).backfill())
+    assert r.op.output_types[0] == OutputType.dataframe
+    assert r.shape == (len(df1), 2)
+    assert len(r.chunks) == 3
+    assert r.chunks[0].shape == (np.nan, 2)
+    assert r.dtypes.index.tolist() == ["one", "three"]
+
+    r = tile(mdf.groupby(["one"]).fillna(5))
+    assert r.op.output_types[0] == OutputType.dataframe
+    assert r.shape == (len(df1), 2)
+    assert len(r.chunks) == 3
+    assert r.chunks[0].shape == (np.nan, 2)
+    assert r.dtypes.index.tolist() == ["two", "three"]
+
+    s1 = pd.Series([4, 3, 9, np.nan, np.nan, 7, 10, 8, 1, 6])
+    ms1 = md.Series(s1, chunk_size=3)
+    r = tile(ms1.groupby(lambda x: x % 2).ffill())
+    assert r.op.output_types[0] == OutputType.series
+    assert len(r.chunks) == 4
+    assert r.shape == (len(s1),)
+    assert r.chunks[0].shape == (np.nan,)
+
+    r = tile(ms1.groupby(lambda x: x % 2).bfill())
+    assert r.op.output_types[0] == OutputType.series
+    assert len(r.chunks) == 4
+    assert r.shape == (len(s1),)
+    assert r.chunks[0].shape == (np.nan,)
+
+    r = tile(ms1.groupby(lambda x: x % 2).backfill())
+    assert r.op.output_types[0] == OutputType.series
+    assert len(r.chunks) == 4
+    assert r.shape == (len(s1),)
+    assert r.chunks[0].shape == (np.nan,)
+
+    r = tile(ms1.groupby(lambda x: x % 2).fillna(5))
+    assert r.op.output_types[0] == OutputType.series
+    assert len(r.chunks) == 4
+    assert r.shape == (len(s1),)
+    assert r.chunks[0].shape == (np.nan,)
+
+    s1 = pd.Series([4, 3, 9, np.nan, np.nan, 7, 10, 8, 1, 6])
+    ms1 = md.Series(s1, chunk_size=3)
+
+    r = tile(ms1.groupby(lambda x: x % 2).ffill())
+    assert r.op.output_types[0] == OutputType.series
+    assert len(r.chunks) == 4
+    assert r.shape == (len(s1),)
+    assert r.chunks[0].shape == (np.nan,)
+
+    r = tile(ms1.groupby(lambda x: x % 2).bfill())
+    assert r.op.output_types[0] == OutputType.series
+    assert len(r.chunks) == 4
+    assert r.shape == (len(s1),)
+    assert r.chunks[0].shape == (np.nan,)
+
+    r = tile(ms1.groupby(lambda x: x % 2).backfill())
+    assert r.op.output_types[0] == OutputType.series
+    assert len(r.chunks) == 4
+    assert r.shape == (len(s1),)
+    assert r.chunks[0].shape == (np.nan,)
+
+    r = tile(ms1.groupby(lambda x: x % 2).fillna(5))
+    assert r.op.output_types[0] == OutputType.series
+    assert len(r.chunks) == 4
+    assert r.shape == (len(s1),)
+    assert r.chunks[0].shape == (np.nan,)

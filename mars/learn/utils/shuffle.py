@@ -214,7 +214,8 @@ class LearnShuffle(MapReduceOperand, LearnOperandMixin):
         ax_nsplit = {ax: decide_unify_split(*ns) for ax, ns in axis_to_nsplits.items()}
         rechunked_inputs = []
         for inp in inputs:
-            inp = yield from cls._safe_rechunk(inp, ax_nsplit)
+            inp_ax_nsplit = {ax: ns for ax, ns in ax_nsplit.items() if ax < inp.ndim}
+            inp = yield from cls._safe_rechunk(inp, inp_ax_nsplit)
             rechunked_inputs.append(inp)
         inputs = rechunked_inputs
 
@@ -317,6 +318,7 @@ class LearnShuffle(MapReduceOperand, LearnOperandMixin):
                             if reduce_sizes[j] > 1
                         ),
                         reduce_sizes=reduce_sizes_,
+                        n_reducers=len(map_chunks),
                     )
                     params = cls._calc_chunk_params(
                         c, inp_axes, inp.chunk_shape, oup, output_type, chunk_op, False
@@ -399,12 +401,12 @@ class LearnShuffle(MapReduceOperand, LearnOperandMixin):
             for ax, to_hash_ind in zip(axes, to_hash_inds):
                 slc = (slice(None),) * ax + (to_hash_ind == index[ax],)
                 selected = _safe_slice(selected, slc, op.output_types[0])
-            ctx[out.key, tuple(index)] = selected
+            ctx[out.key, tuple(index)] = (ctx.get_current_chunk().index, selected)
 
     @classmethod
     def execute_reduce(cls, ctx, op: "LearnShuffle"):
         inputs_grid = np.empty(op.reduce_sizes, dtype=object)
-        for input_index, inp in op.iter_mapper_data_with_index(ctx):
+        for input_index, inp in op.iter_mapper_data(ctx):
             reduce_index = tuple(input_index[ax] for ax in op.axes)
             inputs_grid[reduce_index] = inp
         ret = cls._concat_grid(inputs_grid, op.axes, op.output_types[0])
@@ -469,7 +471,7 @@ def shuffle(*arrays, **options):
     random_state = check_random_state(options.pop("random_state", None)).to_numpy()
     if options:
         raise TypeError(
-            "shuffle() got an unexpected " f"keyword argument {next(iter(options))}"
+            f"shuffle() got an unexpected keyword argument {next(iter(options))}"
         )
 
     max_ndim = max(ar.ndim for ar in arrays)

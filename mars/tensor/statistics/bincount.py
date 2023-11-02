@@ -82,7 +82,7 @@ class TensorBinCount(TensorMapReduceOperand, TensorOperandMixin):
             raise ValueError("The weights and list don't have the same length.")
 
         input_max = yield from recursive_tile(a.max())
-        yield input_max.chunks
+        yield input_max.chunks + [c for inp in op.inputs for c in inp.chunks]
         [max_val] = ctx.get_chunks_result([input_max.chunks[0].key])
         tileable_right_bound = max(op.minlength, int(max_val) + 1)
 
@@ -118,7 +118,7 @@ class TensorBinCount(TensorMapReduceOperand, TensorOperandMixin):
                     dtype=out.dtype,
                     shape=(np.nan,),
                     index=a_chunk.index,
-                    index_value=parse_index(pd.Int64Index([0]), a_chunk.key),
+                    index_value=parse_index(pd.Index([0], dtype=np.int64), a_chunk.key),
                 )
             )
 
@@ -134,6 +134,8 @@ class TensorBinCount(TensorMapReduceOperand, TensorOperandMixin):
 
             new_op = op.copy().reset_key()
             new_op.stage = OperandStage.reduce
+            new_op.reducer_ordinal = chunk_idx
+            new_op.n_reducers = chunk_count
             new_op.chunk_count = chunk_count
             new_op.tileable_right_bound = tileable_right_bound
 
@@ -179,17 +181,17 @@ class TensorBinCount(TensorMapReduceOperand, TensorOperandMixin):
             sliced = res.iloc[left_bound:right_bound]
             if len(sliced) > 0:
                 ctx[op.outputs[0].key, (target_idx,)] = sliced
+            else:
+                # ensure all mapper data are inserted context
+                ctx[op.outputs[0].key, (target_idx,)] = None
             left_bound = right_bound
 
     @classmethod
     def _execute_reduce(cls, ctx, op: "TensorBinCount"):
         out = op.outputs[0]
-        input_list = []
-        for input_key in op.inputs[0].op.source_keys:
-            sliced = ctx.get((input_key, out.index))
-            if sliced is not None:
-                input_list.append(sliced)
-
+        input_list = list(
+            d for d in op.iter_mapper_data(ctx, skip_none=True) if d is not None
+        )
         left_bound = op.chunk_size_limit * out.index[0]
         right_bound = min(left_bound + op.chunk_size_limit, op.tileable_right_bound)
         if not input_list:

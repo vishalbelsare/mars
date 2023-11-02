@@ -22,8 +22,9 @@ try:
 except ImportError:  # pragma: no cover
     UFuncTypeError = None
 
+from ...metrics import Metrics
 from ...typing import TileableType, ChunkType, OperandType
-from ...utils import calc_data_size, tokenize
+from ...utils import calc_data_size
 from ..context import Context
 from ..mode import is_eager_mode
 from ..entity import (
@@ -39,6 +40,11 @@ _op_type_to_executor: Dict[Type[OperandType], Callable] = dict()
 _op_type_to_size_estimator: Dict[Type[OperandType], Callable] = dict()
 
 
+op_executed_number = Metrics.counter(
+    "mars.operand.executed_number", "The number of executed operands.", ("op",)
+)
+
+
 class TileableOperandMixin:
     __slots__ = ()
 
@@ -46,16 +52,12 @@ class TileableOperandMixin:
         if not inputs:
             return
 
-        from ...dataframe.core import DATAFRAME_TYPE
-
         for inp in inputs:
-            if isinstance(inp, DATAFRAME_TYPE):
-                dtypes = getattr(inp, "dtypes", None)
-                if dtypes is None:
-                    raise ValueError(
-                        f"{inp} has unknown dtypes, "
-                        f"it must be executed first before {str(type(self))}"
-                    )
+            if inp is not None and inp._need_execution():
+                raise ValueError(
+                    f"{inp} has unknown dtypes, "
+                    f"it must be executed first before {str(type(self))}"
+                )
 
     @classmethod
     def _check_if_gpu(cls, inputs: List[TileableType]):
@@ -74,7 +76,7 @@ class TileableOperandMixin:
         return None
 
     def _tokenize_output(self, output_idx: int, **kw):
-        return tokenize(self._key, output_idx)
+        return f"{self._key}_{output_idx}"
 
     def _create_chunk(self, output_idx: int, index: Tuple[int], **kw) -> ChunkType:
         output_type = kw.pop("output_type", None) or self._get_output_type(output_idx)
@@ -99,22 +101,22 @@ class TileableOperandMixin:
         return chunk_type(data)
 
     def _new_chunks(
-        self, inputs: List[ChunkType], kws: dict = None, **kw
+        self, inputs: List[ChunkType], kws: List[Dict] = None, **kw
     ) -> List[ChunkType]:
         output_limit = kw.pop("output_limit", None)
         if output_limit is None:
-            output_limit = getattr(self, "output_limit")
-
-        self.check_inputs(inputs)
-        getattr(self, "_set_inputs")(inputs)
-        if getattr(self, "gpu", None) is None:
-            self.gpu = self._check_if_gpu(self._inputs)
-        if getattr(self, "_key", None) is None:
-            getattr(self, "_update_key")()
-
-        chunks = []
+            output_limit = self.output_limit
         if isinstance(output_limit, float) and kws:
             output_limit = len(kws)
+
+        self.check_inputs(inputs)
+        self._set_inputs(inputs)
+        if self.gpu is None:
+            self.gpu = self._check_if_gpu(self._inputs)
+        if self._key is None:
+            self._update_key()
+
+        chunks = []
         for j in range(output_limit):
             create_chunk_kw = kw.copy()
             if kws:
@@ -123,7 +125,7 @@ class TileableOperandMixin:
             chunk = self._create_chunk(j, index, **create_chunk_kw)
             chunks.append(chunk)
 
-        setattr(self, "outputs", chunks)
+        self.outputs = chunks
         if len(chunks) > 1:
             # for each output chunk, hold the reference to the other outputs
             # so that either no one or everyone are gc collected
@@ -132,7 +134,7 @@ class TileableOperandMixin:
         return chunks
 
     def new_chunks(
-        self, inputs: List[ChunkType], kws: dict = None, **kwargs
+        self, inputs: List[ChunkType], kws: List[Dict] = None, **kwargs
     ) -> List[ChunkType]:
         """
         Create chunks.
@@ -162,7 +164,9 @@ class TileableOperandMixin:
         """
         return self._new_chunks(inputs, kws=kws, **kwargs)
 
-    def new_chunk(self, inputs: List[ChunkType], kws: dict = None, **kw) -> ChunkType:
+    def new_chunk(
+        self, inputs: List[ChunkType], kws: List[Dict] = None, **kw
+    ) -> ChunkType:
         if getattr(self, "output_limit") != 1:
             raise TypeError("cannot new chunk with more than 1 outputs")
 
@@ -274,7 +278,7 @@ class TileableOperandMixin:
         return tileables
 
     def new_tileable(
-        self, inputs: List[TileableType], kws: dict = None, **kw
+        self, inputs: List[TileableType], kws: List[Dict] = None, **kw
     ) -> TileableType:
         if getattr(self, "output_limit") != 1:
             raise TypeError("cannot new chunk with more than 1 outputs")
@@ -486,6 +490,11 @@ def execute(results: Dict[str, Any], op: OperandType):
             try:
                 result = executor(results, op)
                 succeeded = True
+                if op.stage is not None:
+                    op_name = f"{op.__class__.__name__}:{op.stage.name}"
+                else:
+                    op_name = op.__class__.__name__
+                op_executed_number.record(1, {"op": op_name})
                 return result
             except UFuncTypeError as e:  # pragma: no cover
                 raise TypeError(str(e)).with_traceback(sys.exc_info()[2]) from None
@@ -517,4 +526,4 @@ def estimate_size(results: Dict[str, Any], op: OperandType):
                 size_estimator = _op_type_to_size_estimator[op_cls]
                 _op_type_to_size_estimator[type(op)] = size_estimator
                 return size_estimator(results, op)
-        raise KeyError(f"No handler found for op: " f"{op} to estimate size")
+        raise KeyError(f"No handler found for op: {op} to estimate size")

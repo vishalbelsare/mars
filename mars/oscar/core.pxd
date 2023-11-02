@@ -18,8 +18,11 @@ cdef class ActorRef:
     cdef public str address
     cdef public object uid
     cdef dict _methods
-    cdef __send__(self, object message)
-    cdef __tell__(self, object message, object delay=*)
+
+
+cdef class LocalActorRef(ActorRef):
+    cdef object _actor_weakref
+    cdef _weakref_local_actor(self)
 
 
 cdef class _BaseActor:

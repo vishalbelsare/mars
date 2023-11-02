@@ -23,7 +23,6 @@ from sklearn.utils.extmath import fast_logdet
 
 from ... import tensor as mt
 from ... import remote as mr
-from ...core import ENTITY_TYPE
 from ...tensor.array_utils import get_array_module
 from ...tensor.core import TENSOR_TYPE
 from ...tensor.utils import check_random_state
@@ -114,8 +113,6 @@ def _infer_dimension(spectrum, n_samples):
 
     The returned value will be in [1, n_features - 1].
     """
-    if isinstance(spectrum, ENTITY_TYPE):
-        spectrum = spectrum.fetch()
     xp = get_array_module(spectrum, nosparse=True)
 
     ll = xp.empty_like(spectrum)
@@ -446,7 +443,7 @@ class PCA(_BasePCA):
         if n_components == "mle":
             if n_samples < n_features:
                 raise ValueError(
-                    "n_components='mle' is only supported " "if n_samples >= n_features"
+                    "n_components='mle' is only supported if n_samples >= n_features"
                 )
         elif not 0 <= n_components <= min(n_samples, n_features):
             raise ValueError(
@@ -473,7 +470,7 @@ class PCA(_BasePCA):
         components_ = V
 
         # Get variance explained by singular values
-        explained_variance_ = (S ** 2) / (n_samples - 1)
+        explained_variance_ = (S**2) / (n_samples - 1)
         total_var = explained_variance_.sum()
         explained_variance_ratio_ = explained_variance_ / total_var
         singular_values_ = S.copy()  # Store the singular values.
@@ -481,7 +478,9 @@ class PCA(_BasePCA):
         # Postprocess the number of components required
         if n_components == "mle":
             n_components = mr.spawn(
-                _infer_dimension, args=(explained_variance_, n_samples)
+                _infer_dimension,
+                args=(explained_variance_, n_samples),
+                resolve_tileable_input=True,
             )
             ExecutableTuple([n_components, U, V]).execute(
                 session=session, **(run_kwargs or dict())
@@ -576,7 +575,7 @@ class PCA(_BasePCA):
         self.n_components_ = n_components
 
         # Get variance explained by singular values
-        self.explained_variance_ = (S ** 2) / (n_samples - 1)
+        self.explained_variance_ = (S**2) / (n_samples - 1)
         total_var = mt.var(X, ddof=1, axis=0)
         self.explained_variance_ratio_ = self.explained_variance_ / total_var.sum()
         self.singular_values_ = S.copy()  # Store the singular values.

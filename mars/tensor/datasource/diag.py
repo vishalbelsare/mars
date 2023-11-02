@@ -42,7 +42,7 @@ def _get_diag_shape(v_shape, k):
     return (size,)
 
 
-class TensorDiagBase(object):
+class TensorDiagBase:
     __slots__ = ()
 
     def to_chunk_op(self, *args):
@@ -84,7 +84,13 @@ class TensorDiagBase(object):
             chunk_shape = (nsplits[0][i], nsplits[1][j])
             if (ld_fx > 0 and ru_fx > 0) or (ld_fx < 0 and ru_fx < 0):
                 # does not cross, fill with zeros
-                chunk_op = TensorZeros(dtype=op.dtype, gpu=op.gpu, sparse=op.sparse)
+                chunk_op = TensorZeros(
+                    dtype=op.dtype,
+                    gpu=op.gpu,
+                    sparse=op.sparse,
+                    shape=chunk_shape,
+                    order=tensor.order.value,
+                )
                 chunk = chunk_op.new_chunk(None, shape=chunk_shape, index=out_idx)
             else:
                 lu_pos = ru_pos[0], ld_pos[1]
@@ -134,9 +140,7 @@ class TensorDiag(TensorDiagBase, TensorHasInput):
     def _get_chunk(cls, op, chunk_k, chunk_shape, chunk_idx):
         assert chunk_shape[0] == chunk_shape[1]
         input_idx = chunk_idx[1] if op.k < 0 else chunk_idx[0]
-        input_chunk = op.inputs[0].cix[
-            input_idx,
-        ]
+        input_chunk = op.inputs[0].cix[input_idx,]
         op = TensorDiag(k=chunk_k, dtype=op.dtype, gpu=op.gpu, sparse=op.sparse)
         return op.new_chunk([input_chunk], shape=chunk_shape, index=chunk_idx)
 
@@ -208,7 +212,7 @@ class TensorDiag(TensorDiagBase, TensorHasInput):
             ctx[chunk.key] = create_array(op)("diag", ctx[op.inputs[0].key], k=op.k)
 
 
-def diag(v, k=0, sparse=None, gpu=False, chunk_size=None):
+def diag(v, k=0, sparse=None, gpu=None, chunk_size=None):
     """
     Extract a diagonal or construct a diagonal tensor.
 

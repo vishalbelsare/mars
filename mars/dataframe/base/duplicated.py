@@ -93,8 +93,8 @@ class DataFrameDuplicated(DuplicateOperand):
     def _gen_intermediate_chunk_params(cls, op: "DataFrameDuplicated", input_chunk):
         inp = op.input
         chunk_params = dict()
-        chunk_params["index"] = input_chunk.index[:1] + (0,) * (inp.ndim - 1)
         chunk_params["shape"] = shape = cls._get_intermediate_shape(input_chunk.shape)
+        chunk_params["index"] = input_chunk.index[:1] + (0,) * (len(shape) - 1)
         chunk_params["index_value"] = gen_unknown_index_value(
             input_chunk.index_value, input_chunk
         )
@@ -148,7 +148,7 @@ class DataFrameDuplicated(DuplicateOperand):
         duplicated = cls._duplicated(inp, op)
         if not duplicated.name:
             duplicated.name = "_duplicated_"
-        result.iloc[duplicated] = None
+        result.iloc[duplicated.values] = None
         result = xdf.concat([result, duplicated], axis=1)
         ctx[op.outputs[0].key] = result
 
@@ -156,11 +156,12 @@ class DataFrameDuplicated(DuplicateOperand):
     def _execute_tree_combine(cls, ctx, op):
         inp = ctx[op.input.key]
         result = inp.copy()
-        duplicates = inp[~inp.iloc[:, -1]]
+        duplicated_filter = ~inp.iloc[:, -1]
+        duplicates = inp.loc[duplicated_filter]
         dup_on_duplicated = cls._duplicated(duplicates, op)
-        result.iloc[~inp.iloc[:, -1], -1] = dup_on_duplicated
+        result.iloc[duplicated_filter.to_numpy().nonzero()[0], -1] = dup_on_duplicated
         duplicated = result.iloc[:, -1]
-        result.iloc[duplicated, :-1] = None
+        result.iloc[duplicated.values, :-1] = None
         ctx[op.outputs[0].key] = result
 
     @classmethod
@@ -426,7 +427,7 @@ def series_duplicated(series, keep="first", method="auto"):
 
     >>> import mars.dataframe as md
 
-    >>> animals = md.Series(['lama', 'cow', 'lama', 'beetle', 'lama'])
+    >>> animals = md.Series(['lame', 'cow', 'lame', 'beetle', 'lame'])
     >>> animals.duplicated().execute()
     0    False
     1    False
@@ -468,7 +469,7 @@ def series_duplicated(series, keep="first", method="auto"):
     """
     if method not in ("auto", "tree", "shuffle", None):
         raise ValueError(
-            "method could only be one of " "'auto', 'tree', 'shuffle' or None"
+            "method could only be one of 'auto', 'tree', 'shuffle' or None"
         )
     op = DataFrameDuplicated(keep=keep, method=method)
     return op(series)
@@ -509,7 +510,7 @@ def index_duplicated(index, keep="first"):
 
     >>> import mars.dataframe as md
 
-    >>> idx = md.Index(['lama', 'cow', 'lama', 'beetle', 'lama'])
+    >>> idx = md.Index(['lame', 'cow', 'lame', 'beetle', 'lame'])
     >>> idx.duplicated().execute()
     array([False, False,  True, False,  True])
 

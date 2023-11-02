@@ -17,17 +17,15 @@ import numpy as np
 
 from ... import opcodes as OperandDef
 from ...core.operand.base import SchedulingHint
-from ...serialization.serializables import KeyField, StringField
+from ...serialization.serializables import FieldTypes, KeyField, StringField, TupleField
 from ...storage.base import StorageLevel
+from ...utils import lazy_import
 from ..datasource import tensor as astensor
 from .core import TensorDataStore
 
-try:
-    import vineyard
-    from vineyard.data.tensor import make_global_tensor
-    from vineyard.data.utils import to_json
-except ImportError:
-    vineyard = None
+vineyard = lazy_import("vineyard")
+vy_data_tensor = lazy_import("vineyard.data.tensor", rename="vy_data_tensor")
+vy_data_utils = lazy_import("vineyard.data.utils", rename="vy_data_utils")
 
 
 def resolve_vineyard_socket(ctx, op) -> Tuple[str, bool]:
@@ -52,6 +50,9 @@ class TensorVineyardDataStoreChunk(TensorDataStore):
     # vineyard ipc socket
     vineyard_socket = StringField("vineyard_socket")
 
+    # a dummy attr to make sure ops have different keys
+    operator_index = TupleField("operator_index", FieldTypes.int32)
+
     def __init__(self, vineyard_socket=None, **kw):
         super().__init__(vineyard_socket=vineyard_socket, **kw)
 
@@ -71,6 +72,7 @@ class TensorVineyardDataStoreChunk(TensorDataStore):
         for idx, chunk in enumerate(op.inputs[0].chunks):
             chunk_op = op.copy().reset_key()
             chunk_op.scheduling_hint = scheduling_hint
+            chunk_op.operator_index = chunk.index
             out_chunk = chunk_op.new_chunk(
                 [chunk], dtype=np.dtype("O"), shape=(1,), index=(idx,)
             )
@@ -105,7 +107,7 @@ class TensorVineyardDataStoreChunk(TensorDataStore):
                 needs_put = True
         if needs_put:
             tensor_id = client.put(
-                ctx[op.inputs[0].key], partition_index=op.inputs[0].index
+                np.asarray(ctx[op.inputs[0].key]), partition_index=op.inputs[0].index
             )
         else:  # pragma: no cover
             meta = client.get_meta(tensor_id)
@@ -116,7 +118,7 @@ class TensorVineyardDataStoreChunk(TensorDataStore):
                         new_meta.add_member(k, v)
                     else:
                         new_meta[k] = v
-            new_meta["partition_index_"] = to_json(op.inputs[0].index)
+            new_meta["partition_index_"] = vy_data_utils.to_json(op.inputs[0].index)
             tensor_id = client.create_metadata(new_meta).id
 
         client.persist(tensor_id)
@@ -135,7 +137,7 @@ class TensorVineyardDataStoreMeta(TensorDataStore):
 
     def __init__(self, vineyard_socket=None, dtype=None, sparse=None, **kw):
         super().__init__(
-            vineyard_socket=vineyard_socket, _dtype=dtype, _sparse=sparse, **kw
+            vineyard_socket=vineyard_socket, dtype=dtype, sparse=sparse, **kw
         )
 
     @classmethod
@@ -164,7 +166,7 @@ class TensorVineyardDataStoreMeta(TensorDataStore):
         # # store the result object id to execution context
         chunks = [ctx[chunk.key][0] for chunk in op.inputs]
         holder = np.empty((1,), dtype=object)
-        holder[0] = make_global_tensor(client, chunks).id
+        holder[0] = vy_data_tensor.make_global_tensor(client, chunks).id
         ctx[op.outputs[0].key] = holder
 
 

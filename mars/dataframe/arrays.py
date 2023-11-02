@@ -51,13 +51,23 @@ try:
 except ImportError:  # pragma: no cover
     pa = None
     pa_null = None
+try:
+    import pyarrow.compute as pc
+except ImportError:  # pragma: no cover
+    pc = None
 
 from ..config import options
 from ..core import is_kernel_mode
-from ..lib.version import parse as parse_version
-from ..utils import tokenize
+from ..utils import pd_release_version, tokenize
 
-_use_bool_any_all = parse_version(pd.__version__) >= parse_version("1.3.0")
+_use_bool_any_all = pd_release_version[:2] >= (1, 3)
+_use_extension_index = pd_release_version[:2] >= (1, 4)
+_object_engine_for_string_array = pd_release_version[:2] >= (1, 5)
+
+if _object_engine_for_string_array:
+    StringArrayBase = type(StringArrayBase)(
+        "StringArrayBase", StringArrayBase.__bases__, dict(StringArrayBase.__dict__)
+    )
 
 
 class ArrowDtype(ExtensionDtype):
@@ -232,9 +242,7 @@ class ArrowArray(ExtensionArray):
             # just for infer dtypes purpose
             self._init_by_numpy(values, dtype=dtype, copy=copy)
         else:
-            raise ImportError(
-                "Cannot create ArrowArray " "when `pyarrow` not installed"
-            )
+            raise ImportError("Cannot create ArrowArray when `pyarrow` not installed")
 
         # for test purpose
         self._force_use_pandas = pandas_only
@@ -256,6 +264,8 @@ class ArrowArray(ExtensionArray):
             arrow_array = values
         elif isinstance(values, pa.Array):
             arrow_array = pa.chunked_array([values])
+        elif len(values) == 0:  # pragma: no cover
+            arrow_array = pa.chunked_array([pa.array([], type=dtype.arrow_type)])
         else:
             arrow_array = pa.chunked_array([pa.array(values, type=dtype.arrow_type)])
 
@@ -290,6 +300,12 @@ class ArrowArray(ExtensionArray):
     @property
     def _array(self):
         return self._arrow_array if self._use_arrow else self._ndarray
+
+    def __arrow_array__(self, type=None):
+        if self._use_arrow:
+            combined = self._arrow_array.combine_chunks()
+            return combined.cast(type) if type else combined
+        return super().__arrow_array__(type=type)
 
     @property
     def dtype(self) -> "Type[ArrowDtype]":
@@ -498,8 +514,14 @@ class ArrowArray(ExtensionArray):
         # try to slice 1 record to get the result dtype
         test_array = self._arrow_array.slice(0, 1).to_pandas()
         test_result_array = test_array.astype(dtype).array
+        if _use_extension_index:
+            test_result_type = type(test_array.astype(dtype).values)
+            if test_result_type is np.ndarray:
+                test_result_type = np.array
+        else:
+            test_result_type = type(test_result_array)
 
-        result_array = type(test_result_array)(
+        result_array = test_result_type(
             np.full(
                 self.shape,
                 test_result_array.dtype.na_value,
@@ -556,6 +578,11 @@ class ArrowArray(ExtensionArray):
             return type(self)(copy_obj(self._arrow_array))
         else:
             return type(self)(self._ndarray.copy())
+
+    def unique(self):
+        if self._force_use_pandas or not self._use_arrow or not hasattr(pc, "unique"):
+            return type(self)(np.unique(self.to_numpy()), dtype=self._dtype)
+        return type(self)(pc.unique(self._arrow_array), dtype=self._dtype)
 
     def value_counts(self, dropna=False):
         if self._use_arrow:

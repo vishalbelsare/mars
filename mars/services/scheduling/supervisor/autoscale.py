@@ -26,6 +26,7 @@ from ....typing import BandType
 from ....lib.aio import alru_cache
 from ...cluster.api import ClusterAPI
 from ...cluster.core import NodeRole, NodeStatus
+from ..errors import NoAvailableBand
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,9 @@ class AutoscalerActor(mo.Actor):
         self._autoscale_conf = autoscale_conf
         self._cluster_api = None
         self.queueing_refs = dict()
-        self.global_slot_ref = None
+        self.global_resource_ref = None
         self._dynamic_workers: Set[str] = set()
+        self._autoscale_in_disable_counter = 0
 
     async def __post_create__(self):
         strategy = self._autoscale_conf.get("strategy")
@@ -46,10 +48,10 @@ class AutoscalerActor(mo.Actor):
             strategy_cls = getattr(importlib.import_module(module), name)
         else:
             strategy_cls = PendingTaskBacklogStrategy
-        from ..supervisor import GlobalSlotManagerActor
+        from ..supervisor import GlobalResourceManagerActor
 
-        self.global_slot_ref = await mo.actor_ref(
-            GlobalSlotManagerActor.default_uid(), address=self.address
+        self.global_resource_ref = await mo.actor_ref(
+            GlobalResourceManagerActor.default_uid(), address=self.address
         )
         self._cluster_api = await ClusterAPI.create(self.address)
         self._strategy = await strategy_cls.create(self._autoscale_conf, self)
@@ -80,7 +82,7 @@ class AutoscalerActor(mo.Actor):
         )
         if worker_address:
             self._dynamic_workers.add(worker_address)
-            logger.info(
+            logger.warning(
                 "Requested new worker %s in %.4f seconds, current dynamic worker nums is %s",
                 worker_address,
                 time.time() - start_time,
@@ -94,19 +96,33 @@ class AutoscalerActor(mo.Actor):
                 time.time() - start_time,
             )
 
-    async def release_workers(self, addresses: List[str]):
+    async def disable_autoscale_in(self):
+        self._autoscale_in_disable_counter += 1
+        if self._enabled:
+            logger.info("Disabled autoscale_in")
+
+    async def try_enable_autoscale_in(self):
+        self._autoscale_in_disable_counter -= 1
+        if self._autoscale_in_disable_counter == 0 and self._enabled:
+            logger.info("Enabled autoscale_in")
+
+    async def release_workers(self, addresses: List[str]) -> List[str]:
         """
         Release a group of worker nodes.
         Parameters
         ----------
         addresses : List[str]
-            The addresses of the specified noded.
+            The addresses of the specified node.
         """
+        if self._autoscale_in_disable_counter > 0:
+            return []
         workers_bands = {
             address: await self.get_worker_bands(address) for address in addresses
         }
         logger.info(
-            "Start to release workers %s which have bands %s.", addresses, workers_bands
+            "Start to release workers %s which have bands %s.",
+            addresses,
+            workers_bands,
         )
         for address in addresses:
             await self._cluster_api.set_node_status(
@@ -114,21 +130,28 @@ class AutoscalerActor(mo.Actor):
             )
         # Ensure global_slot_manager get latest bands timely, so that we can invoke `wait_band_idle`
         # to ensure there won't be new tasks scheduled to the stopping worker.
-        await self.global_slot_ref.refresh_bands()
+        await self.global_resource_ref.refresh_bands()
         excluded_bands = set(b for bands in workers_bands.values() for b in bands)
 
         async def release_worker(address):
             logger.info("Start to release worker %s.", address)
             worker_bands = workers_bands[address]
             await asyncio.gather(
-                *[self.global_slot_ref.wait_band_idle(band) for band in worker_bands]
+                *[
+                    self.global_resource_ref.wait_band_idle(band)
+                    for band in worker_bands
+                ]
             )
             await self._migrate_data_of_bands(worker_bands, excluded_bands)
             await self._cluster_api.release_worker(address)
             self._dynamic_workers.remove(address)
             logger.info("Released worker %s.", address)
 
-        await asyncio.gather(*[release_worker(address) for address in addresses])
+        # Release workers one by one to ensure others workers which the current is moving data to
+        # is not being releasing.
+        for address in addresses:
+            await release_worker(address)
+        return addresses
 
     def get_dynamic_workers(self) -> Set[str]:
         return self._dynamic_workers
@@ -211,7 +234,7 @@ class AutoscalerActor(mo.Actor):
             if (b[1] == band[1] and b != band and b not in excluded_bands)
         )
         if not bands:  # pragma: no cover
-            raise RuntimeError(
+            raise NoAvailableBand(
                 f"No bands to migrate data to, "
                 f"all available bands is {all_bands}, "
                 f"current band is {band}, "
@@ -323,7 +346,7 @@ class PendingTaskBacklogStrategy(AbstractScaleStrategy):
         while any(
             [await queueing_ref.all_bands_busy() for queueing_ref in queueing_refs]
         ):
-            worker_num = 2 ** rnd
+            worker_num = 2**rnd
             if (
                 self._autoscaler.get_dynamic_worker_nums() + worker_num
                 > self._max_workers
@@ -353,7 +376,7 @@ class PendingTaskBacklogStrategy(AbstractScaleStrategy):
 
     async def _scale_in(self):
         idle_bands = set(
-            await self._autoscaler.global_slot_ref.get_idle_bands(
+            await self._autoscaler.global_resource_ref.get_idle_bands(
                 self._worker_idle_timeout
             )
         )
@@ -397,14 +420,21 @@ class PendingTaskBacklogStrategy(AbstractScaleStrategy):
                 worker_addresses,
                 idle_bands,
             )
-            # Release workers one by one to ensure others workers which the current is moving data to
-            # is not being releasing.
-            await self._autoscaler.release_workers(worker_addresses)
-            logger.info(
-                "Finished offline workers %s in %.4f seconds",
-                worker_addresses,
-                time.time() - start_time,
-            )
+            try:
+                worker_addresses = await self._autoscaler.release_workers(
+                    worker_addresses
+                )
+                logger.info(
+                    "Finished offline workers %s in %.4f seconds",
+                    worker_addresses,
+                    time.time() - start_time,
+                )
+            except NoAvailableBand as e:  # pragma: no cover
+                logger.warning(
+                    "No enough bands, offline workers %s failed with exception %s.",
+                    worker_addresses,
+                    e,
+                )
 
     async def stop(self):
         self._task.cancel()

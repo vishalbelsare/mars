@@ -68,7 +68,7 @@ class IndexDataSource(DataFrameOperand, DataFrameOperandMixin):
         elif hasattr(inp, "index_value"):
             # get index from Mars DataFrame, Series or Index
             name = name if name is not None else inp.index_value.name
-            names = names if names is not None else [name]
+            names = names if names is not None else inp.index_value.names
             if inp.index_value.has_value():
                 self.data = data = inp.index_value.to_pandas()
                 return self.new_index(
@@ -240,7 +240,7 @@ class IndexDataSource(DataFrameOperand, DataFrameOperandMixin):
         else:
             out = op.outputs[0]
             inp = ctx[op.inputs[0].key]
-            dtype = out.dtype if out.dtype != np.object else None
+            dtype = out.dtype if out.dtype != object else None
             if hasattr(inp, "index"):
                 # DataFrame, Series
                 ctx[out.key] = pd.Index(inp.index, dtype=dtype, name=out.name)
@@ -248,7 +248,7 @@ class IndexDataSource(DataFrameOperand, DataFrameOperandMixin):
                 ctx[out.key] = pd.Index(inp, dtype=dtype, name=out.name)
 
 
-def from_pandas(data, chunk_size=None, gpu=False, sparse=False, store_data=False):
+def from_pandas(data, chunk_size=None, gpu=None, sparse=False, store_data=False):
     op = IndexDataSource(
         data=data, gpu=gpu, sparse=sparse, dtype=data.dtype, store_data=store_data
     )

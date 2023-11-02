@@ -19,6 +19,7 @@ from typing import Dict, List
 
 from ... import oscar as mo
 from ...lib.aio import alru_cache
+from ...resource import Resource
 from ...storage import StorageLevel
 from ...typing import BandType
 from .core import NodeInfo, NodeStatus, WorkerSlotInfo, QuotaInfo, DiskInfo, StorageInfo
@@ -35,11 +36,11 @@ class NodeInfoUploaderActor(mo.Actor):
     _disk_infos: List[DiskInfo]
     _band_storage_infos: Dict[str, Dict[StorageLevel, StorageInfo]]
 
-    def __init__(self, role=None, interval=None, band_to_slots=None, use_gpu=True):
+    def __init__(self, role=None, interval=None, band_to_resource=None, use_gpu=True):
         self._info = NodeInfo(role=role)
 
         self._env_uploaded = False
-        self._band_to_slots = band_to_slots
+        self._band_to_resource = band_to_resource
 
         self._interval = interval or DEFAULT_INFO_UPLOAD_INTERVAL
         self._upload_task = None
@@ -87,7 +88,9 @@ class NodeInfoUploaderActor(mo.Actor):
                     self._uploaded_future.set_result(None)
             except asyncio.CancelledError:  # pragma: no cover
                 break
-            except Exception as ex:  # pragma: no cover  # noqa: E722  # nosec  # pylint: disable=bare-except
+            except (
+                Exception
+            ) as ex:  # pragma: no cover  # noqa: E722  # nosec  # pylint: disable=bare-except
                 logger.error(f"Failed to upload node info: {ex}")
                 if not self._uploaded_future.done():
                     self._uploaded_future.set_exception(ex)
@@ -98,8 +101,15 @@ class NodeInfoUploaderActor(mo.Actor):
 
     async def mark_node_ready(self):
         self._upload_enabled = True
-        # upload info in time to reduce latency
-        await self.upload_node_info(status=NodeStatus.READY)
+
+        while True:
+            try:
+                # upload info in time to reduce latency
+                await self.upload_node_info(status=NodeStatus.READY)
+                break
+            except (mo.ActorNotExist, ConnectionError):  # pragma: no cover
+                await asyncio.sleep(1)
+
         self._node_ready_event.set()
 
     def is_node_ready(self):
@@ -123,7 +133,7 @@ class NodeInfoUploaderActor(mo.Actor):
             )
 
             band_resources = await asyncio.to_thread(
-                gather_node_resource, self._band_to_slots, use_gpu=self._use_gpu
+                gather_node_resource, self._band_to_resource, use_gpu=self._use_gpu
             )
 
             for band, res in band_resources.items():
@@ -154,15 +164,19 @@ class NodeInfoUploaderActor(mo.Actor):
             raise
 
     def get_bands(self) -> Dict[BandType, int]:
-        band_slots = dict()
+        band_resource = dict()
         for resource_type, info in self._info.resource.items():
             if resource_type.startswith("numa"):
                 # cpu
-                band_slots[(self.address, resource_type)] = info["cpu_total"]
+                band_resource[(self.address, resource_type)] = Resource(
+                    num_cpus=info["cpu_total"], mem_bytes=info["memory_total"]
+                )
             else:  # pragma: no cover
                 assert resource_type.startswith("gpu")
-                band_slots[(self.address, resource_type)] = info["gpu_total"]
-        return band_slots
+                band_resource[(self.address, resource_type)] = Resource(
+                    num_gpus=info["gpu_total"]
+                )
+        return band_resource
 
     def set_node_disk_info(self, node_disk_info: List[DiskInfo]):
         self._disk_infos = node_disk_info

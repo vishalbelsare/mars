@@ -90,7 +90,7 @@ def floor_divide(a, b, **_):
 
 def power(a, b, **_):
     try:
-        return a ** b
+        return a**b
     except TypeError:
         if hasattr(b, "__rpow__"):
             return b.__rpow__(a)
@@ -265,6 +265,14 @@ kl_div = partial(_call_bin, "kl_div")
 xlogy = partial(_call_bin, "xlogy")
 
 erf = partial(_call_unary, "erf")
+erfc = partial(_call_unary, "erfc")
+erfcx = partial(_call_unary, "erfcx")
+erfi = partial(_call_unary, "erfi")
+erfinv = partial(_call_unary, "erfinv")
+erfcinv = partial(_call_unary, "erfcinv")
+wofz = partial(_call_unary, "wofz")
+dawsn = partial(_call_unary, "dawsn")
+voigt_profile = partial(call_sparse, "voigt_profile")
 
 jv = partial(_call_bin, "jv")
 jve = partial(_call_bin, "jve")
@@ -285,6 +293,25 @@ hyp2f1 = partial(call_sparse, "hyp2f1")
 hyp1f1 = partial(call_sparse, "hyp1f1")
 hyperu = partial(call_sparse, "hyperu")
 hyp0f1 = partial(_call_bin, "hyp0f1")
+
+ellip_harm = partial(call_sparse, "ellip_harm")
+ellip_harm_2 = partial(call_sparse, "ellip_harm_2")
+ellip_normal = partial(call_sparse, "ellip_normal")
+
+ellipk = partial(_call_unary, "ellipk")
+ellipkm1 = partial(_call_unary, "ellipkm1")
+ellipkinc = partial(_call_bin, "ellipkinc")
+ellipe = partial(_call_unary, "ellipe")
+ellipeinc = partial(_call_bin, "ellipeinc")
+elliprc = partial(_call_bin, "elliprc")
+elliprd = partial(call_sparse, "elliprd")
+elliprf = partial(call_sparse, "elliprf")
+elliprg = partial(call_sparse, "elliprg")
+elliprj = partial(call_sparse, "elliprj")
+
+airy = partial(_call_unary, "airy")
+airye = partial(_call_unary, "airye")
+itairy = partial(_call_unary, "itairy")
 
 
 def equal(a, b, **_):
@@ -727,6 +754,10 @@ def isreal(x, **kw):
     return _call_unary("isreal", x, **kw)
 
 
+def isfortran(x, **kw):
+    return call_sparse("isfortran", x, **kw)
+
+
 def where(cond, x, y):
     if any([i.ndim not in (0, 2) for i in (cond, x, y)]):
         raise NotImplementedError
@@ -816,3 +847,15 @@ def solve_triangular(a, b, lower=False, sparse=True):
     from .matrix import solve_triangular_sparse_matrix
 
     return solve_triangular_sparse_matrix(a, b, lower=lower, sparse=sparse)
+
+
+def block(arrs):
+    arr = arrs[0]
+    while isinstance(arr, list):
+        arr = arr[0]
+    if arr.ndim != 2:  # pragma: no cover
+        raise NotImplementedError
+
+    from .matrix import block
+
+    return block(arrs)

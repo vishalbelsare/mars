@@ -211,8 +211,19 @@ class LGBMTrain(MergeDictOperand):
     @staticmethod
     def _get_data_chunks_workers(ctx, data):
         # data_chunk.inputs is concat, and concat's input is the co-allocated chunks
-        metas = ctx.get_chunks_meta([c.key for c in data.chunks], fields=["bands"])
-        return [m["bands"][0][0] for m in metas]
+        metas = ctx.get_chunks_meta(
+            [c.key for c in data.chunks], fields=["ip", "bands"]
+        )
+
+        ips = []
+        ip_to_worker = {}
+        for m in metas:
+            ip = m["ip"]
+            assert ip, "There is meta {meta} who doesn't contain ip."
+            ips.append(ip)
+            bands = m["bands"]
+            ip_to_worker[ip] = bands[0][0] if bands else None
+        return ips, ip_to_worker
 
     @staticmethod
     def _concat_chunks_by_worker(chunks, chunk_workers):
@@ -230,23 +241,24 @@ class LGBMTrain(MergeDictOperand):
         data = op.data
         worker_to_args = defaultdict(dict)
 
-        workers = cls._get_data_chunks_workers(ctx, data)
+        # Note: Mars worker is band address, and LGBMTrain worker is machine ip.
+        ips, ip_to_worker = cls._get_data_chunks_workers(ctx, data)
 
         for arg in ["_data", "_label", "_sample_weight", "_init_score"]:
             if getattr(op, arg) is not None:
                 for worker, chunk in cls._concat_chunks_by_worker(
-                    getattr(op, arg).chunks, workers
+                    getattr(op, arg).chunks, ips
                 ).items():
                     worker_to_args[worker][arg] = chunk
 
         if op.eval_datas:
             eval_workers_list = [
-                cls._get_data_chunks_workers(ctx, d) for d in op.eval_datas
+                cls._get_data_chunks_workers(ctx, d)[0] for d in op.eval_datas
             ]
             extra_workers = reduce(
                 operator.or_, (set(w) for w in eval_workers_list)
-            ) - set(workers)
-            worker_remap = dict(zip(extra_workers, itertools.cycle(workers)))
+            ) - set(ips)
+            worker_remap = dict(zip(extra_workers, itertools.cycle(ips)))
             if worker_remap:
                 eval_workers_list = [
                     [worker_remap.get(w, w) for w in wl] for wl in eval_workers_list
@@ -270,10 +282,11 @@ class LGBMTrain(MergeDictOperand):
                             worker_to_args[worker][arg].append(chunk)
 
         out_chunks = []
-        workers = list(set(workers))
-        for worker_id, worker in enumerate(workers):
+        ips = list(set(ips))
+        workers = list(ip_to_worker.values())
+        for worker_id, worker in enumerate(ips):
             chunk_op = op.copy().reset_key()
-            chunk_op.expect_worker = worker
+            chunk_op.expect_worker = ip_to_worker[worker]
 
             input_chunks = []
             concat_args = worker_to_args.get(worker, {})
@@ -301,7 +314,7 @@ class LGBMTrain(MergeDictOperand):
             ).chunks[0]
             input_chunks.append(worker_ports_chunk)
 
-            chunk_op._workers = workers
+            chunk_op._workers = ips
             chunk_op._worker_ports = worker_ports_chunk
             chunk_op._worker_id = worker_id
 
@@ -357,9 +370,8 @@ class LGBMTrain(MergeDictOperand):
         # if model is trained, remove unsupported parameters
         params.pop("out_dtype_", None)
         worker_ports = ctx[op.worker_ports.key]
-        worker_ips = [worker.split(":", 1)[0] for worker in op.workers]
         worker_endpoints = [
-            f"{worker}:{port}" for worker, port in zip(worker_ips, worker_ports)
+            f"{worker}:{port}" for worker, port in zip(op.workers, worker_ports)
         ]
 
         params["machines"] = ",".join(worker_endpoints)
@@ -394,11 +406,11 @@ class LGBMTrain(MergeDictOperand):
                 op.model_type == LGBMModelType.RANKER
                 or op.model_type == LGBMModelType.REGRESSOR
             ):
-                model.set_params(out_dtype_=np.dtype("float"))
+                model.set_params(out_dtype_=[np.dtype("float")])
             elif hasattr(label_val, "dtype"):
-                model.set_params(out_dtype_=label_val.dtype)
+                model.set_params(out_dtype_=[label_val.dtype])
             else:
-                model.set_params(out_dtype_=label_val.dtypes[0])
+                model.set_params(out_dtype_=[label_val.dtypes[0]])
 
             ctx[op.outputs[0].key] = pickle.dumps(model)
         finally:
@@ -436,7 +448,8 @@ def train(params, train_set, eval_sets=None, **kwargs):
         sample_weights.append(train_kw["sample_weight"])
         init_scores.append(train_kw["init_score"])
 
-    op = LGBMTrain(
+    train_cls = kwargs.pop("train_cls", LGBMTrain)
+    op = train_cls(
         params=params,
         data=datas[0],
         label=labels[0],
@@ -452,6 +465,10 @@ def train(params, train_set, eval_sets=None, **kwargs):
         kwds=kwargs,
     )
     ret = op().execute(session=session, **run_kwargs).fetch(session=session)
+    # Note: There may be multiple results if running on clusters, so we should
+    # combine the results if so.
+    if isinstance(ret, list):
+        ret = b"".join(ret)
 
     bst = pickle.loads(ret)
     evals_result.update(bst.evals_result_ or {})

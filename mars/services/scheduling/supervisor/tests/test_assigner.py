@@ -29,7 +29,7 @@ from ....meta import MockMetaAPI
 from ....session import MockSessionAPI
 from ....subtask import Subtask
 from ...supervisor import AssignerActor
-from ...errors import NoMatchingSlots
+from ...errors import NoMatchingSlots, NoAvailableBand
 
 
 class MockNodeInfoCollectorActor(NodeInfoCollectorActor):
@@ -81,7 +81,7 @@ class FakeClusterAPI(ClusterAPI):
                     NodeInfoUploaderActor,
                     NodeRole.WORKER,
                     interval=kw.get("upload_interval"),
-                    band_to_slots=kw.get("band_to_slots"),
+                    band_to_resource=kw.get("band_to_resource"),
                     use_gpu=kw.get("use_gpu", False),
                     uid=NodeInfoUploaderActor.default_uid(),
                     address=address,
@@ -119,9 +119,10 @@ async def actor_pool(request):
             address=pool.external_address,
         )
 
-        yield pool, session_id, assigner_ref, cluster_api, meta_api
-
-        await mo.destroy_actor(assigner_ref)
+        try:
+            yield pool, session_id, assigner_ref, cluster_api, meta_api
+        finally:
+            await mo.destroy_actor(assigner_ref)
 
 
 @pytest.mark.asyncio
@@ -178,11 +179,65 @@ async def test_assign_cpu_tasks(actor_pool):
     [result] = await assigner_ref.assign_subtasks([subtask])
     assert result in (("address0", "numa-0"), ("address2", "numa-0"))
 
+    [result] = await assigner_ref.assign_subtasks(
+        [subtask], exclude_bands={("address0", "numa-0"), ("address2", "numa-0")}
+    )
+    assert result in (("address0", "numa-0"), ("address2", "numa-0"))
+    [result] = await assigner_ref.assign_subtasks(
+        [subtask], exclude_bands={("address0", "numa-0")}, random_when_unavailable=False
+    )
+    assert result == ("address2", "numa-0")
+    with pytest.raises(NoAvailableBand):
+        await assigner_ref.assign_subtasks(
+            [subtask],
+            exclude_bands={("address0", "numa-0"), ("address2", "numa-0")},
+            random_when_unavailable=False,
+        )
+    subtask.bands_specified = True
+    assert result == ("address2", "numa-0")
+    with pytest.raises(NoAvailableBand):
+        await assigner_ref.assign_subtasks([subtask])
+    subtask.bands_specified = False
+
     result_chunk.op.gpu = True
     subtask = Subtask("test_task", session_id, chunk_graph=chunk_graph)
     with pytest.raises(NoMatchingSlots) as err:
         await assigner_ref.assign_subtasks([subtask])
     assert "gpu" in str(err.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actor_pool", [False], indirect=True)
+async def test_assign_broadcaster(actor_pool):
+    pool, session_id, assigner_ref, cluster_api, meta_api = actor_pool
+
+    broadcaster = TensorFetch(key="x", source_key="x", dtype=np.dtype(int)).new_chunk(
+        [], is_broadcaster=True
+    )
+    input_chunk = TensorFetch(key="a", source_key="a", dtype=np.dtype(int)).new_chunk(
+        []
+    )
+    result_chunk = TensorTreeAdd(args=[broadcaster, input_chunk]).new_chunk(
+        [broadcaster, input_chunk]
+    )
+
+    chunk_graph = ChunkGraph([result_chunk])
+    chunk_graph.add_node(broadcaster)
+    chunk_graph.add_node(input_chunk)
+    chunk_graph.add_node(result_chunk)
+    chunk_graph.add_edge(broadcaster, result_chunk)
+    chunk_graph.add_edge(input_chunk, result_chunk)
+
+    await meta_api.set_chunk_meta(
+        broadcaster, memory_size=1000, store_size=200, bands=[("address0", "numa-0")]
+    )
+    await meta_api.set_chunk_meta(
+        input_chunk, memory_size=200, store_size=200, bands=[("address1", "numa-0")]
+    )
+
+    subtask = Subtask("test_task", session_id, chunk_graph=chunk_graph)
+    [result] = await assigner_ref.assign_subtasks([subtask])
+    assert result == ("address1", "numa-0")
 
 
 @pytest.mark.asyncio

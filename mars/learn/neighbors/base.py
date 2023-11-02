@@ -31,9 +31,15 @@ from ._proxima import build_proxima_index, proxima_query, METRIC_TO_PROXIMA_METR
 from ._kneighbors_graph import KNeighborsGraph
 
 
+def _call_if_callable(metrics):
+    if callable(metrics):
+        return metrics()
+    return metrics
+
+
 VALID_METRICS = dict(
-    ball_tree=SklearnBallTree.valid_metrics,
-    kd_tree=SklearnKDTree.valid_metrics,
+    ball_tree=_call_if_callable(SklearnBallTree.valid_metrics),
+    kd_tree=_call_if_callable(SklearnKDTree.valid_metrics),
     # The following list comes from the
     # sklearn.metrics.pairwise doc string
     brute=(
@@ -86,7 +92,6 @@ class NeighborsBase(BaseEstimator, MultiOutputMixin, metaclass=ABCMeta):
         metric_params=None,
         n_jobs=None,
     ):
-
         self.n_neighbors = n_neighbors
         self.radius = radius
         self.algorithm = algorithm
@@ -164,7 +169,7 @@ class NeighborsBase(BaseEstimator, MultiOutputMixin, metaclass=ABCMeta):
         if self.metric == "minkowski":
             p = self.effective_metric_params_.pop("p", 2)
             if p < 1:  # pragma: no cover
-                raise ValueError("p must be greater than one " "for minkowski metric")
+                raise ValueError("p must be greater than one for minkowski metric")
             elif p == 1:
                 self.effective_metric_ = "manhattan"
             elif p == 2:
@@ -200,7 +205,7 @@ class NeighborsBase(BaseEstimator, MultiOutputMixin, metaclass=ABCMeta):
 
         if X.issparse():
             if self.algorithm not in ("auto", "brute"):
-                warnings.warn("cannot use tree with sparse input: " "using brute force")
+                warnings.warn("cannot use tree with sparse input: using brute force")
             if self.effective_metric_ not in VALID_METRICS_SPARSE[
                 "brute"
             ] and not callable(self.effective_metric_):

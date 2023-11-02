@@ -28,7 +28,12 @@ def refresh_tileable_shape(tileable):
 
 
 def tile(tileable, *tileables: TileableType):
-    from ..graph import TileableGraph, TileableGraphBuilder, ChunkGraphBuilder
+    from ..graph import (
+        TileableGraph,
+        TileableGraphBuilder,
+        ChunkGraphBuilder,
+        TileContext,
+    )
 
     raw_tileables = target_tileables = [tileable] + list(tileables)
     target_tileables = [t.data if hasattr(t, "data") else t for t in target_tileables]
@@ -38,7 +43,7 @@ def tile(tileable, *tileables: TileableType):
     next(tileable_graph_builder.build())
 
     # tile
-    tile_context = dict()
+    tile_context = TileContext()
     chunk_graph_builder = ChunkGraphBuilder(
         tileable_graph, fuse_enabled=False, tile_context=tile_context
     )
@@ -71,21 +76,24 @@ def recursive_tile(
     q = [t for t in to_tile if t.is_coarse()]
     while q:
         t = q[-1]
-        cs = [c for c in t.inputs if c.is_coarse()]
-        if cs:
-            q.extend(cs)
-            continue
-        for obj in handler.tile(t.op.outputs):
-            to_update_inputs = []
-            chunks = []
-            for inp in t.op.inputs:
-                if has_unknown_shape(inp):
-                    to_update_inputs.append(inp)
+        if t.is_coarse():
+            # t may be put into q repeatedly,
+            # so we check if it's tiled or not
+            cs = [c for c in t.inputs if c.is_coarse()]
+            if cs:
+                q.extend(cs)
+                continue
+            for obj in handler.tile(t.op.outputs):
+                to_update_inputs = []
+                chunks = []
+                for inp in t.op.inputs:
                     chunks.extend(inp.chunks)
-            if obj is None:
-                yield chunks + to_update_inputs
-            else:
-                yield obj + to_update_inputs
+                    if has_unknown_shape(inp):
+                        to_update_inputs.append(inp)
+                if obj is None:
+                    yield chunks + to_update_inputs
+                else:
+                    yield obj + to_update_inputs
         q.pop()
 
     if not return_list:

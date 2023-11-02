@@ -49,6 +49,7 @@ async def redirect_subtask_errors(actor: mo.Actor, subtasks):
                         subtask_id=subtask.subtask_id,
                         session_id=subtask.session_id,
                         task_id=subtask.task_id,
+                        stage_id=subtask.stage_id,
                         progress=1.0,
                         status=status,
                         error=error,
@@ -56,5 +57,6 @@ async def redirect_subtask_errors(actor: mo.Actor, subtasks):
                     )
                 )
             )
-        await asyncio.wait(coros)
+        tasks = [asyncio.ensure_future(coro) for coro in coros]
+        await asyncio.wait(tasks)
         raise

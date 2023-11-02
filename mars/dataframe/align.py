@@ -39,137 +39,76 @@ from .utils import (
     build_split_idx_to_origin_idx,
     filter_index_value,
     hash_index,
+    is_index_value_identical,
+    validate_axis,
 )
 
 
 class DataFrameIndexAlign(MapReduceOperand, DataFrameOperandMixin):
     _op_type_ = OperandDef.DATAFRAME_INDEX_ALIGN
 
-    _index_min = AnyField("index_min")
-    _index_min_close = BoolField("index_min_close")
-    _index_max = AnyField("index_max")
-    _index_max_close = BoolField("index_max_close")
-    _index_shuffle_size = Int32Field("index_shuffle_size")
-    _column_min = AnyField("column_min")
-    _column_min_close = BoolField("column_min_close")
-    _column_max = AnyField("column_max")
-    _column_max_close = BoolField("column_max_close")
-    _column_shuffle_size = Int32Field("column_shuffle_size")
-    _column_shuffle_segments = ListField("column_shuffle_segments", FieldTypes.series)
+    index_min = AnyField("index_min")
+    index_min_close = BoolField("index_min_close")
+    index_max = AnyField("index_max")
+    index_max_close = BoolField("index_max_close")
+    index_shuffle_size = Int32Field("index_shuffle_size", default=None)
+    column_min = AnyField("column_min")
+    column_min_close = BoolField("column_min_close")
+    column_max = AnyField("column_max")
+    column_max_close = BoolField("column_max_close")
+    column_shuffle_size = Int32Field("column_shuffle_size", default=None)
+    column_shuffle_segments = ListField("column_shuffle_segments", FieldTypes.series)
 
-    _input = KeyField("input")
+    input = KeyField("input")
 
     def __init__(
-        self,
-        index_min_max=None,
-        index_shuffle_size=None,
-        column_min_max=None,
-        column_shuffle_size=None,
-        column_shuffle_segments=None,
-        sparse=None,
-        dtype=None,
-        dtypes=None,
-        output_types=None,
-        **kw
+        self, index_min_max=None, column_min_max=None, output_types=None, **kw
     ):
         if index_min_max is not None:
             kw.update(
                 dict(
-                    _index_min=index_min_max[0],
-                    _index_min_close=index_min_max[1],
-                    _index_max=index_min_max[2],
-                    _index_max_close=index_min_max[3],
+                    index_min=index_min_max[0],
+                    index_min_close=index_min_max[1],
+                    index_max=index_min_max[2],
+                    index_max_close=index_min_max[3],
                 )
             )
         if column_min_max is not None:
             kw.update(
                 dict(
-                    _column_min=column_min_max[0],
-                    _column_min_close=column_min_max[1],
-                    _column_max=column_min_max[2],
-                    _column_max_close=column_min_max[3],
+                    column_min=column_min_max[0],
+                    column_min_close=column_min_max[1],
+                    column_max=column_min_max[2],
+                    column_max_close=column_min_max[3],
                 )
             )
-        super().__init__(
-            _index_shuffle_size=index_shuffle_size,
-            _column_shuffle_size=column_shuffle_size,
-            _column_shuffle_segments=column_shuffle_segments,
-            _sparse=sparse,
-            _dtype=dtype,
-            _dtypes=dtypes,
-            _output_types=output_types,
-            **kw
-        )
-
-    @property
-    def index_min(self):
-        return self._index_min
-
-    @property
-    def index_min_close(self):
-        return self._index_min_close
-
-    @property
-    def index_max(self):
-        return self._index_max
-
-    @property
-    def index_max_close(self):
-        return self._index_max_close
+        super().__init__(_output_types=output_types, **kw)
 
     @property
     def index_min_max(self):
-        if getattr(self, "_index_min", None) is None:
+        if getattr(self, "index_min", None) is None:
             return None
         return (
-            self._index_min,
-            self._index_min_close,
-            self._index_max,
-            self._index_max_close,
+            self.index_min,
+            self.index_min_close,
+            self.index_max,
+            self.index_max_close,
         )
-
-    @property
-    def index_shuffle_size(self):
-        return self._index_shuffle_size
-
-    @property
-    def column_min(self):
-        return self._column_min
-
-    @property
-    def column_min_close(self):
-        return self._column_min_close
-
-    @property
-    def column_max(self):
-        return self._column_max
-
-    @property
-    def column_max_close(self):
-        return self._column_max_close
 
     @property
     def column_min_max(self):
-        if getattr(self, "_column_min", None) is None:
+        if getattr(self, "column_min", None) is None:
             return None
         return (
-            self._column_min,
-            self._column_min_close,
-            self._column_max,
-            self._column_max_close,
+            self.column_min,
+            self.column_min_close,
+            self.column_max,
+            self.column_max_close,
         )
-
-    @property
-    def column_shuffle_size(self):
-        return self._column_shuffle_size
-
-    @property
-    def column_shuffle_segments(self):
-        return self._column_shuffle_segments
 
     def _set_inputs(self, inputs):
         super()._set_inputs(inputs)
-        self._input = self._inputs[0]
+        self.input = self._inputs[0]
 
     def build_map_chunk_kw(self, inputs, **kw):
         if kw.get("index_value", None) is None and inputs[0].index_value is not None:
@@ -204,7 +143,7 @@ class DataFrameIndexAlign(MapReduceOperand, DataFrameOperandMixin):
                 kw["dtypes"] = input_dtypes[kw["columns_value"].to_pandas()]
                 column_shuffle_size = self.column_shuffle_size
                 if column_shuffle_size is not None:
-                    self._column_shuffle_segments = hash_dtypes(
+                    self.column_shuffle_segments = hash_dtypes(
                         input_dtypes, column_shuffle_size
                     )
         else:
@@ -309,7 +248,10 @@ class DataFrameIndexAlign(MapReduceOperand, DataFrameOperandMixin):
                 ctx[chunk.key] = df.loc[filters[0][0]]
             else:
                 for index_idx, index_filter in enumerate(filters[0]):
-                    ctx[chunk.key, (index_idx,)] = df.loc[index_filter]
+                    ctx[chunk.key, (index_idx,)] = (
+                        ctx.get_current_chunk().index,
+                        df.loc[index_filter],
+                    )
             return
 
         if op.column_shuffle_size == -1:
@@ -334,12 +276,18 @@ class DataFrameIndexAlign(MapReduceOperand, DataFrameOperandMixin):
             # shuffle on columns
             for column_idx, column_filter in enumerate(filters[1]):
                 shuffle_index = (chunk.index[0], column_idx)
-                ctx[chunk.key, shuffle_index] = df.loc[filters[0][0], column_filter]
+                ctx[chunk.key, shuffle_index] = (
+                    ctx.get_current_chunk().index,
+                    df.loc[filters[0][0], column_filter],
+                )
         elif len(filters[1]) == 1:
             # shuffle on index
             for index_idx, index_filter in enumerate(filters[0]):
                 shuffle_index = (index_idx, chunk.index[1])
-                ctx[chunk.key, shuffle_index] = df.loc[index_filter, filters[1][0]]
+                ctx[chunk.key, shuffle_index] = (
+                    ctx.get_current_chunk().index,
+                    df.loc[index_filter, filters[1][0]],
+                )
         else:
             # full shuffle
             shuffle_index_size = op.index_shuffle_size
@@ -350,12 +298,15 @@ class DataFrameIndexAlign(MapReduceOperand, DataFrameOperandMixin):
             out_index_columns = itertools.product(*filters)
             for out_idx, out_index_column in zip(out_idxes, out_index_columns):
                 index_filter, column_filter = out_index_column
-                ctx[chunk.key, out_idx] = df.loc[index_filter, column_filter]
+                ctx[chunk.key, out_idx] = (
+                    ctx.get_current_chunk().index,
+                    df.loc[index_filter, column_filter],
+                )
 
     @classmethod
     def execute_reduce(cls, ctx, op: "DataFrameIndexAlign"):
         chunk = op.outputs[0]
-        input_idx_to_df = dict(op.iter_mapper_data_with_index(ctx))
+        input_idx_to_df = dict(op.iter_mapper_data(ctx))
         row_idxes = sorted({idx[0] for idx in input_idx_to_df})
         if chunk.ndim == 2:
             col_idxes = sorted({idx[1] for idx in input_idx_to_df})
@@ -683,6 +634,7 @@ def _gen_series_chunks(splits, out_shape, left_or_right, series):
         for out_idx in range(out_shape[0]):
             reduce_op = DataFrameIndexAlign(
                 stage=OperandStage.reduce,
+                n_reducers=out_shape[0],
                 i=out_idx,
                 sparse=proxy_chunk.issparse(),
                 output_types=[OutputType.series],
@@ -820,6 +772,7 @@ def _gen_dataframe_chunks(splits, out_shape, left_or_right, df):
                 )
                 reduce_op = DataFrameIndexAlign(
                     stage=OperandStage.reduce,
+                    n_reducers=out_shape[shuffle_axis],
                     i=j,
                     sparse=proxy_chunk.issparse(),
                     output_types=[OutputType.dataframe],
@@ -853,9 +806,11 @@ def _gen_dataframe_chunks(splits, out_shape, left_or_right, df):
         ).new_chunk(map_chunks, shape=())
 
         # gen reduce chunks
-        for out_idx in itertools.product(*(range(s) for s in out_shape)):
+        out_indices = list(itertools.product(*(range(s) for s in out_shape)))
+        for out_idx in out_indices:
             reduce_op = DataFrameIndexAlign(
                 stage=OperandStage.reduce,
+                n_reducers=len(out_indices),
                 i=out_idx,
                 sparse=proxy_chunk.issparse(),
                 output_types=[OutputType.dataframe],
@@ -868,46 +823,77 @@ def _gen_dataframe_chunks(splits, out_shape, left_or_right, df):
     return out_chunks
 
 
-def align_dataframe_dataframe(left, right):
+def align_dataframe_dataframe(left, right, axis=None):
     left_index_chunks = [c.index_value for c in left.cix[:, 0]]
-    left_columns_chunks = [c.columns_value for c in left.cix[0, :]]
     right_index_chunks = [c.index_value for c in right.cix[:, 0]]
+    left_columns_chunks = [c.columns_value for c in left.cix[0, :]]
     right_columns_chunks = [c.columns_value for c in right.cix[0, :]]
 
-    index_splits, index_chunk_shape = _calc_axis_splits(
-        left.index_value, right.index_value, left_index_chunks, right_index_chunks
-    )
+    axis = validate_axis(axis) if axis is not None else None
+    if axis is None or axis == 0:
+        index_splits, index_chunk_shape = _calc_axis_splits(
+            left.index_value, right.index_value, left_index_chunks, right_index_chunks
+        )
+    else:
+        index_splits, index_chunk_shape = None, None
 
-    columns_splits, column_chunk_shape = _calc_axis_splits(
-        left.columns_value,
-        right.columns_value,
-        left_columns_chunks,
-        right_columns_chunks,
-    )
+    if axis is None or axis == 1:
+        columns_splits, column_chunk_shape = _calc_axis_splits(
+            left.columns_value,
+            right.columns_value,
+            left_columns_chunks,
+            right_columns_chunks,
+        )
+    else:
+        columns_splits, column_chunk_shape = None, None
 
     splits = _MinMaxSplitInfo(index_splits, columns_splits)
-    out_chunk_shape = (
-        len(index_chunk_shape or list(itertools.chain(*index_splits._left_split))),
-        len(column_chunk_shape or list(itertools.chain(*columns_splits._left_split))),
+    out_left_chunk_shape = (
+        len(index_chunk_shape or list(itertools.chain(*index_splits._left_split)))
+        if index_splits is not None
+        else left.chunk_shape[0],
+        len(column_chunk_shape or list(itertools.chain(*columns_splits._left_split)))
+        if columns_splits is not None
+        else left.chunk_shape[1],
     )
-    left_chunks = _gen_dataframe_chunks(splits, out_chunk_shape, 0, left)
-    right_chunks = _gen_dataframe_chunks(splits, out_chunk_shape, 1, right)
-    if _is_index_identical(left_index_chunks, right_index_chunks):
-        index_nsplits = left.nsplits[0]
+    if axis is None:
+        out_right_chunk_shape = out_left_chunk_shape
     else:
-        index_nsplits = [np.nan for _ in range(out_chunk_shape[0])]
-    if _is_index_identical(left_columns_chunks, right_columns_chunks):
-        columns_nsplits = left.nsplits[1]
-    else:
-        columns_nsplits = [np.nan for _ in range(out_chunk_shape[1])]
+        out_right_chunk_shape = (
+            len(index_chunk_shape or list(itertools.chain(*index_splits._right_split)))
+            if index_splits is not None
+            else right.chunk_shape[0],
+            len(
+                column_chunk_shape
+                or list(itertools.chain(*columns_splits._right_split))
+            )
+            if columns_splits is not None
+            else right.chunk_shape[1],
+        )
+    left_chunks = _gen_dataframe_chunks(splits, out_left_chunk_shape, 0, left)
+    right_chunks = _gen_dataframe_chunks(splits, out_right_chunk_shape, 1, right)
+
+    index_nsplits = columns_nsplits = None
+    if axis is None or axis == 0:
+        if _is_index_identical(left_index_chunks, right_index_chunks):
+            index_nsplits = left.nsplits[0]
+        else:
+            index_nsplits = [np.nan for _ in range(out_left_chunk_shape[0])]
+    if axis is None or axis == 1:
+        if _is_index_identical(left_columns_chunks, right_columns_chunks):
+            columns_nsplits = left.nsplits[1]
+        else:
+            columns_nsplits = [np.nan for _ in range(out_left_chunk_shape[1])]
 
     nsplits = [index_nsplits, columns_nsplits]
 
-    return nsplits, out_chunk_shape, left_chunks, right_chunks
+    out_chunk_shapes = (out_left_chunk_shape, out_right_chunk_shape)
+    return nsplits, out_chunk_shapes, left_chunks, right_chunks
 
 
 def align_dataframe_series(left, right, axis="columns"):
-    if axis == "columns" or axis == 1:
+    axis = validate_axis(axis)
+    if axis == 1:
         left_columns_chunks = [c.columns_value for c in left.cix[0, :]]
         right_index_chunks = [c.index_value for c in right.chunks]
         index_splits, chunk_shape = _calc_axis_splits(
@@ -936,7 +922,6 @@ def align_dataframe_series(left, right, axis="columns"):
             index_nsplits = [np.nan for _ in range(out_chunk_shape[1])]
         nsplits = [dummy_nsplits, index_nsplits]
     else:
-        assert axis == "index" or axis == 0
         left_index_chunks = [c.index_value for c in left.cix[:, 0]]
         right_index_chunks = [c.index_value for c in right.chunks]
         index_splits, index_chunk_shape = _calc_axis_splits(
@@ -967,6 +952,10 @@ def align_dataframe_series(left, right, axis="columns"):
 
 
 def align_series_series(left, right):
+    if is_index_value_identical(left, right):
+        # index identical, skip align
+        return left.nsplits, left.chunk_shape, left.chunks, right.chunks
+
     left_index_chunks = [c.index_value for c in left.chunks]
     right_index_chunks = [c.index_value for c in right.chunks]
 
@@ -981,9 +970,6 @@ def align_series_series(left, right):
 
     left_chunks = _gen_series_chunks(splits, out_chunk_shape, 0, left)
     right_chunks = _gen_series_chunks(splits, out_chunk_shape, 1, right)
-    if _is_index_identical(left_index_chunks, right_index_chunks):
-        index_nsplits = left.nsplits[0]
-    else:
-        index_nsplits = [np.nan for _ in range(out_chunk_shape[0])]
+    index_nsplits = [np.nan for _ in range(out_chunk_shape[0])]
     nsplits = [index_nsplits]
     return nsplits, out_chunk_shape, left_chunks, right_chunks

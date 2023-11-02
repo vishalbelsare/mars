@@ -57,7 +57,7 @@ class TensorFull(TensorNoInput):
         )
 
 
-def full(shape, fill_value, dtype=None, chunk_size=None, gpu=False, order="C"):
+def full(shape, fill_value, dtype=None, chunk_size=None, gpu=None, order="C"):
     """
     Return a new tensor of given shape and type, filled with `fill_value`.
 
@@ -141,10 +141,10 @@ class TensorFullLike(TensorLike):
             dtype = np.array(fill_value).dtype
         super().__init__(
             _fill_value=fill_value,
-            _dtype=dtype,
-            _gpu=gpu,
             _order=order,
-            _sparse=sparse,
+            dtype=dtype,
+            gpu=gpu,
+            sparse=sparse,
             **kw
         )
 

@@ -11,56 +11,140 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import operator
+import weakref
+from typing import Dict, List, Type, Tuple
 
-from functools import partial
-from typing import Any, Dict, Generator, List, Type, Tuple
+import cloudpickle
 
 from ..core import Serializer, Placeholder, buffered
-from .field import Field, OneOfField
+from .field import Field
+from .field_type import (
+    PrimitiveFieldType,
+    ListType,
+    TupleType,
+    DictType,
+    DtypeType,
+    DatetimeType,
+    TimedeltaType,
+    TZInfoType,
+)
+
+
+_primitive_field_types = (
+    PrimitiveFieldType,
+    DtypeType,
+    DatetimeType,
+    TimedeltaType,
+    TZInfoType,
+)
+
+
+def _is_field_primitive_compound(field: Field):
+    if field.on_serialize is not None or field.on_deserialize is not None:
+        return False
+
+    def check_type(field_type):
+        if isinstance(field_type, _primitive_field_types):
+            return True
+        if isinstance(field_type, (ListType, TupleType)):
+            if all(
+                check_type(element_type) or element_type is Ellipsis
+                for element_type in field_type._field_types
+            ):
+                return True
+        if isinstance(field_type, DictType):
+            if all(
+                isinstance(element_type, _primitive_field_types)
+                or element_type is Ellipsis
+                for element_type in (field_type.key_type, field_type.value_type)
+            ):
+                return True
+        return False
+
+    return check_type(field.field_type)
 
 
 class SerializableMeta(type):
     def __new__(mcs, name: str, bases: Tuple[Type], properties: Dict):
-        new_properties = dict()
+        # All the fields including base fields.
+        all_fields = dict()
+
         for base in bases:
             if hasattr(base, "_FIELDS"):
-                new_properties.update(base._FIELDS)
-        new_properties.update(properties)
-        properties = new_properties
+                all_fields.update(base._FIELDS)
 
-        property_to_fields = dict()
-        # filter out all fields
+        properties_without_fields = {}
+        properties_field_slot_names = []
         for k, v in properties.items():
             if not isinstance(v, Field):
+                properties_without_fields[k] = v
                 continue
 
-            property_to_fields[k] = v
-            properties[k] = v
-            v._attr_name = k
+            field = all_fields.get(k)
+            if field is None:
+                properties_field_slot_names.append(k)
+            else:
+                v.name = field.name
+                v.get = field.get
+                v.set = field.set
+                v.__delete__ = field.__delete__
+            all_fields[k] = v
 
-        properties["_FIELDS"] = property_to_fields
+        # Make field order deterministic to serialize it as list instead of dict.
+        all_fields = dict(sorted(all_fields.items(), key=operator.itemgetter(0)))
+        pickle_fields = []
+        non_pickle_fields = []
+        for v in all_fields.values():
+            if _is_field_primitive_compound(v):
+                pickle_fields.append(v)
+            else:
+                non_pickle_fields.append(v)
+
         slots = set(properties.pop("__slots__", set()))
-        if property_to_fields:
-            slots.add("_FIELD_VALUES")
+        slots.update(properties_field_slot_names)
+
+        properties = properties_without_fields
+        properties["_FIELDS"] = all_fields
+        properties["_PRIMITIVE_FIELDS"] = pickle_fields
+        properties["_NON_PRIMITIVE_FIELDS"] = non_pickle_fields
         properties["__slots__"] = tuple(slots)
 
         clz = type.__new__(mcs, name, bases, properties)
+        # Bind slot member_descriptor with field.
+        for name in properties_field_slot_names:
+            member_descriptor = getattr(clz, name)
+            field = all_fields[name]
+            field.name = member_descriptor.__name__
+            field.get = member_descriptor.__get__
+            field.set = member_descriptor.__set__
+            field.__delete__ = member_descriptor.__delete__
+            setattr(clz, name, field)
+
         return clz
 
 
 class Serializable(metaclass=SerializableMeta):
-    __slots__ = ()
+    __slots__ = ("__weakref__",)
+
+    _cache_primitive_serial = False
 
     _FIELDS: Dict[str, Field]
-    _FIELD_VALUES: Dict[str, Any]
+    _PRIMITIVE_FIELDS: List[str]
+    _NON_PRIMITIVE_FIELDS: List[str]
 
     def __init__(self, *args, **kwargs):
+        fields = self._FIELDS
         if args:  # pragma: no cover
-            values = dict(zip(self.__slots__, args))
+            values = dict(zip(fields, args))
             values.update(kwargs)
-            self._FIELD_VALUES = values
         else:
-            self._FIELD_VALUES = kwargs
+            values = kwargs
+        for k, v in values.items():
+            fields[k].set(self, v)
+
+    def __on_deserialize__(self):
+        pass
 
     def __repr__(self):
         values = ", ".join(
@@ -71,96 +155,91 @@ class Serializable(metaclass=SerializableMeta):
         )
         return "{}({})".format(self.__class__.__name__, values)
 
+    def copy(self) -> "Serializable":
+        copied = type(self)()
+        copied_fields = copied._FIELDS
+        for k, field in self._FIELDS.items():
+            try:
+                # Slightly faster than getattr.
+                value = field.get(self, k)
+                copied_fields[k].set(copied, value)
+            except AttributeError:
+                continue
+        return copied
+
+
+_primitive_serial_cache = weakref.WeakKeyDictionary()
+
+
+class _NoFieldValue:
+    pass
+
 
 class SerializableSerializer(Serializer):
     """
     Leverage DictSerializer to perform serde.
     """
 
-    serializer_name = "serializable"
-
     @classmethod
-    def _get_tag_to_values(cls, obj: Serializable):
-        fields = obj._FIELDS
-        attr_to_values = obj._FIELD_VALUES
-        tag_to_values = dict()
-
-        for field in fields.values():
-            tag = field.tag
-            attr_name = field.attr_name
+    def _get_field_values(cls, obj: Serializable, fields):
+        values = []
+        for field in fields:
             try:
-                value = attr_to_values[attr_name]
-            except KeyError:
-                continue
-            if field.on_serialize:
-                value = field.on_serialize(value)
-            tag_to_values[tag] = value
-
-        return tag_to_values
+                value = field.get(obj)
+                if field.on_serialize is not None:
+                    value = field.on_serialize(value)
+            except AttributeError:
+                # Most field values are not None, serialize by list is more efficient than dict.
+                value = _NoFieldValue
+            values.append(value)
+        return values
 
     @buffered
-    def serialize(self, obj: Serializable, context: Dict):
-        tag_to_values = self._get_tag_to_values(obj)
+    def serial(self, obj: Serializable, context: Dict):
+        if obj._cache_primitive_serial and obj in _primitive_serial_cache:
+            primitive_vals = _primitive_serial_cache[obj]
+        else:
+            primitive_vals = self._get_field_values(obj, obj._PRIMITIVE_FIELDS)
+            if obj._cache_primitive_serial:
+                primitive_vals = cloudpickle.dumps(primitive_vals)
+                _primitive_serial_cache[obj] = primitive_vals
 
-        keys = [None] * len(tag_to_values)
-        value_headers = [None] * len(tag_to_values)
-        value_sizes = [0] * len(tag_to_values)
-        value_buffers = []
-        for idx, (key, val) in enumerate(tag_to_values.items()):
-            keys[idx] = key
-            value_headers[idx], val_buf = yield val
-            value_sizes[idx] = len(val_buf)
-            value_buffers.extend(val_buf)
+        compound_vals = self._get_field_values(obj, obj._NON_PRIMITIVE_FIELDS)
+        return (type(obj), primitive_vals), [compound_vals], False
 
-        header = {
-            "keys": keys,
-            "value_headers": value_headers,
-            "value_sizes": value_sizes,
-            "class": type(obj),
-        }
-        return header, value_buffers
+    @staticmethod
+    def _set_field_value(obj: Serializable, field: Field, value):
+        if value is _NoFieldValue:
+            return
+        if type(value) is Placeholder:
+            if field.on_deserialize is not None:
+                value.callbacks.append(
+                    lambda v: field.set(obj, field.on_deserialize(v))
+                )
+            else:
+                value.callbacks.append(lambda v: field.set(obj, v))
+        else:
+            if field.on_deserialize is not None:
+                field.set(obj, field.on_deserialize(value))
+            else:
+                field.set(obj, value)
 
-    def deserialize(
-        self, header: Dict, buffers: List, context: Dict
-    ) -> Generator[Any, Any, Serializable]:
-        obj_class: Type[Serializable] = header.pop("class")
+    def deserial(self, serialized: Tuple, context: Dict, subs: List) -> Serializable:
+        obj_class, primitives = serialized
 
-        tag_to_values = dict()
-        pos = 0
-        for key, value_header, value_size in zip(
-            header["keys"], header["value_headers"], header["value_sizes"]
-        ):
-            tag_to_values[key] = (
-                yield value_header,
-                buffers[pos : pos + value_size],
-            )  # noqa: E999
-            pos += value_size
+        if type(primitives) is not list:
+            primitives = cloudpickle.loads(primitives)
 
-        attr_to_values = dict()
-        for field in obj_class._FIELDS.values():
-            try:
-                value = attr_to_values[field.attr_name] = tag_to_values[field.tag]
-            except KeyError:
-                continue
-            if not isinstance(field, OneOfField):
-                if value is not None:
-                    if field.on_deserialize:
+        obj = obj_class.__new__(obj_class)
 
-                        def cb(v, field_):
-                            attr_to_values[field_.attr_name] = field_.on_deserialize(v)
+        if primitives:
+            for field, value in zip(obj_class._PRIMITIVE_FIELDS, primitives):
+                self._set_field_value(obj, field, value)
 
-                    else:
-
-                        def cb(v, field_):
-                            attr_to_values[field_.attr_name] = v
-
-                    if isinstance(value, Placeholder):
-                        value.callbacks.append(partial(cb, field_=field))
-                    else:
-                        cb(value, field)
-
-        obj = obj_class()
-        obj._FIELD_VALUES = attr_to_values
+        if obj_class._NON_PRIMITIVE_FIELDS:
+            for field, value in zip(obj_class._NON_PRIMITIVE_FIELDS, subs[0]):
+                self._set_field_value(obj, field, value)
+        obj.__on_deserialize__()
         return obj
 
 

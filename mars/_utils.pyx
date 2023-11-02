@@ -1,3 +1,4 @@
+# distutils: language = c++
 # Copyright 1999-2021 Alibaba Group Holding Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,35 +13,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import importlib
+import itertools
 import os
 import pickle
 import pkgutil
+import time
 import types
 import uuid
+import warnings
 from datetime import date, datetime, timedelta, tzinfo
 from enum import Enum
 from functools import lru_cache, partial
+from random import getrandbits
+from weakref import WeakSet
 
 import numpy as np
 import pandas as pd
 import cloudpickle
 cimport cython
+from cpython cimport PyBytes_FromStringAndSize
+from libc.stdint cimport uint_fast64_t, uint32_t, uint8_t
+from libc.stdlib cimport malloc, free
+from .lib.cython.libcpp cimport mt19937_64
 try:
     from pandas.tseries.offsets import Tick as PDTick
 except ImportError:
     PDTick = None
-try:
-    from sqlalchemy.sql import Selectable as SASelectable
-    from sqlalchemy.sql.sqltypes import TypeEngine as SATypeEngine
-except ImportError:
-    SASelectable, SATypeEngine = None, None
 
 from .lib.mmh3 import hash as mmh_hash, hash_bytes as mmh_hash_bytes, \
     hash_from_buffer as mmh3_hash_from_buffer
 
 cdef bint _has_cupy = bool(pkgutil.find_loader('cupy'))
 cdef bint _has_cudf = bool(pkgutil.find_loader('cudf'))
+cdef bint _has_sqlalchemy = bool(pkgutil.find_loader('sqlalchemy'))
+cdef bint _has_interval_array_inclusive = hasattr(
+    pd.arrays.IntervalArray, "inclusive"
+)
+
+
+cdef extern from "MurmurHash3.h":
+    void MurmurHash3_x64_128(const void * key, Py_ssize_t len, uint32_t seed, void * out)
+
+
+cdef bytes _get_mars_key(const uint8_t[:] bufferview):
+    cdef const uint8_t *data = &bufferview[0]
+    cdef uint8_t out[16]
+    MurmurHash3_x64_128(data, len(bufferview), 0, out)
+    out[0] |= 0xC0
+    return PyBytes_FromStringAndSize(<char*>out, 16)
 
 
 cpdef str to_str(s, encoding='utf-8'):
@@ -82,38 +104,52 @@ cpdef unicode to_text(s, encoding='utf-8'):
         raise TypeError(f"Could not convert from {s} to unicode.")
 
 
-cdef class TypeDispatcher:
-    cdef dict _handlers
-    cdef dict _lazy_handlers
-    cdef dict _inherit_handlers
+_type_dispatchers = WeakSet()
 
+
+NamedType = collections.namedtuple("NamedType", ["name", "type_"])
+
+
+cdef class TypeDispatcher:
     def __init__(self):
         self._handlers = dict()
         self._lazy_handlers = dict()
         # store inherited handlers to facilitate unregistering
         self._inherit_handlers = dict()
 
+        _type_dispatchers.add(self)
+
     cpdef void register(self, object type_, object handler):
         if isinstance(type_, str):
             self._lazy_handlers[type_] = handler
+        elif type(type_) is not NamedType and isinstance(type_, tuple):
+            for t in type_:
+                self.register(t, handler)
         else:
             self._handlers[type_] = handler
 
     cpdef void unregister(self, object type_):
-        self._lazy_handlers.pop(type_, None)
-        self._handlers.pop(type_, None)
-        self._inherit_handlers.clear()
+        if type(type_) is not NamedType and isinstance(type_, tuple):
+            for t in type_:
+                self.unregister(t)
+        else:
+            self._lazy_handlers.pop(type_, None)
+            self._handlers.pop(type_, None)
+            self._inherit_handlers.clear()
 
     cdef _reload_lazy_handlers(self):
         for k, v in self._lazy_handlers.items():
             mod_name, obj_name = k.rsplit('.', 1)
-            mod = importlib.import_module(mod_name, __name__)
-            self._handlers[getattr(mod, obj_name)] = v
+            with warnings.catch_warnings():
+                # the lazy imported cudf will warn no device found,
+                # when we set visible device to -1 for CPU processes,
+                # ignore the warning to not distract users
+                warnings.simplefilter("ignore")
+                mod = importlib.import_module(mod_name, __name__)
+            self.register(getattr(mod, obj_name), v)
         self._lazy_handlers = dict()
 
     cpdef get_handler(self, object type_):
-        cdef object clz, handler
-        cdef dict d
         try:
             return self._handlers[type_]
         except KeyError:
@@ -123,19 +159,29 @@ cdef class TypeDispatcher:
             return self._inherit_handlers[type_]
         except KeyError:
             self._reload_lazy_handlers()
-            for clz in type_.__mro__:
-                if clz in self._handlers:
-                    d = self._handlers
-                elif clz in self._inherit_handlers:
-                    d = self._inherit_handlers
-
-                if clz in self._handlers:
-                    handler = self._inherit_handlers[type_] = d[clz]
+            if type(type_) is NamedType:
+                named_type = partial(NamedType, type_.name)
+                mro = itertools.chain(
+                    *zip(map(named_type, type_.type_.__mro__),
+                         type_.type_.__mro__)
+                )
+            else:
+                mro = type_.__mro__
+            for clz in mro:
+                # only lookup self._handlers for mro clz
+                handler = self._handlers.get(clz)
+                if handler is not None:
+                    self._inherit_handlers[type_] = handler
                     return handler
             raise KeyError(f'Cannot dispatch type {type_}')
 
     def __call__(self, object obj, *args, **kwargs):
         return self.get_handler(type(obj))(obj, *args, **kwargs)
+
+    @staticmethod
+    def reload_all_lazy_handlers():
+        for dispatcher in _type_dispatchers:
+            (<TypeDispatcher>dispatcher)._reload_lazy_handlers()
 
 
 cdef inline build_canonical_bytes(tuple args, kwargs):
@@ -145,7 +191,7 @@ cdef inline build_canonical_bytes(tuple args, kwargs):
 
 
 def tokenize(*args, **kwargs):
-    return mmh_hash_bytes(build_canonical_bytes(args, kwargs)).hex()
+    return _get_mars_key(build_canonical_bytes(args, kwargs)).hex()
 
 
 def tokenize_int(*args, **kwargs):
@@ -155,13 +201,14 @@ def tokenize_int(*args, **kwargs):
 cdef class Tokenizer(TypeDispatcher):
     def __call__(self, object obj, *args, **kwargs):
         try:
-            return super().__call__(obj, *args, **kwargs)
+            return self.get_handler(type(obj))(obj, *args, **kwargs)
         except KeyError:
             if hasattr(obj, '__mars_tokenize__') and not isinstance(obj, type):
                 if len(args) == 0 and len(kwargs) == 0:
                     return obj.__mars_tokenize__()
                 else:
-                    return super().__call__(obj.__mars_tokenize__(), *args, **kwargs)
+                    obj = obj.__mars_tokenize__()
+                    return self.get_handler(type(obj))(obj, *args, **kwargs)
             if callable(obj):
                 if PDTick is not None and not isinstance(obj, PDTick):
                     return tokenize_function(obj)
@@ -179,7 +226,9 @@ cdef inline list iterative_tokenize(object ob):
     while dq_pos < len(dq):
         x = dq[dq_pos]
         dq_pos += 1
-        if isinstance(x, (list, tuple)):
+        if type(x) in _primitive_types:
+            h_list.append(x)
+        elif isinstance(x, (list, tuple)):
             dq.extend(x)
         elif isinstance(x, set):
             dq.extend(sorted(x))
@@ -187,6 +236,10 @@ cdef inline list iterative_tokenize(object ob):
             dq.extend(sorted(x.items()))
         else:
             h_list.append(tokenize_handler(x))
+
+        if dq_pos >= 64 and len(dq) < dq_pos * 2:  # pragma: no cover
+            dq = dq[dq_pos:]
+            dq_pos = 0
     return h_list
 
 
@@ -205,20 +258,20 @@ cdef inline tuple tokenize_numpy(ob):
                 ob.shape, ob.strides, offset)
     if ob.dtype.hasobject:
         try:
-            data = mmh_hash_bytes('-'.join(ob.flat).encode('utf-8', errors='surrogatepass')).hex()
+            data = mmh_hash_bytes('-'.join(ob.flat).encode('utf-8', errors='surrogatepass'))
         except UnicodeDecodeError:
-            data = mmh_hash_bytes(b'-'.join([to_binary(x) for x in ob.flat])).hex()
+            data = mmh_hash_bytes(b'-'.join([to_binary(x) for x in ob.flat]))
         except TypeError:
             try:
-                data = mmh_hash_bytes(pickle.dumps(ob, pickle.HIGHEST_PROTOCOL)).hex()
+                data = mmh_hash_bytes(pickle.dumps(ob, pickle.HIGHEST_PROTOCOL))
             except:
                 # nothing can do, generate uuid
                 data = uuid.uuid4().hex
     else:
         try:
-            data = mmh_hash_bytes(ob.ravel().view('i1').data).hex()
+            data = mmh_hash_bytes(ob.ravel().view('i1').data)
         except (BufferError, AttributeError, ValueError):
-            data = mmh_hash_bytes(ob.copy().ravel().view('i1').data).hex()
+            data = mmh_hash_bytes(ob.copy().ravel().view('i1').data)
     return data, ob.dtype, ob.shape, ob.strides
 
 
@@ -279,8 +332,11 @@ cdef list tokenize_pandas_tick(ob):
     return iterative_tokenize([ob.freqstr])
 
 
-cdef list tokenize_pandas_interval_arrays(ob):
-    return iterative_tokenize([ob.left, ob.right, ob.closed])
+cdef list tokenize_pandas_interval_arrays(ob):  # pragma: no cover
+    if _has_interval_array_inclusive:
+        return iterative_tokenize([ob.left, ob.right, ob.inclusive])
+    else:
+        return iterative_tokenize([ob.left, ob.right, ob.closed])
 
 
 cdef list tokenize_sqlalchemy_data_type(ob):
@@ -335,20 +391,19 @@ def tokenize_cudf(ob):
 
 cdef Tokenizer tokenize_handler = Tokenizer()
 
-base_types = (int, float, str, unicode, bytes, complex,
-              type(None), type, slice, date, datetime, timedelta)
-for t in base_types:
+cdef set _primitive_types = {
+    int, float, str, unicode, bytes, complex, type(None), type, slice, date, datetime, timedelta
+}
+for t in _primitive_types:
     tokenize_handler.register(t, lambda ob: ob)
 
 for t in (np.dtype, np.generic):
-    tokenize_handler.register(t, lambda ob: repr(ob))
+    tokenize_handler.register(t, lambda ob: ob)
 
 for t in (list, tuple, dict, set):
     tokenize_handler.register(t, iterative_tokenize)
 
 tokenize_handler.register(np.ndarray, tokenize_numpy)
-tokenize_handler.register(dict, lambda ob: iterative_tokenize(sorted(ob.items())))
-tokenize_handler.register(set, lambda ob: iterative_tokenize(sorted(ob)))
 tokenize_handler.register(np.random.RandomState, lambda ob: iterative_tokenize(ob.get_state()))
 tokenize_handler.register(memoryview, lambda ob: mmh3_hash_from_buffer(ob))
 tokenize_handler.register(Enum, tokenize_enum)
@@ -373,36 +428,16 @@ if _has_cudf:
 
 if PDTick is not None:
     tokenize_handler.register(PDTick, tokenize_pandas_tick)
-if SATypeEngine is not None:
-    tokenize_handler.register(SATypeEngine, tokenize_sqlalchemy_data_type)
-if SASelectable is not None:
-    tokenize_handler.register(SASelectable, tokenize_sqlalchemy_selectable)
+if _has_sqlalchemy:
+    tokenize_handler.register(
+        "sqlalchemy.sql.sqltypes.TypeEngine", tokenize_sqlalchemy_data_type
+    )
+    tokenize_handler.register(
+        "sqlalchemy.sql.Selectable", tokenize_sqlalchemy_selectable
+    )
 
 cpdef register_tokenizer(cls, handler):
     tokenize_handler.register(cls, handler)
-
-
-cpdef tuple insert_reversed_tuple(tuple a, object x):
-    cdef int mid, lo = 0, hi = len(a), len_a = hi
-    cdef object el
-
-    if len_a == 0:
-        return x,
-
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if a[mid] > x: lo = mid + 1
-        else: hi = mid
-
-    if lo == len_a:
-        return a + (x,)
-    el = a[lo]
-    if el == x:
-        return a
-    elif lo == 0 and el < x:
-        return (x,) + a
-    else:
-        return a[:lo] + (x,) + a[lo:]
 
 
 @cython.nonecheck(False)
@@ -411,5 +446,58 @@ cpdef long long ceildiv(long long x, long long y) nogil:
     return x // y + (x % y != 0)
 
 
+cdef class Timer:
+    cdef object _start
+    cdef readonly object duration
+
+    def __enter__(self):
+        self._start = time.time()
+        return self
+
+    def __exit__(self, *_):
+        self.duration = time.time() - self._start
+
+
+cdef mt19937_64 _rnd_gen
+cdef bint _rnd_is_seed_set = False
+
+
+cpdef void reset_id_random_seed() except *:
+    cdef bytes seed_bytes
+    global _rnd_is_seed_set
+
+    seed_bytes = getrandbits(64).to_bytes(8, "little")
+    _rnd_gen.seed((<uint_fast64_t *><char *>seed_bytes)[0])
+    _rnd_is_seed_set = True
+
+
+cpdef bytes new_random_id(int byte_len):
+    cdef uint_fast64_t *res_ptr
+    cdef uint_fast64_t res_data[4]
+    cdef int i, qw_num = byte_len >> 3
+    cdef bytes res
+
+    if not _rnd_is_seed_set:
+        reset_id_random_seed()
+
+    if (qw_num << 3) < byte_len:
+        qw_num += 1
+
+    if qw_num <= 4:
+        # use stack memory to accelerate
+        res_ptr = res_data
+    else:
+        res_ptr = <uint_fast64_t *>malloc(qw_num << 3)
+
+    try:
+        for i in range(qw_num):
+            res_ptr[i] = _rnd_gen()
+        return <bytes>((<char *>&(res_ptr[0]))[:byte_len])
+    finally:
+        # free memory if allocated by malloc
+        if res_ptr != res_data:
+            free(res_ptr)
+
+
 __all__ = ['to_str', 'to_binary', 'to_text', 'TypeDispatcher', 'tokenize', 'tokenize_int',
-           'register_tokenizer', 'insert_reversed_tuple', 'ceildiv']
+           'register_tokenizer', 'ceildiv', 'Timer', 'reset_id_random_seed', 'new_random_id']

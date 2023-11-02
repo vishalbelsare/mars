@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Any
 
 
 class ActorPoolConfig:
@@ -26,6 +26,8 @@ class ActorPoolConfig:
             self._conf["pools"] = dict()
         if "mapping" not in self._conf:
             self._conf["mapping"] = dict()
+        if "metrics" not in self._conf:
+            self._conf["metrics"] = dict()
 
     @property
     def n_pool(self):
@@ -58,8 +60,9 @@ class ActorPoolConfig:
             "logging_conf": logging_conf,
             "kwargs": kwargs or {},
         }
+
+        mapping: Dict = self._conf["mapping"]
         for addr in external_address:
-            mapping: Dict = self._conf["mapping"]
             mapping[addr] = internal_address
 
     def get_pool_config(self, process_index: int):
@@ -76,8 +79,29 @@ class ActorPoolConfig:
             if external_address in conf["external_address"]:
                 return process_index
         raise ValueError(
-            f"Cannot get process_index " f"for {external_address}"
+            f"Cannot get process_index for {external_address}"
         )  # pragma: no cover
+
+    def reset_pool_external_address(
+        self,
+        process_index: int,
+        external_address: Union[str, List[str]],
+    ):
+        if not isinstance(external_address, list):
+            external_address = [external_address]
+        cur_pool_config = self._conf["pools"][process_index]
+        internal_address = cur_pool_config["internal_address"]
+
+        mapping: Dict = self._conf["mapping"]
+        for addr in cur_pool_config["external_address"]:
+            if internal_address == addr:
+                # internal address may be the same as external address in Windows
+                internal_address = external_address[0]
+            mapping.pop(addr, None)
+
+        cur_pool_config["external_address"] = external_address
+        for addr in external_address:
+            mapping[addr] = internal_address
 
     def get_external_addresses(self, label=None) -> List[str]:
         result = []
@@ -95,3 +119,10 @@ class ActorPoolConfig:
 
     def as_dict(self):
         return self._conf
+
+    def add_metric_configs(self, metrics: Dict[str, Any]):
+        if metrics:
+            self._conf["metrics"].update(metrics)
+
+    def get_metric_configs(self):
+        return self._conf["metrics"]

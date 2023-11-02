@@ -13,15 +13,20 @@
 # limitations under the License.
 
 import asyncio
+import copy
+import logging
 from typing import Dict, Union
 
+from ...oscar.profiling import ProfilingData
+from ...utils import Timer
 from ..errors import ServerClosed
 from .communication import Client
 from .message import _MessageBase, ResultMessage, ErrorMessage, DeserializeMessageFailed
 from .router import Router
 
 
-result_message_type = Union[ResultMessage, ErrorMessage]
+ResultMessageType = Union[ResultMessage, ErrorMessage]
+logger = logging.getLogger(__name__)
 
 
 class ActorCaller:
@@ -38,6 +43,14 @@ class ActorCaller:
         if client not in self._clients:
             self._clients[client] = asyncio.create_task(self._listen(client))
             self._client_to_message_futures[client] = dict()
+            client_count = len(self._clients)
+            if client_count >= 100:  # pragma: no cover
+                if (client_count - 100) % 10 == 0:  # pragma: no cover
+                    logger.warning(
+                        "Actor caller has created too many clients (%s >= 100), "
+                        "the global router may not be set.",
+                        client_count,
+                    )
         return client
 
     async def _listen(self, client: Client):
@@ -57,21 +70,33 @@ class ActorCaller:
                     ) from None
                 future = self._client_to_message_futures[client].pop(message.message_id)
                 future.set_result(message)
-            except DeserializeMessageFailed as e:  # pragma: no cover
+            except DeserializeMessageFailed as e:
                 message_id = e.message_id
                 future = self._client_to_message_futures[client].pop(message_id)
-                future.set_exception(e)
+                future.set_exception(e.__cause__)
             except Exception as e:  # noqa: E722  # pylint: disable=bare-except
                 message_futures = self._client_to_message_futures.get(client)
                 self._client_to_message_futures[client] = dict()
                 for future in message_futures.values():
-                    future.set_exception(e)
+                    future.set_exception(copy.copy(e))
+            finally:
+                # message may have Ray ObjectRef, delete it early in case next loop doesn't run
+                # as soon as expected.
+                try:
+                    del message
+                except NameError:
+                    pass
+                try:
+                    del future
+                except NameError:
+                    pass
+                await asyncio.sleep(0)
 
         message_futures = self._client_to_message_futures.get(client)
         self._client_to_message_futures[client] = dict()
         error = ServerClosed(f"Remote server {client.dest_address} closed")
         for future in message_futures.values():
-            future.set_exception(error)
+            future.set_exception(copy.copy(error))
 
     async def call(
         self,
@@ -85,20 +110,24 @@ class ActorCaller:
         wait_response = loop.create_future()
         self._client_to_message_futures[client][message.message_id] = wait_response
 
-        try:
-            await client.send(message)
-        except ConnectionError:
+        with Timer() as timer:
             try:
-                await client.close()
+                await client.send(message)
             except ConnectionError:
-                # close failed, ignore it
-                pass
-            raise ServerClosed(f"Remote server {client.dest_address} closed")
+                try:
+                    await client.close()
+                except ConnectionError:
+                    # close failed, ignore it
+                    pass
+                raise ServerClosed(f"Remote server {client.dest_address} closed")
 
-        if not wait:
-            return wait_response
-        else:
-            return await wait_response
+            if not wait:
+                r = wait_response
+            else:
+                r = await wait_response
+
+        ProfilingData.collect_actor_call(message, timer.duration)
+        return r
 
     async def stop(self):
         try:

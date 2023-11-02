@@ -28,7 +28,12 @@ class TaskSupervisorService(AbstractService):
             "default_config": {
                 "optimize_tileable_graph": True,
                 "optimize_chunk_graph": True,
-                "fuse_enabled": True
+                "fuse_enabled": True,
+                "reserved_finish_tasks": 10
+            },
+            "execution_config": {
+                "backend": "mars",
+                "mars": {},
             }
         }
     }
@@ -37,10 +42,14 @@ class TaskSupervisorService(AbstractService):
     async def start(self):
         task_config = self._config.get("task", dict())
         options = task_config.get("default_config", dict())
+        execution_config = task_config.get("execution_config", dict())
+        task_processor_cls = task_config.get("task_processor_cls")
         task_preprocessor_cls = task_config.get("task_preprocessor_cls")
         await mo.create_actor(
             TaskConfigurationActor,
             options,
+            execution_config=execution_config,
+            task_processor_cls=task_processor_cls,
             task_preprocessor_cls=task_preprocessor_cls,
             address=self._address,
             uid=TaskConfigurationActor.default_uid(),

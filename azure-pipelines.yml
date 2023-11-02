@@ -23,7 +23,7 @@ jobs:
         mars.test.module: 'tensor'
 
   variables:
-    PYTHON: '3.8'
+    PYTHON: '3.9'
 
   steps:
     - powershell: |
@@ -57,11 +57,6 @@ jobs:
           conda install -n test --quiet --yes -c conda-forge python=$PYTHON numba
         fi
 
-        # todo remove this when fastparquet release new version
-        if [[ "$PYTHON" =~ "3.6" ]]; then
-          pip install numpy\<1.20.0
-        fi
-
         source ./ci/rewrite-cov-config.sh
 
         if [[ "$(mars.test.module)" == "learn" ]]; then
@@ -74,7 +69,7 @@ jobs:
 
         if [ -z "$NO_COMMON_TESTS" ]; then
           if [[ ! "$PYTHON" =~ "3.6" ]] && [[ ! "$PYTHON" =~ "3.9" ]]; then
-            pip install h5py zarr matplotlib fastparquet\<0.7.0
+            pip install h5py zarr matplotlib fastparquet
             conda install -n test --quiet --yes -c conda-forge python=$PYTHON \
               "tiledb-py>=0.4.3,<0.6.0" "tiledb<2.0.0" || true
           fi
@@ -82,10 +77,8 @@ jobs:
           conda install -n test --quiet --yes -c pkgs/main python=$PYTHON certifi
 
           if [[ "$(mars.test.module)" == "learn" ]]; then
-            # remove version limit when blue-yonder/tsfresh#897 is fixed.
-            # remove keras version after https://github.com/tensorflow/tensorflow/issues/52922 is fixed.
-            pip install xgboost lightgbm keras==2.6.0 tensorflow faiss-cpu torch torchvision \
-              statsmodels\<0.13.0 tsfresh
+            pip install "xgboost<1.7" lightgbm keras tensorflow "faiss-cpu<1.7.3" torch torchvision \
+              statsmodels tsfresh
           fi
         fi
         conda list -n test
@@ -94,8 +87,19 @@ jobs:
     - bash: |
         set -e
         source ci/reload-env.sh
+        export CI=true
+        mkdir -p build
         pytest $PYTEST_CONFIG mars/$(mars.test.module)
-        coverage report
+        mv .coverage build/.coverage.main.file
+
+        # do compatibility test for earliest supported pandas release
+        if [[ "$(mars.test.module)" == "dataframe" ]]; then
+          pip install numpy\<1.24.0
+          pytest $PYTEST_CONFIG -m pd_compat mars/dataframe
+          mv .coverage build/.coverage.pd_compat.file
+        fi
+
+        coverage combine build/ && coverage report
         coverage xml
       displayName: 'Run tests'
 
@@ -115,7 +119,7 @@ jobs:
     vmImage: 'ubuntu-latest'
 
   variables:
-    PYTHON: '3.8'
+    PYTHON: '3.9'
 
   steps:
     - bash: |
@@ -143,17 +147,17 @@ jobs:
 
         # special check for __init__.py
         grep -A 10000 '\[flake8\]' setup.cfg | awk '!/(F401|F811|__init__\.py)/' > flake8_init.ini
-        flake8 --config=flake8_init.ini
+        flake8 mars --config=flake8_init.ini
 
         # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 mars --config="default" --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        flake8 mars --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
       displayName: 'Lint with flake8'
 
     - bash: |
         set -e
         source ./ci/reload-env.sh
 
-        black --check --diff --verbose mars
+        black --check --diff --verbose mars benchmarks
       displayName: 'Check code style with black'
 
     - bash: |

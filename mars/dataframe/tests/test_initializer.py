@@ -20,8 +20,8 @@ from ... import tensor as mt
 from ...tests.core import require_cudf, require_cupy
 from ...utils import lazy_import
 
-cupy = lazy_import("cupy", globals=globals())
-cudf = lazy_import("cudf", globals=globals())
+cupy = lazy_import("cupy")
+cudf = lazy_import("cudf")
 
 
 def test_dataframe_initializer(setup):
@@ -55,6 +55,10 @@ def test_dataframe_initializer(setup):
     r = md.DataFrame(m_dict, columns=list("ABC"))
     result = r.execute().fetch()
     pd.testing.assert_frame_equal(result, pd.DataFrame(raw_dict, columns=list("ABC")))
+
+    r = md.DataFrame({"a": [mt.tensor([1, 2, 3]).sum() + 1]})
+    result = r.execute().fetch()
+    pd.testing.assert_frame_equal(result, pd.DataFrame({"a": [7]}))
 
     # from tileable list
     raw_list = [

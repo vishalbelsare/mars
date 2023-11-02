@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import json
-from typing import Dict, List, Optional, Set
+import time
+from typing import Callable, Dict, List, Optional, Set
 
 from ....lib.aio import alru_cache
+from ....resource import Resource
 from ....typing import BandType
 from ....utils import serialize_serializable, deserialize_serializable
 from ...core import NodeRole
@@ -42,7 +44,7 @@ class ClusterWebAPIHandler(MarsServiceWebAPIHandler):
             res[node_addr] = res_dict
         return res
 
-    @web_api("nodes", method=["get", "post"])
+    @web_api("nodes", method=["get", "post"], cache_blocking=True)
     async def get_nodes_info(self):
         watch = bool(int(self.get_argument("watch", "0")))
         env = bool(int(self.get_argument("env", "0")))
@@ -102,7 +104,7 @@ class ClusterWebAPIHandler(MarsServiceWebAPIHandler):
             result["nodes"] = self._convert_node_dict(nodes)
         self.write(json.dumps(result))
 
-    @web_api("bands", method="get")
+    @web_api("bands", method="get", cache_blocking=True)
     async def get_all_bands(self):
         role_arg = self.get_argument("role", None)
         role = NodeRole(int(role_arg)) if role_arg is not None else None
@@ -133,18 +135,40 @@ class ClusterWebAPIHandler(MarsServiceWebAPIHandler):
                 )
             )
 
-    @web_api("versions", method="get")
+    @web_api("versions", method="get", cache_blocking=True)
     async def get_mars_versions(self):
         cluster_api = await self._get_cluster_api()
         self.write(json.dumps(list(await cluster_api.get_mars_versions())))
+
+    @web_api("pools", method="get", cache_blocking=True)
+    async def get_node_pool_configs(self):
+        cluster_api = await self._get_cluster_api()
+        address = self.get_argument("address", "") or None
+        pools = list(await cluster_api.get_node_pool_configs(address))
+        self.write(json.dumps({"pools": pools}))
+
+    @web_api("stacks", method="get", cache_blocking=True)
+    async def get_node_thread_stacks(self):
+        cluster_api = await self._get_cluster_api()
+        address = self.get_argument("address", "") or None
+        stacks = list(await cluster_api.get_node_thread_stacks(address))
+        self.write(
+            json.dumps(
+                {
+                    "generate_time": time.time(),
+                    "stacks": stacks,
+                }
+            )
+        )
 
 
 web_handlers = {ClusterWebAPIHandler.get_root_pattern(): ClusterWebAPIHandler}
 
 
 class WebClusterAPI(AbstractClusterAPI, MarsWebAPIClientMixin):
-    def __init__(self, address: str):
+    def __init__(self, address: str, request_rewriter: Callable = None):
         self._address = address.rstrip("/")
+        self.request_rewriter = request_rewriter
 
     @staticmethod
     def _convert_node_dict(node_info_list: Dict[str, Dict]):
@@ -258,7 +282,7 @@ class WebClusterAPI(AbstractClusterAPI, MarsWebAPIClientMixin):
         role: NodeRole = None,
         statuses: Set[NodeStatus] = None,
         exclude_statuses: Set[NodeStatus] = None,
-    ) -> Dict[BandType, int]:
+    ) -> Dict[BandType, Resource]:
         statuses = self._calc_statuses(statuses, exclude_statuses)
         statuses_str = (
             ",".join(str(status.value) for status in statuses) if statuses else ""
@@ -299,3 +323,13 @@ class WebClusterAPI(AbstractClusterAPI, MarsWebAPIClientMixin):
         path = f"{self._address}/api/cluster/versions"
         res = await self._request_url("GET", path)
         return list(json.loads(res.body))
+
+    async def get_node_pool_configs(self, address: str) -> List[Dict]:
+        path = f"{self._address}/api/cluster/pools?address={address}"
+        res = await self._request_url("GET", path)
+        return list(json.loads(res.body)["pools"])
+
+    async def get_node_thread_stacks(self, address: str) -> List[Dict]:
+        path = f"{self._address}/api/cluster/stacks?address={address}"
+        res = await self._request_url("GET", path)
+        return list(json.loads(res.body)["stacks"])

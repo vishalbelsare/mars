@@ -16,61 +16,88 @@
 
 import asyncio
 import dataclasses
+import datetime
+import enum
 import functools
 import importlib
+import inspect
 import io
 import itertools
 import logging
 import numbers
 import operator
 import os
-import cloudpickle as pickle
+import weakref
 import pkgutil
 import random
-import shutil
 import socket
 import struct
 import sys
 import threading
 import time
+import types
+import uuid
 import warnings
 import zlib
 from abc import ABC
 from contextlib import contextmanager
-from typing import Any, List, Dict, Set, Tuple, Type, Union, Callable, Optional
+from typing import (
+    Any,
+    List,
+    Dict,
+    NamedTuple,
+    Set,
+    Tuple,
+    Type,
+    Union,
+    Callable,
+    Optional,
+    Mapping,
+)
+from types import TracebackType
+from urllib.parse import urlparse
 
+import cloudpickle as pickle
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator
 
-from ._utils import (
+from ._utils import (  # noqa: F401 # pylint: disable=unused-import
     to_binary,
     to_str,
     to_text,
+    NamedType,
     TypeDispatcher,
     tokenize,
     tokenize_int,
     register_tokenizer,
-    insert_reversed_tuple,
     ceildiv,
+    reset_id_random_seed,
+    new_random_id,
+    Timer,
 )
+from .lib.version import parse as parse_version
 from .typing import ChunkType, TileableType, EntityType, OperandType
 
 logger = logging.getLogger(__name__)
 random.seed(int(time.time()) * os.getpid())
+pd_release_version: Tuple[int] = parse_version(pd.__version__).release
 
 OBJECT_FIELD_OVERHEAD = 50
 
 # make flake8 happy by referencing these imports
+NamedType = NamedType
 TypeDispatcher = TypeDispatcher
 tokenize = tokenize
 register_tokenizer = register_tokenizer
-insert_reversed_tuple = insert_reversed_tuple
 ceildiv = ceildiv
+reset_id_random_seed = reset_id_random_seed
+new_random_id = new_random_id
+_create_task = asyncio.create_task
+_is_ci = (os.environ.get("CI") or "0").lower() in ("1", "true")
 
 
 # fix encoding conversion problem under windows
-if sys.platform == "win32":  # pragma: no cover
+if sys.platform.startswith("win"):
 
     def _replace_default_encoding(func):
         def _fun(s, encoding=None):
@@ -84,6 +111,43 @@ if sys.platform == "win32":  # pragma: no cover
     to_binary = _replace_default_encoding(to_binary)
     to_text = _replace_default_encoding(to_text)
     to_str = _replace_default_encoding(to_str)
+
+
+try:
+    from pandas._libs.lib import NoDefault, no_default
+    from pandas._libs import lib as _pd__libs_lib
+
+    _raw__reduce__ = type(NoDefault).__reduce__
+
+    def _no_default__reduce__(self):
+        if self is not NoDefault:
+            return _raw__reduce__(self)
+        else:  # pragma: no cover
+            return getattr, (_pd__libs_lib, "NoDefault")
+
+    if hasattr(_pd__libs_lib, "_NoDefault"):  # pragma: no cover
+        # need to patch __reduce__ to make sure it can be properly unpickled
+        type(NoDefault).__reduce__ = _no_default__reduce__
+    else:
+        # introduced in pandas 1.5.0 : register for pickle compatibility
+        _pd__libs_lib._NoDefault = NoDefault
+except ImportError:  # pragma: no cover
+
+    class NoDefault(enum.Enum):
+        no_default = "NO_DEFAULT"
+
+        def __repr__(self) -> str:
+            return "<no_default>"
+
+    no_default = NoDefault.no_default
+
+    try:
+        # register for pickle compatibility
+        from pandas._libs import lib as _pd__libs_lib
+
+        _pd__libs_lib.NoDefault = NoDefault
+    except (ImportError, AttributeError):
+        pass
 
 
 class AttributeDict(dict):
@@ -124,7 +188,7 @@ def on_serialize_nsplits(value: Tuple[Tuple[int]]):
         return None
     new_nsplits = []
     for dim_splits in value:
-        new_nsplits.append(tuple(None if np.isnan(v) else v for v in dim_splits))
+        new_nsplits.append(tuple(None if pd.isna(v) else v for v in dim_splits))
     return tuple(new_nsplits)
 
 
@@ -169,17 +233,17 @@ def readable_size(size: int, trunc: bool = False) -> str:
     if size < 1024:
         ret_size = size
         size_unit = ""
-    elif 1024 <= size < 1024 ** 2:
+    elif 1024 <= size < 1024**2:
         ret_size = size * 1.0 / 1024
         size_unit = "K"
-    elif 1024 ** 2 <= size < 1024 ** 3:
-        ret_size = size * 1.0 / (1024 ** 2)
+    elif 1024**2 <= size < 1024**3:
+        ret_size = size * 1.0 / (1024**2)
         size_unit = "M"
-    elif 1024 ** 3 <= size < 1024 ** 4:
-        ret_size = size * 1.0 / (1024 ** 3)
+    elif 1024**3 <= size < 1024**4:
+        ret_size = size * 1.0 / (1024**3)
         size_unit = "G"
     else:
-        ret_size = size * 1.0 / (1024 ** 4)
+        ret_size = size * 1.0 / (1024**4)
         size_unit = "T"
 
     if not trunc:
@@ -191,23 +255,22 @@ def readable_size(size: int, trunc: bool = False) -> str:
 _git_info = None
 
 
+class GitInfo(NamedTuple):
+    commit_hash: str
+    commit_ref: str
+
+
 def git_info():
-    from ._version import get_git_info
+    from ._version import get_versions
 
     global _git_info
-    if _git_info is not None:
-        if _git_info == ":INVALID:":
-            return None
-        else:
-            return _git_info
 
-    git_tuple = get_git_info()
-    if git_tuple is None:
-        _git_info = ":INVALID:"
-        return None
-    else:
-        _git_info = git_tuple
-        return git_tuple
+    if _git_info is not None:
+        return _git_info
+
+    versions = get_versions()
+    _git_info = GitInfo(versions["full-revisionid"], versions["version"])
+    return _git_info
 
 
 LOW_PORT_BOUND = 10000
@@ -263,8 +326,7 @@ def get_next_port(typ: int = None, occupy: bool = True) -> int:
             occupied = _get_ports_from_netstat()
 
     occupied.update(_local_occupied_ports)
-    randn = struct.unpack("<Q", os.urandom(8))[0]
-    random.seed(int(time.time() * 1000000) | randn)
+    random.seed(uuid.uuid1().bytes)
     randn = random.randint(0, 100000000)
 
     idx = int(randn % (1 + HIGH_PORT_BOUND - LOW_PORT_BOUND - len(occupied)))
@@ -298,26 +360,67 @@ def lazy_import(
     globals: Dict = None,  # pylint: disable=redefined-builtin
     locals: Dict = None,  # pylint: disable=redefined-builtin
     rename: str = None,
+    placeholder: bool = False,
 ):
     rename = rename or name
     prefix_name = name.split(".", 1)[0]
+    globals = globals or inspect.currentframe().f_back.f_globals
 
     class LazyModule(object):
+        def __init__(self):
+            self._on_loads = []
+
         def __getattr__(self, item):
             if item.startswith("_pytest") or item in ("__bases__", "__test__"):
                 raise AttributeError(item)
 
             real_mod = importlib.import_module(name, package=package)
-            if globals is not None and rename in globals:
+            if rename in globals:
                 globals[rename] = real_mod
             elif locals is not None:
                 locals[rename] = real_mod
-            return getattr(real_mod, item)
+            ret = getattr(real_mod, item)
+
+            for on_load_func in self._on_loads:
+                on_load_func()
+
+            # make sure on_load hooks only executed once
+            self._on_loads = []
+            return ret
+
+        def add_load_handler(self, func: Callable):
+            self._on_loads.append(func)
+            return func
 
     if pkgutil.find_loader(prefix_name) is not None:
         return LazyModule()
+    elif placeholder:
+        return ModulePlaceholder(prefix_name)
     else:
         return None
+
+
+def lazy_import_on_load(lazy_mod):
+    def wrapper(fun):
+        if lazy_mod is not None and hasattr(lazy_mod, "add_load_handler"):
+            lazy_mod.add_load_handler(fun)
+        return fun
+
+    return wrapper
+
+
+class ModulePlaceholder:
+    def __init__(self, mod_name: str):
+        self._mod_name = mod_name
+
+    def _raises(self):
+        raise AttributeError(f"{self._mod_name} is required but not installed.")
+
+    def __getattr__(self, key):
+        self._raises()
+
+    def __call__(self, *_args, **_kwargs):
+        self._raises()
 
 
 def serialize_serializable(serializable, compress: bool = False):
@@ -325,7 +428,8 @@ def serialize_serializable(serializable, compress: bool = False):
 
     bio = io.BytesIO()
     header, buffers = serialize(serializable)
-    header["buf_sizes"] = [getattr(buf, "nbytes", len(buf)) for buf in buffers]
+    buf_sizes = [getattr(buf, "nbytes", len(buf)) for buf in buffers]
+    header[0]["buf_sizes"] = buf_sizes
     s_header = pickle.dumps(header)
     bio.write(struct.pack("<Q", len(s_header)))
     bio.write(s_header)
@@ -344,13 +448,14 @@ def deserialize_serializable(ser_serializable: bytes):
     bio = io.BytesIO(ser_serializable)
     s_header_length = struct.unpack("Q", bio.read(8))[0]
     header2 = pickle.loads(bio.read(s_header_length))
-    buffers2 = [bio.read(s) for s in header2["buf_sizes"]]
+    buffers2 = [bio.read(s) for s in header2[0]["buf_sizes"]]
     return deserialize(header2, buffers2)
 
 
 def register_ray_serializer(obj_type, serializer=None, deserializer=None):
-    ray = lazy_import("ray")
-    if ray:
+    try:
+        import ray
+
         try:
             ray.register_custom_serializer(
                 obj_type, serializer=serializer, deserializer=deserializer
@@ -368,6 +473,20 @@ def register_ray_serializer(obj_type, serializer=None, deserializer=None):
                 ray.util.register_serializer(
                     obj_type, serializer=serializer, deserializer=deserializer
                 )
+    except ImportError:
+        pass
+
+
+cudf = lazy_import("cudf")
+
+
+def _get_dtype_itemsize(dt: Union[np.dtype, pd.api.extensions.ExtensionDtype]) -> int:
+    try:
+        return dt.itemsize
+    except AttributeError:
+        if cudf and isinstance(dt, cudf.CategoricalDtype):
+            return dt.to_pandas().itemsize
+        raise
 
 
 def calc_data_size(dt: Any, shape: Tuple[int] = None) -> int:
@@ -389,7 +508,7 @@ def calc_data_size(dt: Any, shape: Tuple[int] = None) -> int:
     if hasattr(dt, "shape") and len(dt.shape) == 0:
         return 0
     if hasattr(dt, "dtypes") and shape is not None:
-        size = shape[0] * sum(dtype.itemsize for dtype in dt.dtypes)
+        size = shape[0] * sum(_get_dtype_itemsize(dtype) for dtype in dt.dtypes)
         try:
             index_value_value = dt.index_value.value
             if hasattr(index_value_value, "dtype") and not isinstance(
@@ -407,10 +526,13 @@ def calc_data_size(dt: Any, shape: Tuple[int] = None) -> int:
 
 
 def estimate_pandas_size(
-    df_obj, max_samples: int = 10, min_sample_rows: int = 100
+    pd_obj, max_samples: int = 10, min_sample_rows: int = 100
 ) -> int:
-    if len(df_obj) <= min_sample_rows or isinstance(df_obj, pd.RangeIndex):
-        return sys.getsizeof(df_obj)
+    if len(pd_obj) <= min_sample_rows or isinstance(pd_obj, pd.RangeIndex):
+        return sys.getsizeof(pd_obj)
+    if isinstance(pd_obj, pd.MultiIndex):
+        # MultiIndex's sample size can't be used to estimate
+        return sys.getsizeof(pd_obj)
 
     from .dataframe.arrays import ArrowDtype
 
@@ -421,14 +543,16 @@ def estimate_pandas_size(
             return isinstance(dtype, ArrowDtype)
 
     dtypes = []
-    if isinstance(df_obj, pd.DataFrame):
-        dtypes.extend(df_obj.dtypes)
-        index_obj = df_obj.index
-    elif isinstance(df_obj, pd.Series):
-        dtypes.append(df_obj.dtype)
-        index_obj = df_obj.index
+    is_series = False
+    if isinstance(pd_obj, pd.DataFrame):
+        dtypes.extend(pd_obj.dtypes)
+        index_obj = pd_obj.index
+    elif isinstance(pd_obj, pd.Series):
+        dtypes.append(pd_obj.dtype)
+        index_obj = pd_obj.index
+        is_series = True
     else:
-        index_obj = df_obj
+        index_obj = pd_obj
 
     # handling possible MultiIndex
     if hasattr(index_obj, "dtypes"):
@@ -437,43 +561,74 @@ def estimate_pandas_size(
         dtypes.append(index_obj.dtype)
 
     if all(_is_fast_dtype(dtype) for dtype in dtypes):
-        return sys.getsizeof(df_obj)
+        return sys.getsizeof(pd_obj)
 
-    indices = np.sort(np.random.choice(len(df_obj), size=max_samples, replace=False))
-    iloc = df_obj if isinstance(df_obj, pd.Index) else df_obj.iloc
-    sample_size = sys.getsizeof(iloc[indices])
-    return sample_size * len(df_obj) // max_samples
+    indices = np.sort(np.random.choice(len(pd_obj), size=max_samples, replace=False))
+    iloc = pd_obj if isinstance(pd_obj, pd.Index) else pd_obj.iloc
+    if isinstance(index_obj, pd.MultiIndex):
+        # MultiIndex's sample size is much greater than expected, thus we calculate
+        # the size separately.
+        index_size = sys.getsizeof(pd_obj.index)
+        if is_series:
+            sample_frame_size = iloc[indices].memory_usage(deep=True, index=False)
+        else:
+            sample_frame_size = iloc[indices].memory_usage(deep=True, index=False).sum()
+        return index_size + sample_frame_size * len(pd_obj) // max_samples
+    else:
+        sample_size = sys.getsizeof(iloc[indices])
+        return sample_size * len(pd_obj) // max_samples
 
 
-def build_fetch_chunk(
-    chunk: ChunkType, input_chunk_keys: List[str] = None, **kwargs
+def build_fetch_shuffle(
+    chunk: ChunkType, n_reducers=None, shuffle_fetch_type=None
 ) -> ChunkType:
+    from .core.operand import ShuffleProxy
+    from .core.operand import ShuffleFetchType
+
+    chunk_op = chunk.op
+    assert isinstance(chunk_op, ShuffleProxy)
+    params = chunk.params.copy()
+    n_mappers = len(chunk.inputs)
+    assert n_reducers > 0, n_reducers
+    # for shuffle nodes, we build FetchShuffle chunks
+    # to replace ShuffleProxy
+    if shuffle_fetch_type is ShuffleFetchType.FETCH_BY_INDEX:
+        # skip data keys info for `FETCH_BY_INDEX`
+        source_keys = None
+    else:
+        source_keys = [pinp.key for pinp in chunk.inputs]
+    op = chunk_op.get_fetch_op_cls(chunk)(
+        source_keys=source_keys,
+        n_mappers=n_mappers,
+        n_reducers=n_reducers,
+        shuffle_fetch_type=shuffle_fetch_type,
+        gpu=chunk.op.gpu,
+    )
+    return op.new_chunk(
+        None,
+        is_broadcaster=chunk.is_broadcaster,
+        kws=[params],
+        _key=chunk.key,
+        _id=chunk.id,
+    )
+
+
+def build_fetch_chunk(chunk: ChunkType, **kwargs) -> ChunkType:
     from .core.operand import ShuffleProxy
 
     chunk_op = chunk.op
     params = chunk.params.copy()
-
-    if isinstance(chunk_op, ShuffleProxy):
-        # for shuffle nodes, we build FetchShuffle chunks
-        # to replace ShuffleProxy
-        source_keys, source_idxes, source_mappers = [], [], []
-        for pinp in chunk.inputs:
-            if input_chunk_keys is not None and pinp.key not in input_chunk_keys:
-                continue
-            source_keys.append(pinp.key)
-            source_idxes.append(pinp.index)
-            source_mappers.append(get_chunk_mapper_id(pinp))
-        op = chunk_op.get_fetch_op_cls(chunk)(
-            source_keys=source_keys,
-            source_idxes=source_idxes,
-            source_mappers=source_mappers,
-            gpu=chunk.op.gpu,
-        )
-    else:
-        # for non-shuffle nodes, we build Fetch chunks
-        # to replace original chunk
-        op = chunk_op.get_fetch_op_cls(chunk)(sparse=chunk.op.sparse, gpu=chunk.op.gpu)
-    return op.new_chunk(None, kws=[params], _key=chunk.key, _id=chunk.id, **kwargs)
+    assert not isinstance(chunk_op, ShuffleProxy)
+    # for non-shuffle nodes, we build Fetch chunks
+    # to replace original chunk
+    op = chunk_op.get_fetch_op_cls(chunk)(sparse=chunk.op.sparse, gpu=chunk.op.gpu)
+    return op.new_chunk(
+        None,
+        is_broadcaster=chunk.is_broadcaster,
+        kws=[params],
+        _key=chunk.key,
+        **kwargs,
+    )
 
 
 def build_fetch_tileable(tileable: TileableType) -> TileableType:
@@ -510,19 +665,6 @@ def build_fetch(entity: EntityType) -> EntityType:
         raise TypeError(f"Type {type(entity)} not supported")
 
 
-def get_chunk_mapper_id(chunk: ChunkType) -> str:
-    op = chunk.op
-    try:
-        return op.mapper_id
-    except AttributeError:
-        from .core.operand import Fuse
-
-        if isinstance(op, Fuse):
-            return chunk.composed[-1].op.mapper_id
-        else:  # pragma: no cover
-            raise
-
-
 def get_chunk_reducer_index(chunk: ChunkType) -> Tuple[int]:
     op = chunk.op
     try:
@@ -548,7 +690,15 @@ def merge_chunks(chunk_results: List[Tuple[Tuple[int], Any]]) -> Any:
     -------
     Data
     """
-    from .dataframe.utils import is_dataframe, is_index, is_series, get_xdf
+    from sklearn.base import BaseEstimator
+
+    from .dataframe.utils import (
+        is_dataframe,
+        is_index,
+        is_series,
+        get_xdf,
+        concat_on_columns,
+    )
     from .lib.groupby_wrapper import GroupByWrapper
     from .tensor.array_utils import get_array_module, is_array
 
@@ -575,8 +725,8 @@ def merge_chunks(chunk_results: List[Tuple[Tuple[int], Any]]) -> Any:
         xdf = get_xdf(v)
         concats = []
         for _, cs in itertools.groupby(chunk_results, key=lambda t: t[0][0]):
-            concats.append(xdf.concat([c[1] for c in cs], axis="columns"))
-        return xdf.concat(concats, axis="index")
+            concats.append(concat_on_columns([c[1] for c in cs]))
+        return xdf.concat(concats, axis=0)
     elif is_series(v):
         xdf = get_xdf(v)
         return xdf.concat([c[1] for c in chunk_results])
@@ -638,6 +788,27 @@ def merge_chunks(chunk_results: List[Tuple[Tuple[int], Any]]) -> Any:
         return result
 
 
+def merged_chunk_as_tileable_type(merged, tileable: TileableType):
+    from .tensor.core import TensorOrder
+    from .tensor.array_utils import get_array_module
+
+    if hasattr(tileable, "order") and tileable.ndim > 0:
+        module = get_array_module(merged)
+        if tileable.order == TensorOrder.F_ORDER and hasattr(module, "asfortranarray"):
+            merged = module.asfortranarray(merged)
+        elif tileable.order == TensorOrder.C_ORDER and hasattr(
+            module, "ascontiguousarray"
+        ):
+            merged = module.ascontiguousarray(merged)
+    if (
+        hasattr(tileable, "isscalar")
+        and tileable.isscalar()
+        and getattr(merged, "size", None) == 1
+    ):
+        merged = merged.item()
+    return merged
+
+
 def calc_nsplits(chunk_idx_to_shape: Dict[Tuple[int], Tuple[int]]) -> Tuple[Tuple[int]]:
     """
     Calculate a tiled entity's nsplits.
@@ -660,25 +831,6 @@ def calc_nsplits(chunk_idx_to_shape: Dict[Tuple[int], Tuple[int]]) -> Tuple[Tupl
                 splits.append(shape[i])
         tileable_nsplits.append(tuple(splits))
     return tuple(tileable_nsplits)
-
-
-def sort_dataframe_result(df, result: pd.DataFrame) -> pd.DataFrame:
-    """sort DataFrame on client according to `should_be_monotonic` attribute"""
-    if hasattr(df, "index_value"):
-        if getattr(df.index_value, "should_be_monotonic", False):
-            try:
-                result.sort_index(inplace=True)
-            except TypeError:  # pragma: no cover
-                # cudf doesn't support inplace
-                result = result.sort_index()
-        if hasattr(df, "columns_value"):
-            if getattr(df.columns_value, "should_be_monotonic", False):
-                try:
-                    result.sort_index(axis=1, inplace=True)
-                except TypeError:  # pragma: no cover
-                    # cudf doesn't support inplace
-                    result = result.sort_index(axis=1)
-    return result
 
 
 def has_unknown_shape(*tiled_tileables: TileableType) -> bool:
@@ -706,45 +858,6 @@ def sbytes(x: Any) -> bytes:
         return bytes(x, encoding="utf-8")
     else:
         return bytes(x)
-
-
-def kill_process_tree(pid: int, include_parent: bool = True):
-    try:
-        import psutil
-    except ImportError:  # pragma: no cover
-        return
-    try:
-        proc = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        return
-
-    plasma_sock_dir = None
-    try:
-        children = proc.children(recursive=True)
-    except psutil.NoSuchProcess:  # pragma: no cover
-        return
-
-    if include_parent:
-        children.append(proc)
-    for p in children:
-        try:
-            if "plasma" in p.name():
-                try:
-                    plasma_sock_dir = next(
-                        (
-                            conn.laddr
-                            for conn in p.connections("unix")
-                            if "plasma" in conn.laddr
-                        ),
-                        None,
-                    )
-                except psutil.AccessDenied:
-                    pass
-            p.kill()
-        except psutil.NoSuchProcess:  # pragma: no cover
-            pass
-    if plasma_sock_dir:
-        shutil.rmtree(plasma_sock_dir, ignore_errors=True)
 
 
 def copy_tileables(tileables: List[TileableType], **kwargs):
@@ -1028,6 +1141,10 @@ def is_object_dtype(dtype: np.dtype) -> bool:
 def get_dtype(dtype: Union[np.dtype, pd.api.extensions.ExtensionDtype]):
     if pd.api.types.is_extension_array_dtype(dtype):
         return dtype
+    elif dtype is pd.Timestamp or dtype is datetime.datetime:
+        return np.dtype("datetime64[ns]")
+    elif dtype is pd.Timedelta or dtype is datetime.timedelta:
+        return np.dtype("timedelta64[ns]")
     else:
         return np.dtype(dtype)
 
@@ -1084,40 +1201,43 @@ def arrow_array_to_objects(
     return obj
 
 
+_enter_counter = 0
+_initial_session = None
+
+
 def enter_current_session(func: Callable):
     @functools.wraps(func)
     def wrapped(cls, ctx, op):
-        from .deploy.oscar.session import AbstractSession, get_default_session
+        from .session import AbstractSession, get_default_session
 
+        global _enter_counter, _initial_session
         # skip in some test cases
         if not hasattr(ctx, "get_current_session"):
             return func(cls, ctx, op)
 
-        session = ctx.get_current_session()
-        prev_default_session = get_default_session()
-        session.as_default()
+        with AbstractSession._lock:
+            if _enter_counter == 0:
+                # to handle nested call, only set initial session
+                # in first call
+                session = ctx.get_current_session()
+                _initial_session = get_default_session()
+                session.as_default()
+            _enter_counter += 1
 
         try:
             result = func(cls, ctx, op)
         finally:
-            if prev_default_session:
-                prev_default_session.as_default()
-            else:
-                AbstractSession.reset_default()
-
+            with AbstractSession._lock:
+                _enter_counter -= 1
+                if _enter_counter == 0:
+                    # set previous session when counter is 0
+                    if _initial_session:
+                        _initial_session.as_default()
+                    else:
+                        AbstractSession.reset_default()
         return result
 
     return wrapped
-
-
-class Timer:
-    def __enter__(self):
-        self._start = time.time()
-        return self
-
-    def __exit__(self, *_):
-        end = time.time()
-        self.duration = end - self._start
 
 
 _io_quiet_local = threading.local()
@@ -1195,7 +1315,7 @@ def find_objects(nested: Union[List, Dict], types: Union[Type, Tuple[Type]]) -> 
     return found
 
 
-def replace_objects(nested: Union[List, Dict], mapping: Dict) -> Union[List, Dict]:
+def replace_objects(nested: Union[List, Dict], mapping: Mapping) -> Union[List, Dict]:
     if not mapping:
         return nested
 
@@ -1249,25 +1369,27 @@ def dataslots(cls):
     return cls
 
 
-def get_params_fields(chunk):
+def get_chunk_params(chunk):
     from .dataframe.core import (
         DATAFRAME_CHUNK_TYPE,
         DATAFRAME_GROUPBY_CHUNK_TYPE,
         SERIES_GROUPBY_CHUNK_TYPE,
     )
 
-    fields = list(chunk.params)
-    if isinstance(chunk, DATAFRAME_CHUNK_TYPE):
-        fields.remove("dtypes")
-        fields.remove("columns_value")
-    elif isinstance(chunk, DATAFRAME_GROUPBY_CHUNK_TYPE):
-        fields.remove("dtypes")
-        fields.remove("key_dtypes")
-        fields.remove("columns_value")
-    elif isinstance(chunk, SERIES_GROUPBY_CHUNK_TYPE):
-        fields.remove("key_dtypes")
-
-    return fields
+    params = chunk.params.copy()
+    if isinstance(
+        chunk,
+        (
+            DATAFRAME_CHUNK_TYPE,
+            DATAFRAME_GROUPBY_CHUNK_TYPE,
+            SERIES_GROUPBY_CHUNK_TYPE,
+        ),
+    ):
+        # dataframe chunk needs some special process for now
+        params.pop("columns_value", None)
+        params.pop("dtypes", None)
+        params.pop("key_dtypes", None)
+    return params
 
 
 # Please refer to https://bugs.python.org/issue41451
@@ -1413,20 +1535,6 @@ def get_chunk_key_to_data_keys(chunk_graph):
     return chunk_key_to_data_keys
 
 
-class ModulePlaceholder:
-    def __init__(self, mod_name: str):
-        self._mod_name = mod_name
-
-    def _raises(self):
-        raise AttributeError(f"{self._mod_name} is required but not installed.")
-
-    def __getattr__(self, key):
-        self._raises()
-
-    def __call__(self, *_args, **_kwargs):
-        self._raises()
-
-
 def merge_dict(dest: Dict, src: Dict, path=None, overwrite=True):
     """
     Merges src dict into dest dict.
@@ -1499,3 +1607,318 @@ def flatten_dict_to_nested_dict(flatten_dict: Dict, sep=".") -> Dict:
                 else:
                     sub_nested_dict = sub_nested_dict[sub_key]
     return nested_dict
+
+
+def is_full_slice(slc: Any) -> bool:
+    """Check if the input is a full slice ((:) or (0:))"""
+    return (
+        isinstance(slc, slice)
+        and (slc.start == 0 or slc.start is None)
+        and slc.stop is None
+        and slc.step is None
+    )
+
+
+def wrap_exception(
+    exc: Exception,
+    bases: Tuple[Type] = None,
+    wrap_name: str = None,
+    message: str = None,
+    traceback: Optional[TracebackType] = None,
+    attr_dict: dict = None,
+):
+    """Generate an exception wraps the cause exception."""
+
+    def __init__(self):
+        pass
+
+    def __getattr__(self, item):
+        return getattr(exc, item)
+
+    def __str__(self):
+        return message or super(type(self), self).__str__()
+
+    traceback = traceback or exc.__traceback__
+    bases = bases or ()
+    attr_dict = attr_dict or {}
+    attr_dict.update(
+        {
+            "__init__": __init__,
+            "__getattr__": __getattr__,
+            "__str__": __str__,
+            "__wrapname__": wrap_name,
+            "__wrapped__": exc,
+            "__module__": type(exc).__module__,
+            "__cause__": exc.__cause__,
+            "__context__": exc.__context__,
+            "__suppress_context__": exc.__suppress_context__,
+            "args": exc.args,
+        }
+    )
+    new_exc_type = type(type(exc).__name__, bases + (type(exc),), attr_dict)
+    return new_exc_type().with_traceback(traceback)
+
+
+_func_token_cache = weakref.WeakKeyDictionary()
+
+
+def get_func_token(func):
+    try:
+        token = _func_token_cache.get(func)
+        if token is None:
+            fields = _get_func_token_values(func)
+            token = tokenize(*fields)
+            _func_token_cache[func] = token
+        return token
+    except TypeError:  # cannot create weak reference to func like 'numpy.ufunc'
+        return tokenize(*_get_func_token_values(func))
+
+
+def _get_func_token_values(func):
+    if hasattr(func, "__code__") and func.__code__.co_code:
+        tokens = [func.__code__.co_code]
+        if func.__closure__ is not None:
+            cvars = tuple([x.cell_contents for x in func.__closure__])
+            tokens.append(cvars)
+        return tokens
+    else:
+        tokens = []
+        while isinstance(func, functools.partial):
+            tokens.extend([func.args, func.keywords])
+            func = func.func
+        if (
+            isinstance(func, types.BuiltinFunctionType)
+            or "cython" in type(func).__name__
+        ):
+            tokens.extend([func.__module__, func.__name__])
+        elif hasattr(func, "__code__"):
+            tokens.extend(_get_func_token_values(func))
+        else:
+            tokens.append(func)
+        return tokens
+
+
+async def _run_task_with_error_log(
+    coro, call_site=None, exit_if_exception=False
+):  # pragma: no cover
+    try:
+        return await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(
+            "Coroutine %r at call_site %s execution got exception %s.",
+            coro,
+            call_site,
+            e,
+        )
+        if exit_if_exception:
+            logger.error("Exit because exit_if_exception=%s.", exit_if_exception)
+            os._exit(-1)  # Use os._exit to ensure exit in non-main thread.
+        raise
+
+
+def create_task_with_error_log(coro, *args, **kwargs):  # pragma: no cover
+    frame = inspect.currentframe()
+    if frame and frame.f_back:
+        call_site = frame.f_back.f_code
+    else:
+        call_site = None
+    return _create_task(_run_task_with_error_log(coro, call_site), *args, **kwargs)
+
+
+def aiotask_wrapper(_f=None, exit_if_exception=False):
+    def _wrapper(func):
+        @functools.wraps(func)
+        def _aiotask_wrapper(*args, **kwargs):
+            frame = inspect.currentframe()
+            if frame and frame.f_back:
+                call_site = frame.f_back.f_code
+            else:
+                call_site = None
+            return _run_task_with_error_log(
+                func(*args, **kwargs),
+                call_site=call_site,
+                exit_if_exception=exit_if_exception,
+            )
+
+        return _aiotask_wrapper
+
+    if inspect.iscoroutinefunction(_f):
+        return _wrapper(_f)
+    else:
+        assert _f is None
+        return _wrapper
+
+
+def is_ray_address(address: str) -> bool:
+    from .oscar.backends.ray.communication import RayServer
+
+    if urlparse(address).scheme == RayServer.scheme:
+        return True
+    else:
+        return False
+
+
+# TODO: clean_up_func, is_on_ray and restore_func functions may be
+# removed or refactored in the future to calculate func size
+# with more accuracy as well as address some serialization issues.
+def is_on_ray(ctx):
+    from .services.task.execution.ray.context import (
+        RayExecutionContext,
+        RayExecutionWorkerContext,
+    )
+
+    # There are three conditions
+    #   a. mars backend
+    #   b. ray backend(oscar), c. ray backend(dag)
+    # When a. or b. is selected, ctx is an instance of ThreadedServiceContext.
+    #   The main difference between them is whether worker address matches ray scheme.
+    #   To avoid duplicated checks, here we choose the first worker address.
+    # When c. is selected, ctx is an instance of RayExecutionContext or RayExecutionWorkerContext,
+    #   while get_worker_addresses method isn't currently implemented in RayExecutionWorkerContext.
+    try:
+        worker_addresses = ctx.get_worker_addresses()
+    except AttributeError:  # pragma: no cover
+        assert isinstance(ctx, RayExecutionWorkerContext)
+        return True
+    return isinstance(ctx, RayExecutionContext) or is_ray_address(worker_addresses[0])
+
+
+def cache_tileables(*tileables):
+    from .core import ENTITY_TYPE
+
+    if len(tileables) == 1 and isinstance(tileables[0], (tuple, list)):
+        tileables = tileables[0]
+    for t in tileables:
+        if isinstance(t, ENTITY_TYPE):
+            t.cache = True
+
+
+class TreeReductionBuilder:
+    def __init__(self, combine_size=None):
+        from .config import options
+
+        self._combine_size = combine_size or options.combine_size
+
+    def _build_reduction(self, inputs, final=False):
+        raise NotImplementedError
+
+    def build(self, inputs):
+        combine_size = self._combine_size
+        while len(inputs) > self._combine_size:
+            new_inputs = []
+            for i in range(0, len(inputs), combine_size):
+                objs = inputs[i : i + combine_size]
+                if len(objs) == 1:
+                    obj = objs[0]
+                else:
+                    obj = self._build_reduction(objs, final=False)
+                new_inputs.append(obj)
+            inputs = new_inputs
+
+        if len(inputs) == 1:
+            return inputs[0]
+        return self._build_reduction(inputs, final=True)
+
+
+def ensure_coverage():
+    # make sure coverage is handled when starting with subprocess.Popen
+    if (
+        not sys.platform.startswith("win") and "COV_CORE_SOURCE" in os.environ
+    ):  # pragma: no cover
+        try:
+            from pytest_cov.embed import cleanup_on_sigterm
+        except ImportError:
+            pass
+        else:
+            cleanup_on_sigterm()
+
+
+@functools.lru_cache(100)
+def sync_to_async(func):
+    if inspect.iscoroutinefunction(func):
+        return func
+    else:
+        # Wrap the sync call to thread to avoid blocking the
+        # asyncio event loop. e.g. acquiring a threading.Lock()
+        # in the sync call.
+        return functools.partial(asyncio.to_thread, func)
+
+
+def retry_callable(
+    callable_,
+    ex_type: type = Exception,
+    wait_interval=1,
+    max_retries=-1,
+    sync: bool = None,
+):
+    if inspect.iscoroutinefunction(callable_) or sync is False:
+
+        @functools.wraps(callable)
+        async def retry_call(*args, **kwargs):
+            num_retried = 0
+            while max_retries < 0 or num_retried < max_retries:
+                num_retried += 1
+                try:
+                    return await callable_(*args, **kwargs)
+                except ex_type:
+                    await asyncio.sleep(wait_interval)
+
+    else:
+
+        @functools.wraps(callable)
+        def retry_call(*args, **kwargs):
+            num_retried = 0
+            ex = None
+            while max_retries < 0 or num_retried < max_retries:
+                num_retried += 1
+                try:
+                    return callable_(*args, **kwargs)
+                except ex_type as e:
+                    ex = e
+                    time.sleep(wait_interval)
+            assert ex is not None
+            raise ex  # pylint: disable-msg=E0702
+
+    return retry_call
+
+
+# `get_node_ip_address` is taken from Ray.
+# https://github.com/ray-project/ray/blob/master/python/ray/_private/services.py#L617
+def get_node_ip_address(address="8.8.8.8:53"):
+    """Determine the IP address of the local node.
+
+    Args:
+        address (str): The IP address and port of any known live service on the
+            network you care about.
+
+    Returns:
+        The IP address of the current node.
+    """
+    ip_address, port = address.split(":")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # This command will raise an exception if there is no internet
+        # connection.
+        s.connect((ip_address, int(port)))
+        node_ip_address = s.getsockname()[0]
+    except Exception as e:  # pragma: no cover
+        node_ip_address = "127.0.0.1"
+        # [Errno 101] Network is unreachable
+        if e.errno == 101:
+            try:
+                # try get node ip address from host name
+                host_name = socket.getfqdn(socket.gethostname())
+                node_ip_address = socket.gethostbyname(host_name)
+            except Exception:  # noqa: E722  # nosec  # pylint: disable=bare-except
+                pass
+    finally:
+        s.close()
+
+    return node_ip_address
+
+
+def is_debugger_repr_thread():
+    thread_cls_name = type(threading.current_thread()).__name__
+    return "GetValue" in thread_cls_name and "Debug" in thread_cls_name

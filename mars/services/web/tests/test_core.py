@@ -26,7 +26,9 @@ from ..api.web import MarsApiEntryHandler
 
 
 class TestAPIHandler(MarsServiceWebAPIHandler):
+    __test__ = False
     _root_pattern = "/api/test/(?P<test_id>[^/]+)"
+    _call_counter = 0
 
     @web_api("", method="get")
     def get_method_root(self, test_id):
@@ -56,6 +58,12 @@ class TestAPIHandler(MarsServiceWebAPIHandler):
     async def get_with_timeout(self, test_id):
         await asyncio.sleep(100)
         raise ValueError(test_id)
+
+    @web_api("subtest_delay_cache", method="get", cache_blocking=True)
+    async def get_with_blocking_cache(self, test_id):
+        await asyncio.sleep(1)
+        type(self)._call_counter += 1
+        self.write(test_id)
 
 
 @pytest.fixture
@@ -90,8 +98,14 @@ class SimpleWebClient(MarsWebAPIClientMixin):
 @pytest.mark.asyncio
 async def test_web_api(actor_pool):
     _pool, web_port = actor_pool
+    recorded_urls = []
+
+    def url_recorder(request):
+        recorded_urls.append(request.url)
+        return request
 
     client = SimpleWebClient()
+    client.request_rewriter = url_recorder
 
     res = await client.fetch(f"http://localhost:{web_port}/")
     assert res.body.decode()
@@ -113,12 +127,12 @@ async def test_web_api(actor_pool):
     assert res.body.decode() == "get_sub_value_test_id_sub_tid"
 
     res = await client.fetch(
-        f"http://localhost:{web_port}/api/test/test_id/" f"subtest/sub_tid?action=a1"
+        f"http://localhost:{web_port}/api/test/test_id/subtest/sub_tid?action=a1"
     )
     assert res.body.decode() == "get_sub_value_test_id_sub_tid_action1"
 
     res = await client.fetch(
-        f"http://localhost:{web_port}/api/test/test_id/" f"subtest/sub_tid?action=a2"
+        f"http://localhost:{web_port}/api/test/test_id/subtest/sub_tid?action=a2"
     )
     assert res.body.decode() == "get_sub_value_test_id_sub_tid_action2"
 
@@ -131,6 +145,17 @@ async def test_web_api(actor_pool):
             f"http://localhost:{web_port}/api/test/test_id/subtest_error"
         )
 
+    # test multiple request into long immutable requests
+    req_uri = f"http://localhost:{web_port}/api/test/test_id/subtest_delay_cache"
+    tasks = [asyncio.create_task(client.fetch(req_uri)) for _ in range(2)]
+    await asyncio.sleep(0.5)
+    assert TestAPIHandler._call_counter == 0
+    assert len(TestAPIHandler._uri_to_futures) == 1
+
+    await asyncio.gather(*tasks)
+    assert TestAPIHandler._call_counter == 1
+    assert len(TestAPIHandler._uri_to_futures) == 0
+
     with pytest.raises(TimeoutError):
         await client.fetch(
             f"http://localhost:{web_port}/api/test/test_id/subtest_delay",
@@ -139,3 +164,5 @@ async def test_web_api(actor_pool):
 
     res = await client.fetch(f"http://localhost:{web_port}/api/extra_test")
     assert "Test" in res.body.decode()
+
+    assert len(recorded_urls) > 0

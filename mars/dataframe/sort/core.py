@@ -19,11 +19,12 @@ from ...core import recursive_tile
 from ...core.operand import OperandStage
 from ...serialization.serializables import (
     FieldTypes,
+    AnyField,
+    BoolField,
     Int32Field,
     Int64Field,
-    StringField,
     ListField,
-    BoolField,
+    StringField,
 )
 from ...utils import ceildiv
 from ..operands import DataFrameOperand
@@ -31,79 +32,15 @@ from ..utils import parse_index
 
 
 class DataFrameSortOperand(DataFrameOperand):
-    _axis = Int32Field("axis")
-    _ascending = BoolField("ascending")
-    _inplace = BoolField("inplace")
-    _kind = StringField("kind")
-    _na_position = StringField("na_position")
-    _ignore_index = BoolField("ignore_index")
-    _parallel_kind = StringField("parallel_kind")
-    _psrs_kinds = ListField("psrs_kinds", FieldTypes.string)
-    _nrows = Int64Field("nrows")
-
-    def __init__(
-        self,
-        axis=None,
-        ascending=None,
-        inplace=None,
-        kind=None,
-        na_position=None,
-        ignore_index=None,
-        parallel_kind=None,
-        psrs_kinds=None,
-        nrows=None,
-        gpu=False,
-        **kw
-    ):
-        super().__init__(
-            _axis=axis,
-            _ascending=ascending,
-            _inplace=inplace,
-            _kind=kind,
-            _na_position=na_position,
-            _ignore_index=ignore_index,
-            _parallel_kind=parallel_kind,
-            _psrs_kinds=psrs_kinds,
-            _nrows=nrows,
-            _gpu=gpu,
-            **kw
-        )
-
-    @property
-    def axis(self):
-        return self._axis
-
-    @property
-    def ascending(self):
-        return self._ascending
-
-    @property
-    def inplace(self):
-        return self._inplace
-
-    @property
-    def kind(self):
-        return self._kind
-
-    @property
-    def na_position(self):
-        return self._na_position
-
-    @property
-    def ignore_index(self):
-        return self._ignore_index
-
-    @property
-    def parallel_kind(self):
-        return self._parallel_kind
-
-    @property
-    def psrs_kinds(self):
-        return self._psrs_kinds
-
-    @property
-    def nrows(self):
-        return self._nrows
+    axis = Int32Field("axis")
+    ascending = AnyField("ascending")
+    inplace = BoolField("inplace")
+    kind = StringField("kind")
+    na_position = StringField("na_position")
+    ignore_index = BoolField("ignore_index")
+    parallel_kind = StringField("parallel_kind")
+    psrs_kinds = ListField("psrs_kinds", FieldTypes.string)
+    nrows = Int64Field("nrows", default=None)
 
     @classmethod
     def _tile_head(cls, op: "DataFrameSortOperand"):
@@ -147,10 +84,13 @@ class DataFrameSortOperand(DataFrameOperand):
                 shape[0] = sum(c.shape[0] for c in to_combine_chunks)
                 shape = tuple(shape)
                 concat_params["shape"] = shape
-                c = DataFrameConcat(axis=axis, output_types=op.output_types).new_chunk(
-                    to_combine_chunks, kws=[concat_params]
-                )
-
+                if len(to_combine_chunks) == 1:
+                    c = to_combine_chunks[0].copy()
+                    c._index = chunk_index
+                else:
+                    c = DataFrameConcat(
+                        axis=axis, output_types=op.output_types
+                    ).new_chunk(to_combine_chunks, kws=[concat_params])
                 chunk_op = op.copy().reset_key()
                 chunk_op.stage = (
                     OperandStage.combine if chunk_size > 1 else OperandStage.agg

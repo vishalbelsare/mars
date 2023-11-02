@@ -15,7 +15,32 @@
 try:
     import scipy
 
-    from .err_fresnel import erf, TensorErf
+    from .err_fresnel import (
+        erf,
+        TensorErf,
+        erfc,
+        TensorErfc,
+        erfcx,
+        TensorErfcx,
+        erfi,
+        TensorErfi,
+        erfinv,
+        TensorErfinv,
+        erfcinv,
+        TensorErfcinv,
+        wofz,
+        TensorWofz,
+        dawsn,
+        TensorDawsn,
+        fresnel,
+        TensorFresnel,
+        modfresnelp,
+        TensorModFresnelP,
+        modfresnelm,
+        TensorModFresnelM,
+        voigt_profile,
+        TensorVoigtProfile,
+    )
     from .gamma_funcs import (
         gamma,
         TensorGamma,
@@ -106,5 +131,47 @@ try:
         hyp0f1,
         TensorHYP0F1,
     )
+    from .ellip_harm import (
+        ellip_harm,
+        TensorEllipHarm,
+        ellip_harm_2,
+        TensorEllipHarm2,
+        ellip_normal,
+        TensorEllipNormal,
+    )
+    from .ellip_func_integrals import (
+        ellipk,
+        TensorEllipk,
+        ellipkm1,
+        TensorEllipkm1,
+        ellipkinc,
+        TensorEllipkinc,
+        ellipe,
+        TensorEllipe,
+        ellipeinc,
+        TensorEllipeinc,
+        elliprc,
+        TensorElliprc,
+        elliprd,
+        TensorElliprd,
+        elliprf,
+        TensorElliprf,
+        elliprg,
+        TensorElliprg,
+        elliprj,
+        TensorElliprj,
+    )
+    from .airy import (
+        airy,
+        TensorAiry,
+        airye,
+        TensorAirye,
+        itairy,
+        TensorItairy,
+    )
 except ImportError:  # pragma: no cover
     pass
+
+_names_to_del = [_name for _name, _val in globals().items() if _val is None]
+[globals().pop(_name) for _name in _names_to_del]
+del _names_to_del

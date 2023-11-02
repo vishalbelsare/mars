@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from . import ShuffleFetchType, FetchShuffle
 from ... import opcodes
 from ...serialization.serializables import (
     Int32Field,
@@ -24,12 +25,36 @@ from .base import Operand, VirtualOperand, OperandStage
 
 class ShuffleProxy(VirtualOperand):
     _op_type_ = opcodes.SHUFFLE_PROXY
+    n_mappers = Int32Field("n_mappers", default=0)
+    # `n_reducers` will be updated in `MapReduceOperand._new_chunks`
+    n_reducers = Int32Field("n_reducers", default=0)
+
+    def _new_chunks(self, inputs, kws=None, **kw):
+        self.n_mappers = len(inputs)
+        return super()._new_chunks(inputs, kws, **kw)
 
 
 class MapReduceOperand(Operand):
+    """
+    An operand for shuffle execution which partitions data by the value in each record’s partition key, and
+    send the partitioned data from all mappers to all reducers.
+    """
+
+    # for reducer
     reducer_index = TupleField("reducer_index", FieldTypes.uint64)
-    mapper_id = Int32Field("mapper_id", default=0)
+    # Total reducer nums, which also be shuffle blocks for single mapper.
+    n_reducers = Int32Field("n_reducers")
+    # The reducer ordinal in all reducers. It's different from reducer_index,
+    # which might be a tuple.
+    # `reducer_ordinal` will be set in `_new_chunks`.
+    reducer_ordinal = Int32Field("reducer_ordinal")
     reducer_phase = StringField("reducer_phase", default=None)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.stage == OperandStage.reduce:
+            # for reducer, we assign worker at first
+            self.scheduling_hint.reassign_worker = True
 
     def _new_chunks(self, inputs, kws=None, **kw):
         if getattr(self, "reducer_index", None) is None:
@@ -37,7 +62,14 @@ class MapReduceOperand(Operand):
             if kws:
                 index = kws[0].get("index")
             self.reducer_index = index or kw.get("index")
-
+        if self.stage == OperandStage.reduce:
+            # Operands such as `TensorIndexSetValue` will have multiple inputs, some won't be ProxyChunk
+            proxy_operands = [c.op for c in inputs if isinstance(c.op, ShuffleProxy)]
+            if proxy_operands:
+                # For create reduce checks with `FetchShuffle`, `proxy_operands` will be empty.
+                proxy = proxy_operands[0]
+                self.reducer_ordinal = proxy.n_reducers
+                proxy.n_reducers += 1
         return super()._new_chunks(inputs, kws, **kw)
 
     def get_dependent_data_keys(self):
@@ -52,56 +84,47 @@ class MapReduceOperand(Operand):
                         [(chunk.key, self.reducer_index) for chunk in inp.inputs or ()]
                     )
                 elif isinstance(inp.op, FetchShuffle):
+                    # fetch shuffle by index doesn't store data keys, so it won't run into this function.
+                    assert inp.op.shuffle_fetch_type == ShuffleFetchType.FETCH_BY_KEY
                     deps.extend([(k, self.reducer_index) for k in inp.op.source_keys])
                 else:
                     deps.append(inp.key)
             return deps
         return super().get_dependent_data_keys()
 
-    def _iter_mapper_key_idx_pairs(self, input_id=0, mapper_id=None):
+    def iter_mapper_keys(self, input_id=0):
+        # key is mapper chunk key, index is mapper chunk index.
         input_chunk = self.inputs[input_id]
         if isinstance(input_chunk.op, ShuffleProxy):
             keys = [inp.key for inp in input_chunk.inputs]
-            idxes = [inp.index for inp in input_chunk.inputs]
-            mappers = (
-                [inp.op.mapper_id for inp in input_chunk.inputs]
-                if mapper_id is not None
-                else None
-            )
         else:
+            assert isinstance(input_chunk.op, FetchShuffle), input_chunk.op
+            if input_chunk.op.shuffle_fetch_type == ShuffleFetchType.FETCH_BY_INDEX:
+                # For fetch shuffle by index, all shuffle block of same reducers are
+                # identified by their index. chunk key are not needed any more.
+                # so just mock key here.
+                # keep this in sync with ray executor `execute_subtask`.
+                return list(range(input_chunk.op.n_mappers))
             keys = input_chunk.op.source_keys
-            idxes = input_chunk.op.source_idxes
-            mappers = input_chunk.op.source_mappers
+        return keys
 
-        if mapper_id is None:
-            key_idx_pairs = zip(keys, idxes)
-        else:
-            key_idx_pairs = (
-                (key, idx)
-                for key, idx, mapper in zip(keys, idxes, mappers)
-                if mapper == mapper_id
-            )
-        return key_idx_pairs
-
-    def iter_mapper_data_with_index(
-        self, ctx, input_id=0, mapper_id=None, pop=False, skip_none=False
-    ):
-        for key, idx in self._iter_mapper_key_idx_pairs(input_id, mapper_id):
+    def iter_mapper_data(self, ctx, input_id=0, pop=False, skip_none=False):
+        for key in self.iter_mapper_keys(input_id):
             try:
                 if pop:
-                    yield idx, ctx.pop((key, self.reducer_index))
+                    yield ctx.pop((key, self.reducer_index))
                 else:
-                    yield idx, ctx[key, self.reducer_index]
+                    yield ctx[key, self.reducer_index]
             except KeyError:
                 if not skip_none:  # pragma: no cover
                     raise
                 if not pop:
                     ctx[key, self.reducer_index] = None
 
-    def iter_mapper_data(
-        self, ctx, input_id=0, mapper_id=0, pop=False, skip_none=False
-    ):
-        for _idx, data in self.iter_mapper_data_with_index(
-            ctx, input_id, mapper_id, pop=pop, skip_none=skip_none
-        ):
-            yield data
+    def execute(self, ctx, op):
+        """The mapper stage must ensure all mapper blocks are inserted into ctx and no blocks
+        for some reducers are missing. This is needed by shuffle fetch by index,
+        which shuffle block are identified by the  index instead of data keys.
+        For operands implementation simplicity, we can sort the `ctx` by key which are (chunk key, reducer index) tuple
+        and relax the insert order requirements.
+        """

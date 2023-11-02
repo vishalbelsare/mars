@@ -17,7 +17,6 @@ import pandas as pd
 
 from .... import opcodes
 from ....core import recursive_tile
-from ....lib.version import parse as parse_version
 from ....serialization.serializables import (
     FieldTypes,
     AnyField,
@@ -30,12 +29,13 @@ from ....serialization.serializables import (
     DictField,
     ListField,
 )
-from ....utils import lazy_import, has_unknown_shape
+from ....utils import lazy_import, has_unknown_shape, pd_release_version, calc_nsplits
 from ...operands import DataFrameOperand, DataFrameOperandMixin
 from ...core import DATAFRAME_TYPE
 from ...utils import build_empty_df, build_empty_series, parse_index
 
-cudf = lazy_import("cudf", globals=globals())
+cudf = lazy_import("cudf")
+_with_pandas_issue_38908 = pd_release_version == (1, 2, 0)
 
 
 class DataFrameRollingAgg(DataFrameOperand, DataFrameOperandMixin):
@@ -401,9 +401,12 @@ class DataFrameRollingAgg(DataFrameOperand, DataFrameOperandMixin):
                     chunk_params["index_value"] = inp_chunk.index_value
                     chunk_params["columns_value"] = out.columns_value
                 else:
-                    out_shape = list(out.shape)
-                    out_shape[axis] = inp_chunk.shape[axis]
-                    chunk_params["shape"] = tuple(out_shape)
+                    if axis == 0:
+                        out_shape = list(out.shape)
+                        out_shape[axis] = inp_chunk.shape[axis]
+                        chunk_params["shape"] = tuple(out_shape)
+                    else:
+                        chunk_params["shape"] = inp_chunk.shape
                     chunk_params["index_value"] = (
                         inp_chunk.index_value if axis == 0 else out.index_value
                     )
@@ -429,12 +432,7 @@ class DataFrameRollingAgg(DataFrameOperand, DataFrameOperandMixin):
             params["shape"] = (inp.shape[0],)
         else:
             params["shape"] = (inp.shape[0], params["shape"][1])
-        nsplits = list(inp.nsplits)
-        if input_ndim == 1 and output_ndim == 2:
-            nsplits.append((out.shape[1],))
-        elif input_ndim == 2 and output_ndim == 2:
-            nsplits[1 - op.axis] = (out.shape[1 - op.axis],)
-        params["nsplits"] = tuple(nsplits)
+        params["nsplits"] = calc_nsplits({c.index: c.shape for c in out_chunks})
         new_op = op.copy()
         return new_op.new_tileables([inp], kws=[params])
 
@@ -465,7 +463,7 @@ class DataFrameRollingAgg(DataFrameOperand, DataFrameOperandMixin):
             # df.rolling().aggregate('skew') modified original data
             # so we copy it first for skew only
             if (
-                parse_version(pd.__version__) == parse_version("1.2.0")
+                _with_pandas_issue_38908
                 and op.func in ["skew", "kurt"]
                 and op.outputs[0].index[0] == 0
             ):

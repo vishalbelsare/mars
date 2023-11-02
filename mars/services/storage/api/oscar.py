@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import sys
-from typing import Any, List, Type, TypeVar, Union
+from typing import Any, List, Tuple, Type, TypeVar, Union
 
 from .... import oscar as mo
 from ....lib.aio import alru_cache
@@ -33,8 +33,8 @@ APIType = TypeVar("APIType", bound="StorageAPI")
 
 
 class StorageAPI(AbstractStorageAPI):
-    _storage_handler_ref: Union[StorageHandlerActor, mo.ActorRef]
-    _data_manager_ref: Union[DataManagerActor, mo.ActorRef]
+    _storage_handler_ref: mo.ActorRefType[StorageHandlerActor]
+    _data_manager_ref: mo.ActorRefType[DataManagerActor]
 
     def __init__(self, address: str, session_id: str, band_name: str):
         self._address = address
@@ -82,6 +82,12 @@ class StorageAPI(AbstractStorageAPI):
         api = StorageAPI(address, session_id, band_name)
         await api._init()
         return api
+
+    async def is_seekable(self, storage_level: StorageLevel = None) -> bool:
+        """
+        If storage backend is seekable.
+        """
+        return await self._storage_handler_ref.is_seekable(storage_level)
 
     @mo.extensible
     async def get(
@@ -163,7 +169,7 @@ class StorageAPI(AbstractStorageAPI):
     @mo.extensible
     async def fetch(
         self,
-        data_key: str,
+        data_key: Union[str, Tuple],
         level: StorageLevel = None,
         band_name: str = None,
         remote_address: str = None,
@@ -174,8 +180,9 @@ class StorageAPI(AbstractStorageAPI):
 
         Parameters
         ----------
-        data_key: str
-            data key to fetch to current worker with specific level
+        data_key: str or tuple
+            data key(tuple when is shuffle key) to fetch to current worker
+            with specific level.
         level: StorageLevel
             the storage level to put into, MEMORY as default
         band_name: BandType
@@ -245,14 +252,14 @@ class StorageAPI(AbstractStorageAPI):
         return await self._storage_handler_ref.open_reader(self._session_id, data_key)
 
     async def open_writer(
-        self, data_key: str, size: int, level: StorageLevel
+        self, data_key: Union[Tuple, str], size: int, level: StorageLevel = None
     ) -> WrappedStorageFileObject:
         """
         Return a file-like object for writing data.
 
         Parameters
         ----------
-        data_key: str
+        data_key: str or tuple
             data key
         size: int
             the total size of data
@@ -323,21 +330,7 @@ class MockStorageAPI(StorageAPI):
 
         storage_configs = kwargs.get("storage_configs")
         if not storage_configs:
-            if sys.platform == "darwin":
-                plasma_dir = "/tmp"
-            else:
-                plasma_dir = "/dev/shm"
-            plasma_setup_params = dict(
-                store_memory=10 * 1024 * 1024,
-                plasma_directory=plasma_dir,
-                check_dir_size=False,
-            )
-            if _is_windows:
-                storage_configs = {"shared_memory": {}}
-            else:
-                storage_configs = {
-                    "plasma": plasma_setup_params,
-                }
+            storage_configs = {"shared_memory": {}}
 
         storage_handler_cls = kwargs.pop("storage_handler_cls", StorageHandlerActor)
         await mo.create_actor(

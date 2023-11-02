@@ -51,7 +51,7 @@ def _check_multi_class(multi_class, solver, n_classes):
         return "multinomial"
 
     raise ValueError(
-        "multi_class should be 'multinomial', " "'ovr' or 'auto'. Got %s." % multi_class
+        "multi_class should be 'multinomial', 'ovr' or 'auto'. Got %s." % multi_class
     )
 
 
@@ -175,7 +175,6 @@ class LogisticRegression(LinearClassifierMixin, BaseEstimator):
         multi_class="auto",
         verbose=0,
     ):
-
         self.penalty = penalty
         self.fit_intercept = fit_intercept
         self.C = C

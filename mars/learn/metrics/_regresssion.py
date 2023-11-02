@@ -90,10 +90,10 @@ def _check_reg_targets(y_true, y_pred, multioutput, dtype="numeric"):
     elif multioutput is not None:
         multioutput = check_array(multioutput, ensure_2d=False)
         if n_outputs == 1:
-            raise ValueError("Custom weights are useful only in " "multi-output cases.")
+            raise ValueError("Custom weights are useful only in multi-output cases.")
         elif n_outputs != len(multioutput):
             raise ValueError(
-                ("There must be equally many custom weights " "(%d) as outputs (%d).")
+                ("There must be equally many custom weights (%d) as outputs (%d).")
                 % (len(multioutput), n_outputs)
             )
     y_type = "continuous" if n_outputs == 1 else "continuous-multioutput"
@@ -214,7 +214,7 @@ def r2_score(
     nonzero_denominator = denominator != 0
     nonzero_numerator = numerator != 0
     valid_score = nonzero_denominator & nonzero_numerator
-    output_scores = mt.ones([y_true.shape[1]])
+    output_scores = mt.ones((y_true.shape[1],))
     output_scores[valid_score] = 1 - (numerator[valid_score] / denominator[valid_score])
     # arbitrary set to zero to avoid -inf scores, having a constant
     # y_true is not interesting for scoring a regression anyway

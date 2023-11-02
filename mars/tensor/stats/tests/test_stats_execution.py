@@ -28,6 +28,7 @@ from scipy.stats import (
     ttest_ind as sp_ttest_ind,
     ttest_ind_from_stats as sp_ttest_ind_from_stats,
     ttest_1samp as sp_ttest_1samp,
+    rankdata as sp_rankdata,
 )
 
 from ....lib.version import parse as parse_version
@@ -42,6 +43,7 @@ from .. import (
     ttest_ind_from_stats,
     ks_1samp,
     ks_2samp,
+    rankdata,
 )
 
 
@@ -203,7 +205,6 @@ def test_t_test_execution(setup):
             functools.partial(mt_from_stats, equal_var=False),
             functools.partial(sp_from_stats, equal_var=False),
         ),
-        (ttest_1samp, sp_ttest_1samp),
     ]
 
     fa_raw = np.array([16, 18, 16, 14, 12, 12])
@@ -230,6 +231,23 @@ def test_t_test_execution(setup):
                 expected = sp_func(fa_raw, fb_raw)
             np.testing.assert_almost_equal(expected[0], result[0])
             np.testing.assert_almost_equal(expected[1], result[1])
+
+    # second param size must be 1 for ttest_1samp
+    fb_raw = np.array([16])
+    fb = tensor(fb_raw)
+    for alt in alternatives:
+        if parse_version(scipy.__version__) >= parse_version("1.6.0"):
+            r = ttest_1samp(fa, fb, alternative=alt)
+        else:
+            r = ttest_1samp(fa, fb)
+        result = r.execute().fetch()
+
+        if parse_version(scipy.__version__) >= parse_version("1.6.0"):
+            expected = sp_ttest_1samp(fa_raw, fb_raw, alternative=alt)
+        else:
+            expected = sp_ttest_1samp(fa_raw, fb_raw)
+        np.testing.assert_almost_equal(expected[0], result[0])
+        np.testing.assert_almost_equal(expected[1], result[1])
 
 
 @pytest.mark.parametrize("chunk_size", [5, 15])
@@ -277,3 +295,51 @@ def test_ks_2samp(setup, chunk_size):
 
     with pytest.raises(ValueError):
         ks_2samp(d1, [])
+
+
+def test_rankdata_execution(setup):
+    rs = np.random.RandomState(0)
+    a = rs.rand(4)
+
+    t1 = tensor(a, chunk_size=5)
+    r = rankdata(t1)
+
+    result = r.execute().fetch()
+    expected = sp_rankdata(a)
+    np.testing.assert_array_almost_equal(result, expected)
+
+    b = rs.rand(4, 4)
+
+    t2 = tensor(b, chunk_size=5)
+    r2 = rankdata(t2, axis=1)
+
+    result = r2.execute().fetch()
+    expected = sp_rankdata(b, axis=1)
+    np.testing.assert_array_almost_equal(result, expected)
+
+    c = rs.rand(0, 4)
+
+    t3 = tensor(c, chunk_size=5)
+    r3 = rankdata(t3, axis=1)
+
+    result = r3.execute().fetch()
+    expected = sp_rankdata(c, axis=1)
+    np.testing.assert_array_almost_equal(result, expected)
+
+    methods = [
+        "average",
+        "min",
+        "max",
+        "dense",
+        "ordinal",
+    ]
+
+    for method in methods:
+        r = rankdata(t1, method=method)
+        result = r.execute().fetch()
+
+        expected = sp_rankdata(a, method=method)
+        np.testing.assert_almost_equal(result, expected)
+
+    with pytest.raises(ValueError):
+        r = rankdata(t1, method="unknown")

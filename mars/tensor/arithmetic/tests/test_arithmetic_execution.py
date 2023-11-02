@@ -25,7 +25,7 @@ from ....config import option_context
 from ....session import execute, fetch
 from ....tests.core import require_cupy
 from ....utils import ignore_warning
-from ...datasource import ones, tensor, zeros
+from ...datasource import ones, tensor, zeros, arange
 from .. import (
     add,
     cos,
@@ -138,6 +138,7 @@ def test_ufunc_execution(setup):
     _new_unary_ufunc = UNARY_UFUNC - _sp_unary_ufunc
     for func in _new_unary_ufunc:
         res_tensor = func(arr1)
+        assert res_tensor.dtype is not None
         res = res_tensor.execute().fetch()
         expected = _get_func(res_tensor.op._func_name)(data1)
         np.testing.assert_array_almost_equal(res, expected)
@@ -145,8 +146,11 @@ def test_ufunc_execution(setup):
     _new_bin_ufunc = BIN_UFUNC - _sp_bin_ufunc
     for func in _new_bin_ufunc:
         res_tensor1 = func(arr1, arr2)
+        assert res_tensor1.dtype is not None
         res_tensor2 = func(arr1, rand)
+        assert res_tensor2.dtype is not None
         res_tensor3 = func(rand, arr1)
+        assert res_tensor3.dtype is not None
 
         res1 = res_tensor1.execute().fetch()
         res2 = res_tensor2.execute().fetch()
@@ -168,14 +172,18 @@ def test_ufunc_execution(setup):
 
     for func in _sp_unary_ufunc:
         res_tensor = func(arr1)
+        assert res_tensor.dtype is not None
         res = res_tensor.execute().fetch()
         expected = _get_func(res_tensor.op._func_name)(data1)
         np.testing.assert_array_almost_equal(res, expected)
 
     for func in _sp_bin_ufunc:
         res_tensor1 = func(arr1, arr2)
+        assert res_tensor1.dtype is not None
         res_tensor2 = func(arr1, rand)
+        assert res_tensor2.dtype is not None
         res_tensor3 = func(rand, arr1)
+        assert res_tensor3.dtype is not None
 
         res1 = res_tensor1.execute().fetch()
         res2 = res_tensor2.execute().fetch()
@@ -341,6 +349,7 @@ def test_arctan2_execution(setup):
     np.testing.assert_equal(result, np.arctan2(0, raw2.A))
 
 
+@pytest.mark.ray_dag
 def test_frexp_execution(setup):
     data1 = np.random.RandomState(0).randint(0, 100, (5, 9, 6))
 
@@ -359,7 +368,7 @@ def test_frexp_execution(setup):
     frexp(arr1, o1, o2)
     res1, res2 = fetch(*execute(o1, o2))
 
-    res = res1 * 2 ** res2
+    res = res1 * 2**res2
     np.testing.assert_array_almost_equal(res, data1, decimal=3)
 
     data1 = sps.random(5, 9, density=0.1)
@@ -372,6 +381,17 @@ def test_frexp_execution(setup):
     res = o.execute().fetch()
     expected = sum(np.frexp(data1.toarray()))
     np.testing.assert_equal(res.toarray(), expected)
+
+    x = np.arange(9)
+    a = np.zeros(9)
+    b = np.zeros(9)
+    mx = arange(9)
+    ma = zeros(9)
+    mb = zeros(9)
+    res = frexp(mx, ma, mb, where=mx > 5).execute()
+    expected = np.frexp(x, a, b, where=x > 5)
+    np.testing.assert_equal(res[0], expected[0])
+    np.testing.assert_equal(res[1], expected[1])
 
 
 def test_frexp_order_execution(setup):

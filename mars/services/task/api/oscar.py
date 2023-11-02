@@ -18,14 +18,14 @@ from .... import oscar as mo
 from ....core import Tileable
 from ....lib.aio import alru_cache
 from ...subtask import SubtaskResult
-from ..core import TileableGraph, TaskResult
+from ..core import TileableGraph, TaskResult, MapReduceInfo
 from ..supervisor.manager import TaskManagerActor
 from .core import AbstractTaskAPI
 
 
 class TaskAPI(AbstractTaskAPI):
     def __init__(
-        self, session_id: str, task_manager_ref: Union[TaskManagerActor, mo.ActorRef]
+        self, session_id: str, task_manager_ref: mo.ActorRefType[TaskManagerActor]
     ):
         self._session_id = session_id
         self._task_manager_ref = task_manager_ref
@@ -59,13 +59,12 @@ class TaskAPI(AbstractTaskAPI):
     async def submit_tileable_graph(
         self,
         graph: TileableGraph,
-        task_name: str = None,
-        fuse_enabled: bool = True,
+        fuse_enabled: bool = None,
         extra_config: dict = None,
     ) -> str:
         try:
             return await self._task_manager_ref.submit_tileable_graph(
-                graph, task_name, fuse_enabled=fuse_enabled, extra_config=extra_config
+                graph, fuse_enabled=fuse_enabled, extra_config=extra_config
             )
         except mo.ActorNotExist:
             raise RuntimeError("Session closed already")
@@ -79,7 +78,6 @@ class TaskAPI(AbstractTaskAPI):
     async def get_tileable_subtasks(
         self, task_id: str, tileable_id: str, with_input_output: bool
     ):
-
         return await self._task_manager_ref.get_tileable_subtasks(
             task_id, tileable_id, with_input_output
         )
@@ -104,3 +102,11 @@ class TaskAPI(AbstractTaskAPI):
 
     async def get_last_idle_time(self) -> Union[float, None]:
         return await self._task_manager_ref.get_last_idle_time()
+
+    async def remove_tileables(self, tileable_keys: List[str]):
+        return await self._task_manager_ref.remove_tileables(tileable_keys)
+
+    async def get_map_reduce_info(
+        self, task_id: str, map_reduce_id: int
+    ) -> MapReduceInfo:
+        return await self._task_manager_ref.get_map_reduce_info(task_id, map_reduce_id)

@@ -16,7 +16,7 @@ import asyncio
 import os
 import sys
 import time
-from typing import Tuple, Union
+from typing import Tuple
 
 import psutil
 import pytest
@@ -26,20 +26,22 @@ from ..... import oscar as mo
 from .....oscar import ServerClosed
 from .....oscar.errors import NoFreeSlot, SlotStateError
 from .....oscar.backends.allocate_strategy import IdleLabel
+from .....resource import Resource
+from .....tests.core import wait_for_condition
 from .....utils import get_next_port
-from ...supervisor import GlobalSlotManagerActor
+from ...supervisor import GlobalResourceManagerActor
 from ...worker import BandSlotManagerActor, BandSlotControlActor
 
 
-class MockGlobalSlotManagerActor(mo.Actor):
+class MockGlobalResourceManagerActor(mo.Actor):
     def __init__(self):
         self._result = None
 
     @mo.extensible
-    def update_subtask_slots(
-        self, band: Tuple, session_id: str, subtask_id: str, slots: int
+    def update_subtask_resources(
+        self, band: Tuple, session_id: str, subtask_id: str, resources: Resource
     ):
-        self._result = (band, session_id, subtask_id, slots)
+        self._result = (band, session_id, subtask_id, resources)
 
     def get_result(self):
         return self._result
@@ -61,16 +63,16 @@ async def actor_pool(request):
     )
 
     async with pool:
-        global_slots_ref = await mo.create_actor(
-            MockGlobalSlotManagerActor,
-            uid=GlobalSlotManagerActor.default_uid(),
+        global_resource_ref = await mo.create_actor(
+            MockGlobalResourceManagerActor,
+            uid=GlobalResourceManagerActor.default_uid(),
             address=pool.external_address,
         )
         slot_manager_ref = await mo.create_actor(
             BandSlotManagerActor,
             (pool.external_address, "numa-0"),
             n_slots,
-            global_slots_ref,
+            global_resource_ref,
             uid=BandSlotManagerActor.gen_uid("numa-0"),
             address=pool.external_address,
         )
@@ -80,7 +82,7 @@ async def actor_pool(request):
             await slot_manager_ref.destroy()
 
 
-ActorPoolType = Tuple[mo.MainActorPoolType, Union[BandSlotManagerActor, mo.ActorRef]]
+ActorPoolType = Tuple[mo.MainActorPoolType, mo.ActorRefType[BandSlotManagerActor]]
 
 
 class TaskActor(mo.Actor):
@@ -204,7 +206,12 @@ async def test_slot_kill(actor_pool: ActorPoolType):
     assert await mo.actor_ref(
         BandSlotControlActor.gen_uid("numa-0", 0), address=pool.external_address
     )
-    assert await mo.actor_ref(task_ref)
+
+    async def check_alive():
+        assert await mo.actor_ref(task_ref)
+        return True
+
+    await wait_for_condition(check_alive)
 
 
 @pytest.mark.asyncio
@@ -264,11 +271,11 @@ async def test_report_usage(actor_pool: ActorPoolType):
     await slot_manager_ref.acquire_free_slot(("session_id", "subtask_id"))
     await asyncio.sleep(1.3)
 
-    global_slot_ref = await mo.actor_ref(
-        uid=GlobalSlotManagerActor.default_uid(), address=pool.external_address
+    global_resource_ref = await mo.actor_ref(
+        uid=GlobalResourceManagerActor.default_uid(), address=pool.external_address
     )
-    _band, session_id, subtask_id, slots = await global_slot_ref.get_result()
-    assert slots == pytest.approx(1.0)
+    _band, session_id, subtask_id, resources = await global_resource_ref.get_result()
+    assert resources.num_cpus == pytest.approx(1.0)
     assert session_id == "session_id"
     assert subtask_id == "subtask_id"
 

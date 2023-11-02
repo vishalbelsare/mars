@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import os
-import pickle
+from typing import Dict
 from urllib.parse import urlparse
 
 import numpy as np
@@ -34,7 +34,7 @@ except ImportError:
 
 from ... import opcodes as OperandDef
 from ...config import options
-from ...lib.filesystem import file_size, get_fs, glob, open_file
+from ...lib.filesystem import file_size, get_fs, glob, open_file, FileSystem
 from ...serialization.serializables import (
     AnyField,
     BoolField,
@@ -43,21 +43,26 @@ from ...serialization.serializables import (
     StringField,
     Int32Field,
     Int64Field,
-    BytesField,
 )
-from ...utils import is_object_dtype
+from ...utils import is_object_dtype, lazy_import
 from ..arrays import ArrowStringDtype
 from ..operands import OutputType
-from ..utils import parse_index, to_arrow_dtypes, contain_arrow_dtype
+from ..utils import (
+    parse_index,
+    to_arrow_dtypes,
+    contain_arrow_dtype,
+)
 from .core import (
     IncrementalIndexDatasource,
     ColumnPruneSupportedDataSourceMixin,
     IncrementalIndexDataSourceMixin,
+    merge_small_files,
 )
 
 
 PARQUET_MEMORY_SCALE = 15
 STRING_FIELD_OVERHEAD = 50
+cudf = lazy_import("cudf")
 
 
 def check_engine(engine):
@@ -106,6 +111,65 @@ class ParquetEngine:
     ):
         raise NotImplementedError
 
+    def read_partitioned_to_pandas(
+        self,
+        f,
+        partitions: Dict,
+        partition_keys: Dict,
+        columns=None,
+        nrows=None,
+        use_arrow_dtype=None,
+        **kwargs,
+    ):
+        raw_df = self.read_to_pandas(
+            f, columns=columns, nrows=nrows, use_arrow_dtype=use_arrow_dtype, **kwargs
+        )
+        for col, value in partition_keys.items():
+            dictionary = partitions[col]
+            raw_df[col] = pd.Series(
+                value,
+                dtype=pd.CategoricalDtype(categories=dictionary.tolist()),
+                index=raw_df.index,
+            )
+        return raw_df
+
+    def read_partitioned_dtypes(self, fs: FileSystem, directory, storage_options):
+        # As ParquetDataset will iterate all files,
+        # here we just find one file to infer dtypes
+        current_path = directory
+        partition_cols = []
+        while fs.isdir(current_path):
+            _, dirs, files = next(fs.walk(current_path))
+            dirs = [d for d in dirs if not d.startswith(".")]
+            files = [f for f in files if not f.startswith(".")]
+            if len(files) == 0:
+                # directory as partition
+                partition_cols.append(dirs[0].split("=", 1)[0])
+                current_path = os.path.join(current_path, dirs[0])
+            elif len(dirs) == 0:
+                # parquet files in deepest directory
+                current_path = os.path.join(current_path, files[0])
+            else:  # pragma: no cover
+                raise ValueError(
+                    "Files and directories are mixed in an intermediate directory"
+                )
+
+        # current path is now a parquet file
+        with open_file(current_path, storage_options=storage_options) as f:
+            dtypes = self.read_dtypes(f)
+        for partition in partition_cols:
+            dtypes[partition] = pd.CategoricalDtype()
+        return dtypes
+
+
+def _parse_prefix(path):
+    path_prefix = ""
+    if isinstance(path, str):
+        parsed_path = urlparse(path)
+        if parsed_path.scheme:
+            path_prefix = f"{parsed_path.scheme}://{parsed_path.netloc}"
+    return path_prefix
+
 
 class ArrowEngine(ParquetEngine):
     def get_row_num(self, f):
@@ -144,7 +208,7 @@ class ArrowEngine(ParquetEngine):
 class FastpaquetEngine(ParquetEngine):
     def get_row_num(self, f):
         file = fastparquet.ParquetFile(f)
-        return file.count
+        return file.count()
 
     def read_dtypes(self, f, **kwargs):
         file = fastparquet.ParquetFile(f)
@@ -155,13 +219,59 @@ class FastpaquetEngine(ParquetEngine):
         self, f, columns=None, nrows=None, use_arrow_dtype=None, **kwargs
     ):
         file = fastparquet.ParquetFile(f)
-        df = file.to_pandas(**kwargs)
+        df = file.to_pandas(columns, **kwargs)
         if nrows is not None:
             df = df.head(nrows)
         if use_arrow_dtype:
             df = df.astype(to_arrow_dtypes(df.dtypes).to_dict())
-
         return df
+
+
+class CudfEngine:
+    @classmethod
+    def read_to_cudf(cls, file, columns: list = None, nrows: int = None, **kwargs):
+        df = cudf.read_parquet(file, columns=columns, **kwargs)
+        if nrows is not None:
+            df = df.head(nrows)
+        return df
+
+    def read_group_to_cudf(
+        self, file, group_index: int, columns: list = None, nrows: int = None, **kwargs
+    ):
+        return self.read_to_cudf(
+            file, columns=columns, nrows=nrows, row_groups=group_index, **kwargs
+        )
+
+    @classmethod
+    def read_partitioned_to_cudf(
+        cls,
+        file,
+        partitions: Dict,
+        partition_keys: Dict,
+        columns=None,
+        nrows=None,
+        **kwargs,
+    ):
+        # cudf will read entire partitions even if only one partition provided,
+        # so we just read with pyarrow and convert to cudf DataFrame
+        file = pq.ParquetFile(file)
+        t = file.read(columns=columns, **kwargs)
+        t = t.slice(0, nrows) if nrows is not None else t
+        t = pa.table(t.columns, names=t.column_names)
+        raw_df = cudf.DataFrame.from_arrow(t)
+        for col, value in partition_keys.items():
+            dictionary = partitions[col].tolist()
+            codes = cudf.core.column.as_column(
+                dictionary.index(value), length=len(raw_df)
+            )
+            raw_df[col] = cudf.core.column.build_categorical_column(
+                categories=dictionary,
+                codes=codes,
+                size=codes.size,
+                offset=codes.offset,
+                ordered=False,
+            )
+        return raw_df
 
 
 class DataFrameReadParquet(
@@ -171,127 +281,32 @@ class DataFrameReadParquet(
 ):
     _op_type_ = OperandDef.READ_PARQUET
 
-    _path = AnyField("path")
-    _engine = StringField("engine")
-    _columns = ListField("columns")
-    _use_arrow_dtype = BoolField("use_arrow_dtype")
-    _groups_as_chunks = BoolField("groups_as_chunks")
-    _group_index = Int32Field("group_index")
-    _read_kwargs = DictField("read_kwargs")
-    _incremental_index = BoolField("incremental_index")
-    _nrows = Int64Field("nrows")
-    _storage_options = DictField("storage_options")
+    path = AnyField("path")
+    engine = StringField("engine")
+    columns = ListField("columns")
+    use_arrow_dtype = BoolField("use_arrow_dtype")
+    groups_as_chunks = BoolField("groups_as_chunks")
+    group_index = Int32Field("group_index")
+    read_kwargs = DictField("read_kwargs")
+    incremental_index = BoolField("incremental_index")
+    storage_options = DictField("storage_options")
+    is_partitioned = BoolField("is_partitioned")
+    merge_small_files = BoolField("merge_small_files")
+    merge_small_file_options = DictField("merge_small_file_options")
     # for chunk
-    _partitions = BytesField("partitions")
-    _partition_keys = ListField("partition_keys")
-    _num_group_rows = Int64Field("num_group_rows")
+    partitions = DictField("partitions", default=None)
+    partition_keys = DictField("partition_keys", default=None)
+    num_group_rows = Int64Field("num_group_rows", default=None)
     # as read meta may be too time-consuming when number of files is large,
     # thus we only read first file to get row number and raw file size
-    _first_chunk_row_num = Int64Field("first_chunk_row_num")
-    _first_chunk_raw_bytes = Int64Field("first_chunk_raw_bytes")
-
-    def __init__(
-        self,
-        path=None,
-        engine=None,
-        columns=None,
-        use_arrow_dtype=None,
-        groups_as_chunks=None,
-        group_index=None,
-        incremental_index=None,
-        read_kwargs=None,
-        partitions=None,
-        partition_keys=None,
-        num_group_rows=None,
-        nrows=None,
-        storage_options=None,
-        first_chunk_row_num=None,
-        first_chunk_raw_bytes=None,
-        memory_scale=None,
-        **kw,
-    ):
-        super().__init__(
-            _path=path,
-            _engine=engine,
-            _columns=columns,
-            _use_arrow_dtype=use_arrow_dtype,
-            _groups_as_chunks=groups_as_chunks,
-            _group_index=group_index,
-            _read_kwargs=read_kwargs,
-            _incremental_index=incremental_index,
-            _partitions=partitions,
-            _partition_keys=partition_keys,
-            _num_group_rows=num_group_rows,
-            _nrows=nrows,
-            _storage_options=storage_options,
-            _memory_scale=memory_scale,
-            _first_chunk_row_num=first_chunk_row_num,
-            _first_chunk_raw_bytes=first_chunk_raw_bytes,
-            _output_types=[OutputType.dataframe],
-            **kw,
-        )
-
-    @property
-    def path(self):
-        return self._path
-
-    @property
-    def engine(self):
-        return self._engine
-
-    @property
-    def columns(self):
-        return self._columns
-
-    @property
-    def use_arrow_dtype(self):
-        return self._use_arrow_dtype
-
-    @property
-    def groups_as_chunks(self):
-        return self._groups_as_chunks
-
-    @property
-    def group_index(self):
-        return self._group_index
-
-    @property
-    def read_kwargs(self):
-        return self._read_kwargs
-
-    @property
-    def incremental_index(self):
-        return self._incremental_index
-
-    @property
-    def partitions(self):
-        return self._partitions
-
-    @property
-    def partition_keys(self):
-        return self._partition_keys
-
-    @property
-    def num_group_rows(self):
-        return self._num_group_rows
-
-    @property
-    def storage_options(self):
-        return self._storage_options
-
-    @property
-    def first_chunk_row_num(self):
-        return self._first_chunk_row_num
-
-    @property
-    def first_chunk_raw_bytes(self):
-        return self._first_chunk_raw_bytes
+    first_chunk_row_num = Int64Field("first_chunk_row_num")
+    first_chunk_raw_bytes = Int64Field("first_chunk_raw_bytes")
 
     def get_columns(self):
-        return self._columns
+        return self.columns
 
     def set_pruned_columns(self, columns, *, keep_order=None):
-        self._columns = columns
+        self.columns = columns
 
     @classmethod
     def _to_arrow_dtypes(cls, dtypes, op):
@@ -309,27 +324,32 @@ class DataFrameReadParquet(
         out_df = op.outputs[0]
         shape = (np.nan, out_df.shape[1])
         dtypes = cls._to_arrow_dtypes(out_df.dtypes, op)
-        dataset = pq.ParquetDataset(op.path)
+        dataset = pq.ParquetDataset(op.path, use_legacy_dataset=False)
 
-        parsed_path = urlparse(op.path)
-        if not os.path.exists(op.path) and parsed_path.scheme:
-            path_prefix = f"{parsed_path.scheme}://{parsed_path.netloc}"
-        else:
-            path_prefix = ""
+        path_prefix = _parse_prefix(op.path)
 
         chunk_index = 0
         out_chunks = []
         first_chunk_row_num, first_chunk_raw_bytes = None, None
-        for i, piece in enumerate(dataset.pieces):
+        for i, fragment in enumerate(dataset.fragments):
             chunk_op = op.copy().reset_key()
-            chunk_op._path = chunk_path = path_prefix + piece.path
-            chunk_op._partitions = pickle.dumps(dataset.partitions)
-            chunk_op._partition_keys = piece.partition_keys
+            chunk_op.path = chunk_path = path_prefix + fragment.path
+            relpath = os.path.relpath(chunk_path, op.path)
+            partition_keys = dict(
+                tuple(s.split("=")) for s in relpath.split(os.sep)[:-1]
+            )
+            chunk_op.partition_keys = partition_keys
+            chunk_op.partitions = dict(
+                zip(
+                    dataset.partitioning.schema.names, dataset.partitioning.dictionaries
+                )
+            )
             if i == 0:
-                first_chunk_raw_bytes = file_size(chunk_path, op.storage_options)
-                first_chunk_row_num = piece.get_metadata().num_rows
-            chunk_op._first_chunk_row_num = first_chunk_row_num
-            chunk_op._first_chunk_raw_bytes = first_chunk_raw_bytes
+                first_row_group = fragment.row_groups[0]
+                first_chunk_raw_bytes = first_row_group.total_byte_size
+                first_chunk_row_num = first_row_group.num_rows
+            chunk_op.first_chunk_row_num = first_chunk_row_num
+            chunk_op.first_chunk_raw_bytes = first_chunk_raw_bytes
             new_chunk = chunk_op.new_chunk(
                 None,
                 shape=shape,
@@ -362,14 +382,20 @@ class DataFrameReadParquet(
         dtypes = cls._to_arrow_dtypes(out_df.dtypes, op)
         shape = (np.nan, out_df.shape[1])
 
-        paths = (
-            op.path
-            if isinstance(op.path, (tuple, list))
-            else glob(op.path, storage_options=op.storage_options)
-        )
+        path_prefix = ""
+        if isinstance(op.path, (tuple, list)):
+            paths = op.path
+        elif get_fs(op.path, op.storage_options).isdir(op.path):
+            parsed_path = urlparse(op.path)
+            if parsed_path.scheme.lower() == "hdfs":
+                path_prefix = f"{parsed_path.scheme}://{parsed_path.netloc}"
+            paths = get_fs(op.path, op.storage_options).ls(op.path)
+        else:
+            paths = glob(op.path, storage_options=op.storage_options)
 
         first_chunk_row_num, first_chunk_raw_bytes = None, None
         for i, pth in enumerate(paths):
+            pth = path_prefix + pth
             if i == 0:
                 with open_file(pth, storage_options=op.storage_options) as f:
                     first_chunk_row_num = get_engine(op.engine).get_row_num(f)
@@ -381,11 +407,11 @@ class DataFrameReadParquet(
                 num_row_groups = pq.ParquetFile(pth).num_row_groups
                 for group_idx in range(num_row_groups):
                     chunk_op = op.copy().reset_key()
-                    chunk_op._path = pth
-                    chunk_op._group_index = group_idx
-                    chunk_op._first_chunk_row_num = first_chunk_row_num
-                    chunk_op._first_chunk_raw_bytes = first_chunk_raw_bytes
-                    chunk_op._num_group_rows = num_row_groups
+                    chunk_op.path = pth
+                    chunk_op.group_index = group_idx
+                    chunk_op.first_chunk_row_num = first_chunk_row_num
+                    chunk_op.first_chunk_raw_bytes = first_chunk_raw_bytes
+                    chunk_op.num_group_rows = num_row_groups
                     new_chunk = chunk_op.new_chunk(
                         None,
                         shape=shape,
@@ -398,9 +424,9 @@ class DataFrameReadParquet(
                     chunk_index += 1
             else:
                 chunk_op = op.copy().reset_key()
-                chunk_op._path = pth
-                chunk_op._first_chunk_row_num = first_chunk_row_num
-                chunk_op._first_chunk_raw_bytes = first_chunk_raw_bytes
+                chunk_op.path = pth
+                chunk_op.first_chunk_row_num = first_chunk_row_num
+                chunk_op.first_chunk_raw_bytes = first_chunk_raw_bytes
                 new_chunk = chunk_op.new_chunk(
                     None,
                     shape=shape,
@@ -425,26 +451,34 @@ class DataFrameReadParquet(
         )
 
     @classmethod
-    def _tile(cls, op):
-        if get_fs(op.path, op.storage_options).isdir(op.path):
-            return cls._tile_partitioned(op)
+    def _tile(cls, op: "DataFrameReadParquet"):
+        if op.is_partitioned:
+            tiled = cls._tile_partitioned(op)
         else:
-            return cls._tile_no_partitioned(op)
+            tiled = cls._tile_no_partitioned(op)
+        if op.merge_small_files:
+            tiled = [
+                merge_small_files(tiled[0], **(op.merge_small_file_options or dict()))
+            ]
+        return tiled
 
     @classmethod
     def _execute_partitioned(cls, ctx, op: "DataFrameReadParquet"):
         out = op.outputs[0]
-        partitions = pickle.loads(op.partitions)
-        piece = pq.ParquetDatasetPiece(
-            op.path, partition_keys=op.partition_keys, open_file_func=open_file
-        )
-        table = piece.read(partitions=partitions)
-        if op.nrows is not None:
-            table = table.slice(0, op.nrows)
-        ctx[out.key] = table.to_pandas()
+        engine = get_engine(op.engine)
+        with open_file(op.path, storage_options=op.storage_options) as f:
+            ctx[out.key] = engine.read_partitioned_to_pandas(
+                f,
+                op.partitions,
+                op.partition_keys,
+                columns=op.columns,
+                nrows=op.nrows,
+                use_arrow_dtype=op.use_arrow_dtype,
+                **op.read_kwargs or dict(),
+            )
 
     @classmethod
-    def execute(cls, ctx, op: "DataFrameReadParquet"):
+    def _pandas_read_parquet(cls, ctx: dict, op: "DataFrameReadParquet"):
         out = op.outputs[0]
         path = op.path
 
@@ -475,6 +509,56 @@ class DataFrameReadParquet(
             ctx[out.key] = df
 
     @classmethod
+    def _cudf_read_parquet(cls, ctx: dict, op: "DataFrameReadParquet"):
+        out = op.outputs[0]
+        path = op.path
+
+        engine = CudfEngine()
+        if os.path.exists(path):
+            file = op.path
+            close = lambda: None
+        else:  # pragma: no cover
+            file = open_file(path, storage_options=op.storage_options)
+            close = file.close
+
+        try:
+            if op.partitions is not None:
+                ctx[out.key] = engine.read_partitioned_to_cudf(
+                    file,
+                    op.partitions,
+                    op.partition_keys,
+                    columns=op.columns,
+                    nrows=op.nrows,
+                    **op.read_kwargs or dict(),
+                )
+            else:
+                if op.groups_as_chunks:
+                    df = engine.read_group_to_cudf(
+                        file,
+                        op.group_index,
+                        columns=op.columns,
+                        nrows=op.nrows,
+                        **op.read_kwargs or dict(),
+                    )
+                else:
+                    df = engine.read_to_cudf(
+                        file,
+                        columns=op.columns,
+                        nrows=op.nrows,
+                        **op.read_kwargs or dict(),
+                    )
+                ctx[out.key] = df
+        finally:
+            close()
+
+    @classmethod
+    def execute(cls, ctx, op: "DataFrameReadParquet"):
+        if not op.gpu:
+            cls._pandas_read_parquet(ctx, op)
+        else:
+            cls._cudf_read_parquet(ctx, op)
+
+    @classmethod
     def estimate_size(cls, ctx, op: "DataFrameReadParquet"):
         first_chunk_row_num = op.first_chunk_row_num
         first_chunk_raw_bytes = op.first_chunk_raw_bytes
@@ -495,6 +579,7 @@ class DataFrameReadParquet(
         ctx[op.outputs[0].key] = (pd_size, pd_size + phy_size)
 
     def __call__(self, index_value=None, columns_value=None, dtypes=None):
+        self._output_types = [OutputType.dataframe]
         shape = (np.nan, len(dtypes))
         return self.new_dataframe(
             None,
@@ -508,12 +593,15 @@ class DataFrameReadParquet(
 def read_parquet(
     path,
     engine: str = "auto",
-    columns=None,
-    groups_as_chunks=False,
-    use_arrow_dtype=None,
-    incremental_index=False,
-    storage_options=None,
-    memory_scale=None,
+    columns: list = None,
+    groups_as_chunks: bool = False,
+    use_arrow_dtype: bool = None,
+    incremental_index: bool = False,
+    storage_options: dict = None,
+    memory_scale: int = None,
+    merge_small_files: bool = True,
+    merge_small_file_options: dict = None,
+    gpu: bool = None,
     **kwargs,
 ):
     """
@@ -550,6 +638,10 @@ def read_parquet(
         Options for storage connection.
     memory_scale: int, optional
         Scale that real memory occupation divided with raw file size.
+    merge_small_files: bool, default True
+        Merge small files whose size is small.
+    merge_small_file_options: dict
+        Options for merging small files
     **kwargs
         Any additional kwargs are passed to the engine.
 
@@ -561,16 +653,18 @@ def read_parquet(
     engine_type = check_engine(engine)
     engine = get_engine(engine_type)
 
-    if get_fs(path, storage_options).isdir(path):
-        # If path is a directory, we will read as a partitioned datasets.
-        if engine_type != "pyarrow":
-            raise TypeError(
-                "Only support pyarrow engine when reading from" "partitioned datasets."
-            )
-        dataset = pq.ParquetDataset(path)
-        dtypes = dataset.schema.to_arrow_schema().empty_table().to_pandas().dtypes
-        for partition in dataset.partitions:
-            dtypes[partition.name] = pd.CategoricalDtype()
+    single_path = path[0] if isinstance(path, list) else path
+    fs = get_fs(single_path, storage_options)
+    is_partitioned = False
+    if fs.isdir(single_path):
+        paths = fs.ls(path)
+        if all(fs.isdir(p) for p in paths):
+            # If all are directories, it is read as a partitioned dataset.
+            dtypes = engine.read_partitioned_dtypes(fs, path, storage_options)
+            is_partitioned = True
+        else:
+            with fs.open(paths[0], mode="rb") as f:
+                dtypes = engine.read_dtypes(f)
     else:
         if not isinstance(path, list):
             file_path = glob(path, storage_options=storage_options)[0]
@@ -580,13 +674,13 @@ def read_parquet(
         with open_file(file_path, storage_options=storage_options) as f:
             dtypes = engine.read_dtypes(f)
 
-        if columns:
-            dtypes = dtypes[columns]
+    if columns:
+        dtypes = dtypes[columns]
 
-        if use_arrow_dtype is None:
-            use_arrow_dtype = options.dataframe.use_arrow_dtype
-        if use_arrow_dtype:
-            dtypes = to_arrow_dtypes(dtypes)
+    if use_arrow_dtype is None:
+        use_arrow_dtype = options.dataframe.use_arrow_dtype
+    if use_arrow_dtype:
+        dtypes = to_arrow_dtypes(dtypes)
 
     index_value = parse_index(pd.RangeIndex(-1))
     columns_value = parse_index(dtypes.index, store_data=True)
@@ -599,6 +693,10 @@ def read_parquet(
         read_kwargs=kwargs,
         incremental_index=incremental_index,
         storage_options=storage_options,
+        is_partitioned=is_partitioned,
         memory_scale=memory_scale,
+        merge_small_files=merge_small_files,
+        merge_small_file_options=merge_small_file_options,
+        gpu=gpu,
     )
     return op(index_value=index_value, columns_value=columns_value, dtypes=dtypes)

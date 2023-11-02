@@ -15,7 +15,7 @@
 import asyncio
 import importlib
 import logging
-from typing import Dict, Optional, Type, Union
+from typing import Dict, Optional, Type
 
 from .... import oscar as mo
 from ....lib.aio import alru_cache
@@ -28,13 +28,13 @@ from .processor import SubtaskProcessor, SubtaskProcessorActor
 logger = logging.getLogger(__name__)
 
 
-SubtaskRunnerRef = Union["SubtaskRunnerActor", mo.ActorRef]
+SubtaskRunnerRef = mo.ActorRefType["SubtaskRunnerActor"]
 
 
 class SubtaskRunnerActor(mo.Actor):
-    _session_id_to_processors: Dict[str, Union[mo.ActorRef, SubtaskProcessorActor]]
-    _running_processor: Optional[Union[mo.ActorRef, SubtaskProcessorActor]]
-    _last_processor: Optional[Union[mo.ActorRef, SubtaskProcessorActor]]
+    _session_id_to_processors: Dict[str, mo.ActorRefType[SubtaskProcessorActor]]
+    _running_processor: Optional[mo.ActorRefType[SubtaskProcessorActor]]
+    _last_processor: Optional[mo.ActorRefType[SubtaskProcessorActor]]
 
     @classmethod
     def gen_uid(cls, band_name: str, slot_id: int):
@@ -59,9 +59,16 @@ class SubtaskRunnerActor(mo.Actor):
         self._cluster_api = await ClusterAPI.create(address=self.address)
 
     async def __pre_destroy__(self):
-        await asyncio.gather(
-            *[mo.destroy_actor(ref) for ref in self._session_id_to_processors.values()]
-        )
+        try:
+            await asyncio.gather(
+                *[
+                    mo.destroy_actor(ref)
+                    for ref in self._session_id_to_processors.values()
+                ]
+            )
+        except mo.ActorNotExist:  # pragma: no cover
+            # deleted, ignore
+            pass
 
     @classmethod
     def _get_subtask_processor_cls(cls, subtask_processor_cls):
@@ -94,19 +101,27 @@ class SubtaskRunnerActor(mo.Actor):
         session_id = subtask.session_id
         supervisor_address = await self._get_supervisor_address(session_id)
         if session_id not in self._session_id_to_processors:
-            self._session_id_to_processors[session_id] = await mo.create_actor(
-                SubtaskProcessorActor,
-                session_id,
-                self._band,
-                supervisor_address,
-                self._worker_address,
-                self._subtask_processor_cls,
-                uid=SubtaskProcessorActor.gen_uid(session_id),
-                address=self.address,
-            )
+            try:
+                self._session_id_to_processors[session_id] = await mo.create_actor(
+                    SubtaskProcessorActor,
+                    session_id,
+                    self._band,
+                    supervisor_address,
+                    self._worker_address,
+                    self._subtask_processor_cls,
+                    uid=SubtaskProcessorActor.gen_uid(session_id),
+                    address=self.address,
+                )
+            except mo.ActorAlreadyExist:
+                # when recovering actor pools, the actor created in sub pools
+                # may be recovered already
+                self._session_id_to_processors[session_id] = await mo.actor_ref(
+                    uid=SubtaskProcessorActor.gen_uid(session_id),
+                    address=self.address,
+                )
         processor = self._session_id_to_processors[session_id]
-        self._running_processor = self._last_processor = processor
         try:
+            self._running_processor = self._last_processor = processor
             result = yield self._running_processor.run(subtask)
         finally:
             self._running_processor = None
@@ -121,4 +136,8 @@ class SubtaskRunnerActor(mo.Actor):
     async def cancel_subtask(self):
         if self._running_processor is None:
             return
-        yield self._running_processor.cancel()
+        running_subtask_id = await self._running_processor.get_running_subtask_id()
+        logger.info("Start to cancel subtask %s.", running_subtask_id)
+        await self._running_processor.cancel()
+        self._running_processor = None
+        logger.info("Canceled subtask %s.", running_subtask_id)

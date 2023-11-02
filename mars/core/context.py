@@ -18,6 +18,7 @@ from typing import List, Dict
 
 from ..typing import BandType, SessionType
 from ..storage.base import StorageLevel
+from ..utils import classproperty
 
 
 class Context(ABC):
@@ -26,34 +27,33 @@ class Context(ABC):
     used inside `tile` and `execute`.
     """
 
-    prev = None
-    current = None
+    all_contexts = []
 
     def __init__(
         self,
         session_id: str = None,
         supervisor_address: str = None,
         worker_address: str = None,
-        current_address: str = None,
+        local_address: str = None,
         band: BandType = None,
     ):
         if session_id is None:
             # try to get session id from environment
             session_id = os.environ.get("MARS_SESSION_ID")
             if session_id is None:
-                raise ValueError("session_id should be provided " "to create a context")
+                raise ValueError("session_id should be provided to create a context")
         if supervisor_address is None:
             # try to get supervisor address from environment
             supervisor_address = os.environ.get("MARS_SUPERVISOR_ADDRESS")
             if supervisor_address is None:
                 raise ValueError(
-                    "supervisor_address should be provided " "to create a context"
+                    "supervisor_address should be provided to create a context"
                 )
 
         self.session_id = session_id
         self.supervisor_address = supervisor_address
         self.worker_address = worker_address
-        self.current_address = current_address
+        self.local_address = local_address
         self.band = band
 
     @abstractmethod
@@ -64,6 +64,16 @@ class Context(ABC):
         Returns
         -------
         session
+        """
+
+    @abstractmethod
+    def get_local_host_ip(self) -> str:
+        """
+        Get local worker's host ip
+
+        Returns
+        -------
+        host_ip : str
         """
 
     @abstractmethod
@@ -87,6 +97,16 @@ class Context(ABC):
         """
 
     @abstractmethod
+    def get_worker_bands(self) -> List[BandType]:
+        """
+        Get worker bands.
+
+        Returns
+        -------
+        worker_bands : list
+        """
+
+    @abstractmethod
     def get_total_n_cpu(self) -> int:
         """
         Get number of cpus.
@@ -97,7 +117,17 @@ class Context(ABC):
         """
 
     @abstractmethod
-    def get_chunks_result(self, data_keys: List[str]) -> List:
+    def get_slots(self) -> int:
+        """
+        Get num of slots of current band
+
+        Returns
+        -------
+        number_of_bands: int
+        """
+
+    @abstractmethod
+    def get_chunks_result(self, data_keys: List[str], fetch_only: bool = False) -> List:
         """
         Get result of chunks.
 
@@ -105,11 +135,13 @@ class Context(ABC):
         ----------
         data_keys : list
             Data keys.
+        fetch_only : bool
+            If fetch_only, only fetch data but not return.
 
         Returns
         -------
         results : list
-            Result of chunks
+            Result of chunks if not fetch_only, else return None
         """
 
     @abstractmethod
@@ -254,16 +286,18 @@ class Context(ABC):
         """
 
     def __enter__(self):
-        Context.prev = Context.current
-        Context.current = self
+        Context.all_contexts.append(self)
 
     def __exit__(self, *_):
-        Context.current = Context.prev
-        Context.prev = None
+        Context.all_contexts.pop()
+
+    @classproperty
+    def current(cls):
+        return cls.all_contexts[-1] if cls.all_contexts else None
 
 
 def set_context(context: Context):
-    Context.current = context
+    Context.all_contexts.append(context)
 
 
 def get_context() -> Context:

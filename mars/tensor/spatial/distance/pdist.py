@@ -262,7 +262,9 @@ class TensorPdist(TensorMapReduceOperand, TensorOperandMixin):
         reduce_chunks = []
         for p in range(aggregate_size):
             reduce_chunk_op = TensorPdist(
-                stage=OperandStage.reduce, dtype=out_tensor.dtype
+                stage=OperandStage.reduce,
+                dtype=out_tensor.dtype,
+                n_reducers=aggregate_size,
             )
             reduce_chunk = reduce_chunk_op.new_chunk(
                 [proxy_chunk], shape=(out_sizes[p],), order=out_tensor.order, index=(p,)
@@ -694,8 +696,13 @@ def pdist(X, metric="euclidean", **kwargs):
 
     if not callable(metric) and not isinstance(metric, str):
         raise TypeError(
-            "2nd argument metric must be a string identifier " "or a function."
+            "2nd argument metric must be a string identifier or a function."
         )
+
+    # scipy remove "wminkowski" since v1.8.0, use "minkowski" with `w=`
+    # keyword-argument for the given weight.
+    if metric == "wminkowski":
+        metric = "minkowski"
 
     p = kwargs.pop("p", None)
     w = kwargs.pop("w", None)

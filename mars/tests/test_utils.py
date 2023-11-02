@@ -29,19 +29,14 @@ from io import BytesIO
 from enum import Enum
 
 import numpy as np
-
-try:
-    import pandas as pd
-except ImportError:  # pragma: no cover
-    pd = None
+import pandas as pd
 import pytest
 
 from .. import dataframe as md
 from .. import tensor as mt
 from .. import utils
 from ..core import tile, TileableGraph
-from ..serialization.ray import register_ray_serializers
-from .core import require_ray
+from .core import require_ray, require_cudf
 
 
 def test_string_conversion():
@@ -191,31 +186,55 @@ def test_lazy_import():
         __version__ = '0.1.0b1'
         """.strip()
     )
+    mock_mod2 = textwrap.dedent(
+        """
+        from mars.utils import lazy_import
+        mock_mod = lazy_import("mock_mod")
+
+        def get_version():
+            return mock_mod.__version__
+        """
+    )
 
     temp_dir = tempfile.mkdtemp(prefix="mars-utils-test-")
     sys.path += [temp_dir]
     try:
-        with open(os.path.join(temp_dir, "test_mod.py"), "w") as outf:
+        with open(os.path.join(temp_dir, "mock_mod.py"), "w") as outf:
             outf.write(mock_mod)
+        with open(os.path.join(temp_dir, "mock_mod2.py"), "w") as outf:
+            outf.write(mock_mod2)
 
         non_exist_mod = utils.lazy_import("non_exist_mod", locals=locals())
         assert non_exist_mod is None
 
+        non_exist_mod1 = utils.lazy_import("non_exist_mod1", placeholder=True)
+        with pytest.raises(AttributeError) as ex_data:
+            non_exist_mod1.meth()
+        assert "required" in str(ex_data.value)
+
         mod = utils.lazy_import(
-            "test_mod", globals=globals(), locals=locals(), rename="mod"
+            "mock_mod", globals=globals(), locals=locals(), rename="mod"
         )
         assert mod is not None
         assert mod.__version__ == "0.1.0b1"
 
         glob = globals().copy()
-        mod = utils.lazy_import("test_mod", globals=glob, locals=locals(), rename="mod")
+        mod = utils.lazy_import("mock_mod", globals=glob, locals=locals(), rename="mod")
         glob["mod"] = mod
         assert mod is not None
         assert mod.__version__ == "0.1.0b1"
         assert type(glob["mod"]).__name__ == "module"
+
+        import mock_mod2 as mod2
+
+        assert type(mod2.mock_mod).__name__ != "module"
+        assert mod2.get_version() == "0.1.0b1"
+        assert type(mod2.mock_mod).__name__ == "module"
     finally:
         shutil.rmtree(temp_dir)
         sys.path = old_sys_path
+        sys.modules.pop("mock_mod", None)
+        sys.modules.pop("mock_mod2", None)
 
 
 def test_chunks_indexer():
@@ -274,14 +293,6 @@ def test_chunks_indexer():
     assert chunk_keys == expected
 
 
-def test_insert_reversed_tuple():
-    assert utils.insert_reversed_tuple((), 9) == (9,)
-    assert utils.insert_reversed_tuple((7, 4, 3, 1), 9) == (9, 7, 4, 3, 1)
-    assert utils.insert_reversed_tuple((7, 4, 3, 1), 6) == (7, 6, 4, 3, 1)
-    assert utils.insert_reversed_tuple((7, 4, 3, 1), 4) == (7, 4, 3, 1)
-    assert utils.insert_reversed_tuple((7, 4, 3, 1), 0) == (7, 4, 3, 1, 0)
-
-
 def test_require_not_none():
     @utils.require_not_none(1)
     def should_exist():
@@ -314,14 +325,28 @@ def test_type_dispatcher():
     type1 = type("Type1", (), {})
     type2 = type("Type2", (type1,), {})
     type3 = type("Type3", (), {})
+    type4 = type("Type4", (type2,), {})
+    type5 = type("Type5", (type4,), {})
 
     dispatcher.register(object, lambda x: "Object")
     dispatcher.register(type1, lambda x: "Type1")
+    dispatcher.register(type4, lambda x: "Type4")
     dispatcher.register("pandas.DataFrame", lambda x: "DataFrame")
+    dispatcher.register(utils.NamedType("ray", type1), lambda x: "RayType1")
 
     assert "Type1" == dispatcher(type2())
     assert "DataFrame" == dispatcher(pd.DataFrame())
     assert "Object" == dispatcher(type3())
+
+    tp = utils.NamedType("ray", type1)
+    assert dispatcher.get_handler(tp)(tp) == "RayType1"
+    tp = utils.NamedType("ray", type2)
+    assert dispatcher.get_handler(tp)(tp) == "RayType1"
+    tp = utils.NamedType("xxx", type2)
+    assert dispatcher.get_handler(tp)(tp) == "Type1"
+    assert "Type1" == dispatcher(type2())
+    tp = utils.NamedType("ray", type5)
+    assert dispatcher.get_handler(tp)(tp) == "Type4"
 
     dispatcher.unregister(object)
     with pytest.raises(KeyError):
@@ -391,6 +416,7 @@ def test_quiet_stdio():
         print("LINE 2", file=sys.stderr, end="\n")
     finally:
         sys.stdout, sys.stderr = old_stdout, old_stderr
+        executor.shutdown(False)
 
     assert stdout_w.content == "LINE T\nLINE 1\n"
     assert stderr_w.content == "LINE 2\n"
@@ -454,13 +480,10 @@ def test_merge_dict():
 
     assert merge_dict({}, {1: 2}) == {1: 2}
     assert merge_dict({1: 2}, {}) == {1: 2}
-    assert (
-        merge_dict(
-            {"a": {1: 2}, "b": {2: 3}, "c": {1: {2: 3}}},
-            {"a": {1: 3}, "b": {2: 3}, "c": {1: {2: 4}}},
-        )
-        == {"a": {1: 3}, "b": {2: 3}, "c": {1: {2: 4}}}
-    )
+    assert merge_dict(
+        {"a": {1: 2}, "b": {2: 3}, "c": {1: {2: 3}}},
+        {"a": {1: 3}, "b": {2: 3}, "c": {1: {2: 4}}},
+    ) == {"a": {1: 3}, "b": {2: 3}, "c": {1: {2: 4}}}
     with pytest.raises(ValueError):
         merge_dict({"a": {1: 2}, "b": {2: 3}}, {"a": {1: 3}}, overwrite=False)
 
@@ -511,16 +534,56 @@ def test_estimate_pandas_size():
 
     s3 = pd.Series(np.random.choice(["abcd", "def", "gh"], size=(1000,)))
     assert utils.estimate_pandas_size(s3) != sys.getsizeof(s3)
+    assert (
+        pytest.approx(utils.estimate_pandas_size(s3) / sys.getsizeof(s3), abs=0.5) == 1
+    )
 
     idx1 = pd.MultiIndex.from_arrays(
         [np.arange(0, 1000), np.random.choice(["abcd", "def", "gh"], size=(1000,))]
     )
-    assert utils.estimate_pandas_size(idx1) != sys.getsizeof(idx1)
+    assert utils.estimate_pandas_size(idx1) == sys.getsizeof(idx1)
+
+    string_idx = pd.Index(np.random.choice(["a", "bb", "cc"], size=(1000,)))
+    assert utils.estimate_pandas_size(string_idx) != sys.getsizeof(string_idx)
+    assert (
+        pytest.approx(
+            utils.estimate_pandas_size(string_idx) / sys.getsizeof(string_idx), abs=0.5
+        )
+        == 1
+    )
+
+    # dataframe with multi index
+    idx2 = pd.MultiIndex.from_arrays(
+        [np.arange(0, 1000), np.random.choice(["abcd", "def", "gh"], size=(1000,))]
+    )
+    df4 = pd.DataFrame(
+        {
+            "A": np.random.choice(["abcd", "def", "gh"], size=(1000,)),
+            "B": np.random.rand(1000),
+            "C": np.random.rand(1000),
+        },
+        index=idx2,
+    )
+    assert utils.estimate_pandas_size(df4) != sys.getsizeof(df4)
+    assert (
+        pytest.approx(utils.estimate_pandas_size(df4) / sys.getsizeof(df4), abs=0.5)
+        == 1
+    )
+
+    # series with multi index
+    idx3 = pd.MultiIndex.from_arrays(
+        [
+            np.random.choice(["a1", "a2", "a3"], size=(1000,)),
+            np.random.choice(["abcd", "def", "gh"], size=(1000,)),
+        ]
+    )
+    s4 = pd.Series(np.arange(1000), index=idx3)
+
+    assert utils.estimate_pandas_size(s4) == sys.getsizeof(s4)
 
 
 @require_ray
 def test_web_serialize_lambda():
-    register_ray_serializers()
     df = md.DataFrame(
         mt.random.rand(10_0000, 4, chunk_size=1_0000), columns=list("abcd")
     )
@@ -529,3 +592,79 @@ def test_web_serialize_lambda():
     s = utils.serialize_serializable(graph)
     f = utils.deserialize_serializable(s)
     assert isinstance(f, TileableGraph)
+
+
+def test_get_func_token_values():
+    from ..utils import _get_func_token_values
+
+    assert _get_func_token_values(test_get_func_token_values) == [
+        test_get_func_token_values.__code__.co_code
+    ]
+    captured_vars = [1, 2, 3]
+
+    def closure_func(a, b):
+        return captured_vars
+
+    assert _get_func_token_values(closure_func)[1][0] == captured_vars
+    assert _get_func_token_values(partial(closure_func, 1))[0][0] == 1
+    assert _get_func_token_values(partial(closure_func, 1))[-1][0] == captured_vars
+
+    from .._utils import ceildiv
+
+    assert _get_func_token_values(ceildiv) == [ceildiv.__module__, ceildiv.__name__]
+
+    class Func:
+        def __call__(self, *args, **kwargs):
+            pass
+
+    func = Func()
+    assert _get_func_token_values(func) == [func]
+
+
+@pytest.mark.parametrize("id_length", [0, 5, 32, 63])
+def test_gen_random_id(id_length):
+    rnd_id = utils.new_random_id(id_length)
+    assert len(rnd_id) == id_length
+
+
+@pytest.mark.asyncio
+async def test_retry_callable():
+    assert utils.retry_callable(lambda x: x)(1) == 1
+    assert utils.retry_callable(lambda x: 0)(1) == 0
+
+    class CustomException(BaseException):
+        pass
+
+    def f1(x):
+        nonlocal num_retried
+        num_retried += 1
+        if num_retried == 3:
+            return x
+        raise CustomException
+
+    num_retried = 0
+    with pytest.raises(CustomException):
+        utils.retry_callable(f1)(1)
+    assert utils.retry_callable(f1, ex_type=CustomException)(1) == 1
+    num_retried = 0
+    with pytest.raises(CustomException):
+        utils.retry_callable(f1, max_retries=2, ex_type=CustomException)(1)
+    num_retried = 0
+    assert utils.retry_callable(f1, max_retries=3, ex_type=CustomException)(1) == 1
+
+    async def f2(x):
+        return f1(x)
+
+    num_retried = 0
+    with pytest.raises(CustomException):
+        await utils.retry_callable(f2)(1)
+    assert await utils.retry_callable(f2, ex_type=CustomException)(1) == 1
+
+
+@require_cudf
+def test_calc_data_size_gpu():
+    import cudf
+
+    df = pd.DataFrame({"a": ["a", "b", "a"]}, dtype="category")
+    df = cudf.from_pandas(df)
+    assert utils.calc_data_size(df) > 0

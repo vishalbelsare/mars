@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import asyncio
+import enum
 import logging
+import os
 import posixpath
 from urllib.parse import urlparse, unquote
 
-from ....utils import lazy_import
+from ....utils import lazy_import, lazy_import_on_load
 
 ray = lazy_import("ray")
 
@@ -26,14 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_placement_group(pg_name):  # pragma: no cover
-    if hasattr(ray.util, "get_placement_group"):
-        return ray.util.get_placement_group(pg_name)
-    else:
-        logger.warning(
-            "Current installed ray version doesn't support named placement group. "
-            "Actor will be created on arbitrary node randomly."
-        )
-        return None
+    return ray.util.get_placement_group(pg_name)
 
 
 def process_address_to_placement(address):
@@ -173,3 +167,37 @@ async def kill_and_wait(
     raise Exception(
         f"The actor {actor_handle} is not died after ray.kill {timeout} seconds."
     )
+
+
+@lazy_import_on_load(ray)
+def _patch_event_security():
+    global ray
+
+    if ray and not hasattr(ray, "report_event"):  # pragma: no cover
+        # lower version of ray doesn't support event
+
+        class EventSeverity(enum.Enum):
+            INFO = 0
+            WARNING = 1
+            ERROR = 2
+            FATAL = 3
+
+        def _report_event(severity, label, message):
+            logger.warning(
+                "severity: %s, label: %s, message: %s.", severity, label, message
+            )
+
+        import ray
+
+        ray.EventSeverity = EventSeverity
+        ray.report_event = _report_event
+
+
+def report_event(severity, label, message):
+    if ray and ray.is_initialized():
+        severity = (
+            getattr(ray.EventSeverity, severity)
+            if isinstance(severity, str)
+            else severity
+        )
+        ray.report_event(severity, label, message)

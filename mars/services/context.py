@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 from collections import defaultdict
 from functools import lru_cache
 from typing import List, Dict
@@ -20,14 +21,16 @@ from typing import List, Dict
 from .. import oscar as mo
 from ..lib.aio import new_isolation
 from ..core.context import Context
-from ..typing import BandType, SessionType
 from ..storage.base import StorageLevel
-from ..utils import implements
+from ..typing import BandType, SessionType
+from ..utils import implements, is_ray_address
 from .cluster import ClusterAPI, NodeRole
 from .session import SessionAPI
 from .storage import StorageAPI
 from .subtask import SubtaskAPI
-from .meta import MetaAPI
+from .meta import MetaAPI, WorkerMetaAPI
+
+logger = logging.getLogger(__name__)
 
 
 class ThreadedServiceContext(Context):
@@ -41,7 +44,7 @@ class ThreadedServiceContext(Context):
         session_id: str,
         supervisor_address: str,
         worker_address: str,
-        current_address: str,
+        local_address: str,
         loop: asyncio.AbstractEventLoop,
         band: BandType = None,
     ):
@@ -49,7 +52,7 @@ class ThreadedServiceContext(Context):
             session_id=session_id,
             supervisor_address=supervisor_address,
             worker_address=worker_address,
-            current_address=current_address,
+            local_address=local_address,
             band=band,
         )
         self._loop = loop
@@ -72,7 +75,7 @@ class ThreadedServiceContext(Context):
         self._session_api = await SessionAPI.create(self.supervisor_address)
         self._meta_api = await MetaAPI.create(self.session_id, self.supervisor_address)
         try:
-            self._subtask_api = await SubtaskAPI.create(self.current_address)
+            self._subtask_api = await SubtaskAPI.create(self.local_address)
         except mo.ActorNotExist:
             pass
 
@@ -82,11 +85,21 @@ class ThreadedServiceContext(Context):
 
     @implements(Context.get_current_session)
     def get_current_session(self) -> SessionType:
-        from ..deploy.oscar.session import new_session
+        from ..session import new_session
 
         return new_session(
             self.supervisor_address, self.session_id, new=False, default=False
         )
+
+    @implements(Context.get_local_host_ip)
+    def get_local_host_ip(self) -> str:
+        local_address = self.local_address
+        if is_ray_address(local_address):
+            import ray
+
+            return ray.util.get_node_ip_address()
+        else:
+            return local_address.split(":", 1)[0]
 
     @implements(Context.get_supervisor_addresses)
     def get_supervisor_addresses(self) -> List[str]:
@@ -96,15 +109,29 @@ class ThreadedServiceContext(Context):
     def get_worker_addresses(self) -> List[str]:
         return list(self._call(self._cluster_api.get_nodes_info(role=NodeRole.WORKER)))
 
+    @implements(Context.get_worker_bands)
+    def get_worker_bands(self) -> List[BandType]:
+        return list(self._call(self._cluster_api.get_all_bands(NodeRole.WORKER)))
+
     @implements(Context.get_total_n_cpu)
     def get_total_n_cpu(self) -> int:
         all_bands = self._call(self._cluster_api.get_all_bands())
         n_cpu = 0
-        for band, size in all_bands.items():
+        for band, resource in all_bands.items():
             _, band_name = band
             if band_name.startswith("numa-"):
-                n_cpu += size
+                n_cpu += resource.num_cpus
         return n_cpu
+
+    @implements(Context.get_slots)
+    def get_slots(self) -> int:
+        worker_bands = self._call(self._get_worker_bands())
+        resource = worker_bands[self.band]
+        return int(resource.num_cpus or resource.num_gpus)
+
+    async def _get_worker_bands(self):
+        worker_cluster_api = await ClusterAPI.create(self.worker_address)
+        return await worker_cluster_api.get_bands()
 
     async def _get_chunks_meta(
         self, data_keys: List[str], fields: List[str] = None, error: str = "raise"
@@ -113,11 +140,32 @@ class ThreadedServiceContext(Context):
         get_metas = []
         for data_key in data_keys:
             meta = self._meta_api.get_chunk_meta.delay(
-                data_key, fields=fields, error=error
+                data_key, fields=["bands"], error=error
             )
             get_metas.append(meta)
-        metas = await self._meta_api.get_chunk_meta.batch(*get_metas)
-        return metas
+        supervisor_metas = await self._meta_api.get_chunk_meta.batch(*get_metas)
+        key_to_supervisor_metas = dict(zip(data_keys, supervisor_metas))
+        api_to_keys_calls = defaultdict(lambda: (list(), list()))
+        for data_key, meta in zip(data_keys, supervisor_metas):
+            addr = meta["bands"][0][0]
+            worker_meta_api = await WorkerMetaAPI.create(self.session_id, addr)
+            keys, calls = api_to_keys_calls[worker_meta_api]
+            keys.append(data_key)
+            calls.append(
+                worker_meta_api.get_chunk_meta.delay(
+                    data_key, fields=fields, error=error
+                )
+            )
+        coros = []
+        for api, (keys, calls) in api_to_keys_calls.items():
+            coros.append(api.get_chunk_meta.batch(*calls))
+        all_metas = await asyncio.gather(*coros)
+        key_to_meta = dict()
+        for (keys, _), metas in zip(api_to_keys_calls.values(), all_metas):
+            for k, meta in zip(keys, metas):
+                meta["bands"] = key_to_supervisor_metas[k]["bands"]
+                key_to_meta[k] = meta
+        return [key_to_meta[k] for k in data_keys]
 
     async def _get_chunks_result(self, data_keys: List[str]) -> List:
         metas = await self._get_chunks_meta(data_keys, fields=["bands"])
@@ -135,9 +183,26 @@ class ThreadedServiceContext(Context):
                 results[chunk_key] = chunk_data
         return [results[key] for key in data_keys]
 
+    async def _fetch_chunks(self, data_keys: List[str]):
+        metas = await self._get_chunks_meta(data_keys, fields=["bands"])
+        bands = [meta["bands"][0] for meta in metas]
+
+        storage_api = await StorageAPI.create(self.session_id, self.local_address)
+        fetches = []
+        for data_key, (address, band_name) in zip(data_keys, bands):
+            fetches.append(
+                storage_api.fetch.delay(
+                    data_key, remote_address=address, band_name=band_name
+                )
+            )
+        await storage_api.fetch.batch(*fetches)
+
     @implements(Context.get_chunks_result)
-    def get_chunks_result(self, data_keys: List[str]) -> List:
-        return self._call(self._get_chunks_result(data_keys))
+    def get_chunks_result(self, data_keys: List[str], fetch_only: bool = False) -> List:
+        if not fetch_only:
+            return self._call(self._get_chunks_result(data_keys))
+        else:
+            return self._call(self._fetch_chunks(data_keys))
 
     @implements(Context.get_chunks_meta)
     def get_chunks_meta(
@@ -198,7 +263,7 @@ class ThreadedServiceContext(Context):
     @lru_cache(50)
     def new_custom_log_dir(self) -> str:
         return self._call(
-            self._session_api.new_custom_log_dir(self.current_address, self.session_id)
+            self._session_api.new_custom_log_dir(self.local_address, self.session_id)
         )
 
     def set_running_operand_key(self, session_id: str, op_key: str):
@@ -214,7 +279,7 @@ class ThreadedServiceContext(Context):
             self._subtask_api.set_running_operand_progress(
                 session_id=self._running_session_id,
                 op_key=self._running_op_key,
-                slot_address=self.current_address,
+                slot_address=self.local_address,
                 progress=progress,
             )
         )

@@ -436,7 +436,7 @@ class DataFrameToCSVStat(TensorOperand, TensorOperandMixin):
 
     def __init__(self, path=None, storage_options=None, dtype=None, **kw):
         super().__init__(
-            _path=path, _storage_options=storage_options, _dtype=dtype, **kw
+            _path=path, _storage_options=storage_options, dtype=dtype, **kw
         )
 
     @property
@@ -458,7 +458,7 @@ class DataFrameToCSVStat(TensorOperand, TensorOperandMixin):
             rest = total_bytes
             while rest > 0:
                 # at most 4M
-                write_bytes = min(4 * 1024 ** 2, rest)
+                write_bytes = min(4 * 1024**2, rest)
                 f.write(b"\00" * write_bytes)
                 rest -= write_bytes
 

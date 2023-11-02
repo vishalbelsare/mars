@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import os
+import sys
+
 import pytest
+import traceback
 import numpy as np
 import pandas as pd
 
@@ -29,9 +32,9 @@ from ....services.tests.fault_injection_manager import (
     FaultPosition,
     FaultType,
 )
+from ....session import get_default_async_session
 from ....tensor.base.psrs import PSRSConcatPivot
 from ..local import new_cluster
-from ..session import get_default_async_session
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "fault_injection_config.yml")
 RERUN_SUBTASK_CONFIG_FILE = os.path.join(
@@ -86,6 +89,7 @@ async def create_fault_injection_manager(
             FaultType.Exception,
             {FaultPosition.ON_EXECUTE_OPERAND: 1},
             pytest.raises(FaultInjectionError, match="Fault Injection"),
+            True,
         ],
         [
             FaultType.UnhandledException,
@@ -93,22 +97,25 @@ async def create_fault_injection_manager(
             pytest.raises(
                 FaultInjectionUnhandledError, match="Fault Injection Unhandled"
             ),
+            True,
         ],
         [
             FaultType.ProcessExit,
             {FaultPosition.ON_EXECUTE_OPERAND: 1},
             pytest.raises(ServerClosed),
+            False,  # The ServerClosed raised from current process directly.
         ],
         [
             FaultType.Exception,
             {FaultPosition.ON_RUN_SUBTASK: 1},
             pytest.raises(FaultInjectionError, match="Fault Injection"),
+            False,
         ],
     ],
 )
 @pytest.mark.asyncio
 async def test_fault_inject_subtask_processor(fault_cluster, fault_and_exception):
-    fault_type, fault_count, first_run_raises = fault_and_exception
+    fault_type, fault_count, first_run_raises, check_error_prefix = fault_and_exception
     name = await create_fault_injection_manager(
         session_id=fault_cluster.session.session_id,
         address=fault_cluster.session.address,
@@ -121,8 +128,12 @@ async def test_fault_inject_subtask_processor(fault_cluster, fault_and_exception
     a = mt.tensor(raw, chunk_size=5)
     b = a + 1
 
-    with first_run_raises:
+    with first_run_raises as ex:
         b.execute(extra_config=extra_config)
+
+    if check_error_prefix:
+        assert str(ex.value).count("address") == 1
+        assert str(ex.value).count("pid") == 1
 
     # execute again may raise an ConnectionRefusedError if the
     # ProcessExit occurred.
@@ -188,6 +199,10 @@ async def test_rerun_subtask(fault_cluster, fault_config):
         await info
 
 
+@pytest.mark.skipif(
+    sys.version_info[:2] < (3, 8),
+    reason="Skip due to the incompatibilities of shared memory.",
+)
 @pytest.mark.parametrize(
     "fault_cluster", [{"config": RERUN_SUBTASK_CONFIG_FILE}], indirect=True
 )
@@ -239,22 +254,45 @@ async def test_rerun_subtask_describe(fault_cluster, fault_config):
 @pytest.mark.parametrize(
     "fault_cluster", [{"config": RERUN_SUBTASK_CONFIG_FILE}], indirect=True
 )
+@pytest.mark.parametrize(
+    "fault_config",
+    [
+        [
+            FaultType.UnhandledException,
+            {FaultPosition.ON_EXECUTE_OPERAND: 1},
+            pytest.raises(FaultInjectionUnhandledError),
+            ["_UnhandledException", "handle_fault"],
+        ],
+        [
+            FaultType.Exception,
+            {FaultPosition.ON_EXECUTE_OPERAND: 100},
+            pytest.raises(FaultInjectionError),
+            ["_ExceedMaxRerun", "handle_fault"],
+        ],
+    ],
+)
 @pytest.mark.asyncio
-async def test_rerun_subtask_unhandled(fault_cluster):
+async def test_rerun_subtask_fail(fault_cluster, fault_config):
+    fault_type, fault_count, expect_raises, exception_match = fault_config
     name = await create_fault_injection_manager(
         session_id=fault_cluster.session.session_id,
         address=fault_cluster.session.address,
-        fault_count={FaultPosition.ON_EXECUTE_OPERAND: 1},
-        fault_type=FaultType.UnhandledException,
+        fault_count=fault_count,
+        fault_type=fault_type,
     )
+    exception_typename, stack_string = exception_match
     extra_config = {ExtraConfigKey.FAULT_INJECTION_MANAGER_NAME: name}
 
     raw = np.random.RandomState(0).rand(10, 10)
     a = mt.tensor(raw, chunk_size=5)
     b = a + 1
 
-    with pytest.raises(FaultInjectionUnhandledError):
+    with expect_raises as e:
         b.execute(extra_config=extra_config)
+
+    tb_str = "".join(traceback.format_tb(e.tb))
+    assert e.value.__wrapname__ == exception_typename, tb_str
+    assert e.traceback[-1].name == stack_string, tb_str
 
 
 @pytest.mark.parametrize(
@@ -266,29 +304,36 @@ async def test_rerun_subtask_unhandled(fault_cluster):
         [
             FaultType.Exception,
             {FaultPosition.ON_EXECUTE_OPERAND: 1},
-            pytest.raises(FaultInjectionError, match="Fault Injection"),
+            pytest.raises(FaultInjectionError, match="RemoteFunction"),
+            ["_UnretryableException", "handle_fault"],
         ],
         [
             FaultType.ProcessExit,
             {FaultPosition.ON_EXECUTE_OPERAND: 1},
             pytest.raises(ServerClosed),
+            ["_UnretryableException", "*"],
         ],
     ],
 )
 @pytest.mark.asyncio
 async def test_retryable(fault_cluster, fault_config):
-    fault_type, fault_count, expect_raises = fault_config
+    fault_type, fault_count, expect_raises, exception_match = fault_config
     name = await create_fault_injection_manager(
         session_id=fault_cluster.session.session_id,
         address=fault_cluster.session.address,
         fault_count=fault_count,
         fault_type=fault_type,
     )
+    exception_typename, stack_string = exception_match
     extra_config = {ExtraConfigKey.FAULT_INJECTION_MANAGER_NAME: name}
 
     def f(x):
         return x + 1
 
     r = spawn(f, args=(1,), retry_when_fail=False)
-    with expect_raises:
+    with expect_raises as e:
         r.execute(extra_config=extra_config)
+
+    tb_str = "".join(traceback.format_tb(e.tb))
+    assert e.value.__wrapname__ == exception_typename, tb_str
+    assert stack_string == "*" or e.traceback[-1].name == stack_string, tb_str

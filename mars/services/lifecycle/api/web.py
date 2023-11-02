@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List
+from typing import Callable, Dict, List
 
-from ....lib.aio import alru_cache
 from ....utils import serialize_serializable, deserialize_serializable
 from ...web import web_api, MarsServiceWebAPIHandler, MarsWebAPIClientMixin
 from .core import AbstractLifecycleAPI
@@ -23,26 +22,20 @@ from .core import AbstractLifecycleAPI
 class LifecycleWebAPIHandler(MarsServiceWebAPIHandler):
     _root_pattern = "/api/session/(?P<session_id>[^/]+)/lifecycle"
 
-    @alru_cache(cache_exceptions=False)
-    async def _get_cluster_api(self):
-        from ...cluster import ClusterAPI
-
-        return await ClusterAPI.create(self._supervisor_addr)
-
-    @alru_cache(cache_exceptions=False)
     async def _get_oscar_lifecycle_api(self, session_id: str):
         from .oscar import LifecycleAPI
 
-        cluster_api = await self._get_cluster_api()
-        [address] = await cluster_api.get_supervisors_by_keys([session_id])
-        return await LifecycleAPI.create(session_id, address)
+        return await self._get_api_by_key(LifecycleAPI, session_id)
 
     @web_api("", method="post", arg_filter={"action": "decref_tileables"})
     async def decref_tileables(self, session_id: str):
         tileable_keys = self.get_argument("tileable_keys").split(",")
+        counts = self.get_argument("counts", None)
+        if counts:
+            counts = [int(c) for c in counts.split(",")]
 
         oscar_api = await self._get_oscar_lifecycle_api(session_id)
-        await oscar_api.decref_tileables(tileable_keys)
+        await oscar_api.decref_tileables(tileable_keys, counts=counts)
 
     @web_api("", method="get", arg_filter={"action": "get_all_chunk_ref_counts"})
     async def get_all_chunk_ref_counts(self, session_id: str):
@@ -55,19 +48,27 @@ web_handlers = {LifecycleWebAPIHandler.get_root_pattern(): LifecycleWebAPIHandle
 
 
 class WebLifecycleAPI(AbstractLifecycleAPI, MarsWebAPIClientMixin):
-    def __init__(self, session_id: str, address: str):
+    def __init__(
+        self, session_id: str, address: str, request_rewriter: Callable = None
+    ):
         self._session_id = session_id
         self._address = address.rstrip("/")
+        self.request_rewriter = request_rewriter
 
-    async def decref_tileables(self, tileable_keys: List[str]):
+    async def decref_tileables(
+        self, tileable_keys: List[str], counts: List[int] = None
+    ):
         path = f"{self._address}/api/session/{self._session_id}/lifecycle"
         params = dict(action="decref_tileables")
+        counts = (
+            f"&counts={','.join(str(c) for c in counts)}" if counts is not None else ""
+        )
         await self._request_url(
             path=path,
             method="POST",
             params=params,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data="tileable_keys=" + ",".join(tileable_keys),
+            data="tileable_keys=" + ",".join(tileable_keys) + counts,
         )
 
     async def get_all_chunk_ref_counts(self) -> Dict[str, int]:

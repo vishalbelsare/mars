@@ -56,8 +56,8 @@ class KMeansElkanInitBounds(LearnOperand, LearnOperandMixin):
             _centers=centers,
             _center_half_distances=center_half_distances,
             _n_clusters=n_clusters,
-            _sparse=sparse,
-            _gpu=gpu,
+            sparse=sparse,
+            gpu=gpu,
             _output_types=output_types,
             **kw
         )
@@ -193,9 +193,7 @@ class KMeansElkanInitBounds(LearnOperand, LearnOperandMixin):
 
         with device(device_id):
             if xp is cp:  # pragma: no cover
-                raise NotImplementedError(
-                    "cannot support init_bounds " "for kmeans elkan"
-                )
+                raise NotImplementedError("cannot support init_bounds for kmeans elkan")
 
             n_samples = x.shape[0]
             n_clusters = op.n_clusters
@@ -404,15 +402,9 @@ class KMeansElkanUpdate(LearnOperand, LearnOperandMixin):
         out_chunks = [list() for _ in range(op.output_limit)]
         for i in range(x.chunk_shape[0]):
             x_chunk = x.cix[i, 0]
-            sample_weight_chunk = sample_weight.cix[
-                i,
-            ]
-            labels_chunk = labels.cix[
-                i,
-            ]
-            upper_bounds_chunk = upper_bounds.cix[
-                i,
-            ]
+            sample_weight_chunk = sample_weight.cix[i,]
+            labels_chunk = labels.cix[i,]
+            upper_bounds_chunk = upper_bounds.cix[i,]
             lower_bounds_chunk = lower_bounds.cix[i, 0]
             chunk_op = op.copy().reset_key()
             chunk_op.stage = OperandStage.map

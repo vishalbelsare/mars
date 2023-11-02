@@ -236,11 +236,19 @@ class TensorUnique(TensorMapReduceOperand, TensorOperandMixin):
                 axis=op.axis,
                 reducer_index=(i,),
                 reducer_phase="agg",
+                n_reducers=aggregate_size,
             )
             kws = cls._gen_kws(op, inp, chunk=True, chunk_index=i)
             chunks = reduce_op.new_chunks(
                 [shuffle_chunk], kws=kws, order=op.outputs[0].order
             )
+            if op.return_inverse:
+                inverse_idx = 2 if op.return_index else 1
+                for j, chk in enumerate(chunks):
+                    if j == inverse_idx:
+                        chk.is_mapper = True
+                    else:
+                        chk.is_mapper = False
             for j, c in enumerate(chunks):
                 reduce_chunks[j].append(c)
 
@@ -254,6 +262,7 @@ class TensorUnique(TensorMapReduceOperand, TensorOperandMixin):
             for j, cs in enumerate(unique_on_chunk_sizes):
                 chunk_op = TensorUnique(
                     stage=OperandStage.reduce,
+                    n_reducers=len(unique_on_chunk_sizes),
                     dtype=map_inverse_chunks[0].dtype,
                     reducer_index=(j,),
                     reducer_phase="inverse",
@@ -295,7 +304,7 @@ class TensorUnique(TensorMapReduceOperand, TensorOperandMixin):
         (ar,), device_id, xp = as_same_device(
             [ctx[c.key] for c in op.inputs], device=op.device, ret_extra=True
         )
-        n_reducer = op.aggregate_size
+        n_reducers = op.aggregate_size
 
         with device(device_id):
             results = xp.unique(
@@ -323,13 +332,13 @@ class TensorUnique(TensorMapReduceOperand, TensorOperandMixin):
             )
             if unique_ar.size > 0:
                 unique_reducers = dense_xp.asarray(
-                    hash_on_axis(unique_ar, op.axis, n_reducer)
+                    hash_on_axis(unique_ar, op.axis, n_reducers)
                 )
             else:
                 unique_reducers = dense_xp.empty_like(unique_ar)
             ind_ar = dense_xp.arange(ar.shape[op.axis])
 
-            for reducer in range(n_reducer):
+            for reducer in range(n_reducers):
                 res = []
                 cond = unique_reducers == reducer
                 # unique
@@ -348,11 +357,14 @@ class TensorUnique(TensorMapReduceOperand, TensorOperandMixin):
                 # counts
                 if counts_ar is not None:
                     res.append(counts_ar[cond])
-                ctx[op.outputs[0].key, (reducer,)] = tuple(res)
+                ctx[op.outputs[0].key, (reducer,)] = (
+                    ctx.get_current_chunk().index,
+                    tuple(res),
+                )
 
     @classmethod
     def _execute_agg_reduce(cls, ctx, op: "TensorUnique"):
-        input_indexes, input_data = zip(*list(op.iter_mapper_data_with_index(ctx)))
+        input_indexes, input_data = zip(*list(op.iter_mapper_data(ctx)))
 
         inputs = list(zip(*input_data))
         flatten, device_id, xp = as_same_device(

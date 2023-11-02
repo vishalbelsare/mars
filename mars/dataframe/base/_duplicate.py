@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_list_like
@@ -24,7 +26,7 @@ from ...utils import ceildiv, has_unknown_shape, lazy_import
 from ..initializer import DataFrame as asdataframe
 from ..operands import DataFrameOperandMixin, DataFrameShuffleProxy
 
-cudf = lazy_import("cudf", globals=globals())
+cudf = lazy_import("cudf")
 
 
 class DuplicateOperand(MapReduceOperand, DataFrameOperandMixin):
@@ -158,7 +160,7 @@ class DuplicateOperand(MapReduceOperand, DataFrameOperandMixin):
                 if out_chunk_size > 1 and method == "tree":
                     # for tree, chunks except last one should be dataframes,
                     chunk_op._output_types = (
-                        [OutputType.dataframe]
+                        concat_chunk.op.output_types
                         if out_chunk_size > 1
                         else out.op.output_types
                     )
@@ -230,10 +232,13 @@ class DuplicateOperand(MapReduceOperand, DataFrameOperandMixin):
             reduce_op._method = "shuffle"
             reduce_op.stage = OperandStage.reduce
             reduce_op.reducer_phase = "drop_duplicates"
+            reduce_op.n_reducers = len(map_chunks)
+            reduce_op.reducer_ordinal = i
             reduce_op._shuffle_size = inp.chunk_shape[0]
-            reduce_op._output_types = [OutputType.dataframe]
+            reduce_op._output_types = op.output_types
             reduce_chunk_params = map_chunks[0].params
             reduce_chunk_params["index"] = (i,) + reduce_chunk_params["index"][1:]
+            reduce_chunk_params["is_mapper"] = True
             reduce_chunks.append(
                 reduce_op.new_chunk([proxy_chunk], kws=[reduce_chunk_params])
             )
@@ -248,6 +253,8 @@ class DuplicateOperand(MapReduceOperand, DataFrameOperandMixin):
             put_back_op.stage = OperandStage.reduce
             put_back_op.reducer_phase = "put_back"
             put_back_op.reducer_index = (i,)
+            put_back_op.n_reducers = len(map_chunks)
+            put_back_op.reducer_ordinal = i
             if out.ndim == 2:
                 put_back_chunk_params = map_chunks[i].params
             else:
@@ -324,7 +331,11 @@ class DuplicateOperand(MapReduceOperand, DataFrameOperandMixin):
             return cls._tile_tree(op, inp)
         else:
             assert op.method == "shuffle"
-            return cls._tile_shuffle(op, inp)
+            ret = cls._tile_shuffle(op, inp)
+            if inspect.isgenerator(ret):
+                return (yield from ret)
+            else:
+                return ret
 
     @classmethod
     def _drop_duplicates(cls, inp, op, subset=None, keep=None, ignore_index=None):

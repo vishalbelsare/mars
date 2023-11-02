@@ -16,19 +16,23 @@ import asyncio
 import concurrent.futures as futures
 import itertools
 import logging
+import time
 from abc import ABC
 from collections import namedtuple
-from typing import Any, Callable, Coroutine, Dict, Type
+from dataclasses import dataclass
+from typing import Any, Callable, Coroutine, Dict, List, Set, Tuple, Type
 from urllib.parse import urlparse
 
+from ....oscar.profiling import ProfilingData
 from ....serialization import serialize, deserialize
-from ....utils import implements, classproperty
-from ....utils import lazy_import
+from ....metrics import Metrics
+from ....utils import lazy_import, lazy_import_on_load, implements, classproperty, Timer
 from ...debug import debug_async_timeout
 from ...errors import ServerClosed
 from ..communication.base import Channel, ChannelType, Server, Client
 from ..communication.core import register_client, register_server
 from ..communication.errors import ChannelClosed
+from .utils import report_event
 
 ray = lazy_import("ray")
 logger = logging.getLogger(__name__)
@@ -36,6 +40,156 @@ logger = logging.getLogger(__name__)
 ChannelID = namedtuple(
     "ChannelID", ["local_address", "client_id", "channel_index", "dest_address"]
 )
+
+SERIALIZATION_TIMEOUT_MILLS = 1000
+DESERIALIZATION_TIMEOUT_MILLS = 1000
+
+
+def msg_to_simple_str(msg):  # pragma: no cover
+    """An helper that prints message structure without generate a big str."""
+    from ..message import SendMessage, _MessageBase
+
+    if type(msg) == _ArgWrapper:
+        msg = msg.message
+    if isinstance(msg, SendMessage):
+        return f"{str(type(msg).__name__)}(actor_ref={msg.actor_ref}, content={msg_to_simple_str(msg.content)})"
+    if isinstance(msg, _MessageBase):
+        return str(msg)
+    if isinstance(msg, List):
+        part_str = ", ".join([msg_to_simple_str(item) for item in msg[:5]])
+        return f"List<{part_str}...{len(msg)}>"
+    if isinstance(msg, Set):
+        part_str = ", ".join([msg_to_simple_str(item) for item in list(msg)[:5]])
+        return f"Set<{part_str}...{len(msg)}>"
+    if isinstance(msg, Tuple):
+        part_str = ", ".join([msg_to_simple_str(item) for item in msg[:5]])
+        return f"Tuple<{part_str}...{len(msg)}>"
+    if isinstance(msg, Dict):
+        part_str = []
+        it = iter(msg.items())
+        try:
+            while len(part_str) < 5:
+                entry = next(it)
+                part_str.append(
+                    f"k={msg_to_simple_str(entry[0])}, v={msg_to_simple_str(entry[1])}"
+                )
+        except StopIteration:
+            pass
+        part_str = ", ".join(part_str)
+        return f"Dict<{part_str}...{len(msg)}>"
+    if isinstance(msg, (str, float, int, bool)):
+        return "{!s:.50}".format(msg)
+    return str(type(msg))
+
+
+def _argwrapper_unpickler(serialized_message):
+    return _ArgWrapper(deserialize(*serialized_message))
+
+
+@dataclass
+class _ArgWrapper:
+    message: Any = None
+
+    def __init__(self, message):
+        self.message = message
+
+    def __reduce__(self):
+        return _argwrapper_unpickler, (
+            serialize(self.message, context={"serializer": "ray"}),
+        )
+
+
+@lazy_import_on_load(ray)
+def _init_ray_serialization_deserialization():
+    _ray_serialize = ray.serialization.SerializationContext.serialize
+    _ray_deserialize_object = ray.serialization.SerializationContext._deserialize_object
+    serialized_bytes_counter = Metrics.counter(
+        "mars.channel_serialized_bytes",
+        "The bytes serialized by mars ray channel.",
+    )
+    deserialized_bytes_counter = Metrics.counter(
+        "mars.channel_deserialized_bytes",
+        "The bytes deserialized by mars ray channel.",
+    )
+    serialization_time_mills = Metrics.counter(
+        "mars.channel_serialization_time_mills",
+        "The time used by mars ray channel serialization.",
+    )
+    deserialization_time_mills = Metrics.counter(
+        "mars.channel_deserialization_time_mills",
+        "The time used by mars ray channel deserialization.",
+    )
+
+    def _serialize(self, value):
+        if type(value) is _ArgWrapper:  # pylint: disable=unidiomatic-typecheck
+            message = value.message
+            with Timer() as timer:
+                serialized_object = _ray_serialize(self, value)
+                bytes_length = serialized_object.total_bytes
+                serialized_bytes_counter.record(bytes_length)
+            serialization_time_mills.record(timer.duration * 1000)
+            if bytes_length > 1 * 1024 * 1024 * 1024:  # pragma: no cover
+                logger.warning(
+                    "Serialize large message (%s bytes > 1GB) through ray channel, message: %s.",
+                    bytes_length,
+                    msg_to_simple_str(message),
+                )
+            if timer.duration * 1000 > SERIALIZATION_TIMEOUT_MILLS:  # pragma: no cover
+                report_event(
+                    "WARNING",
+                    "SERIALIZATION_TIMEOUT",
+                    f"Serialization took {timer.duration} seconds for {bytes_length} sized message {msg_to_simple_str(message)}.",
+                )
+            try:
+                if message.profiling_context is not None:
+                    task_id = message.profiling_context.task_id
+                    ProfilingData[task_id, "serialization"].inc(
+                        "serialize", timer.duration
+                    )
+            except AttributeError:  # pragma: no cover
+                logger.info(
+                    "Profiling serialization got error, the send "
+                    "message %s may not be an instance of message",
+                    type(message),
+                )
+        else:
+            serialized_object = _ray_serialize(self, value)
+        return serialized_object
+
+    def _deserialize_object(self, data, metadata, object_ref):
+        start_time = time.time()
+        bytes_length = 0
+        if data:
+            bytes_length = len(data)
+            deserialized_bytes_counter.record(bytes_length)
+        value = _ray_deserialize_object(self, data, metadata, object_ref)
+        duration = time.time() - start_time
+        deserialization_time_mills.record(duration * 1000)
+        if duration * 1000 > DESERIALIZATION_TIMEOUT_MILLS:  # pragma: no cover
+            report_event(
+                "WARNING",
+                "DESERIALIZATION_TIMEOUT",
+                f"Deserialization took {duration} seconds for "
+                f"{bytes_length} sized msg {msg_to_simple_str(value)}",
+            )
+        if type(value) is _ArgWrapper:  # pylint: disable=unidiomatic-typecheck
+            message = value.message
+            try:
+                if message.profiling_context is not None:
+                    task_id = message.profiling_context.task_id
+                    ProfilingData[task_id, "serialization"].inc(
+                        "deserialize", time.time() - start_time
+                    )
+            except AttributeError:  # pragma: no cover
+                logger.info(
+                    "Profiling serialization got error, the recv "
+                    "message %s may not be an instance of message",
+                    type(message),
+                )
+        return value
+
+    ray.serialization.SerializationContext.serialize = _serialize
+    ray.serialization.SerializationContext._deserialize_object = _deserialize_object
 
 
 class RayChannelException(Exception):
@@ -50,7 +204,7 @@ class RayChannelBase(Channel, ABC):
     Channel for communications between ray processes.
     """
 
-    __slots__ = "_channel_index", "_channel_id", "_in_queue", "_closed"
+    __slots__ = "_channel_index", "_channel_id", "_closed"
 
     name = "ray"
     _channel_index_gen = itertools.count()
@@ -72,7 +226,6 @@ class RayChannelBase(Channel, ABC):
         self._channel_id = channel_id or ChannelID(
             local_address, _gen_client_id(), self._channel_index, dest_address
         )
-        self._in_queue = asyncio.Queue()
         self._closed = asyncio.Event()
 
     @property
@@ -99,7 +252,7 @@ class RayClientChannel(RayChannelBase):
     A channel from ray driver/actor to ray actor. Use ray call reply for client channel recv.
     """
 
-    __slots__ = ("_peer_actor",)
+    __slots__ = "_peer_actor", "_done", "_todo"
 
     def __init__(
         self,
@@ -111,35 +264,66 @@ class RayClientChannel(RayChannelBase):
         super().__init__(None, dest_address, channel_index, channel_id, compression)
         # ray actor should be created with the address as the name.
         self._peer_actor: "ray.actor.ActorHandle" = ray.get_actor(dest_address)
+        self._done = asyncio.Queue()
+        self._todo = set()
+
+    def _submit_task(self, message: Any, object_ref: "ray.ObjectRef"):
+        async def handle_task(message: Any, object_ref: "ray.ObjectRef"):
+            # use `%.500` to avoid print too long messages
+            with debug_async_timeout(
+                "ray_object_retrieval_timeout",
+                "Message that client sent to actor %s is %.500s and object_ref is %s",
+                self.dest_address,
+                message,
+                object_ref,
+            ):
+                try:
+                    result = await object_ref
+                except Exception as e:  # pragma: no cover
+                    # The error ClientObjectRef can't be formatted, so
+                    # we give it a string `ClientObjectRef` instead.
+                    try:
+                        object_ref_str = str(object_ref)
+                    except Exception:
+                        object_ref_str = "ClientObjectRef"
+                    logger.exception(
+                        "Get object %s from %s failed, got exception %s.",
+                        object_ref_str,
+                        self.dest_address,
+                        e,
+                    )
+                    raise
+            if isinstance(result, RayChannelException):
+                raise result.exc_value.with_traceback(result.exc_traceback)
+            return result.message
+
+        def _on_completion(future):
+            self._todo.remove(future)
+            self._done.put_nowait(future)
+
+        future = asyncio.ensure_future(handle_task(message, object_ref))
+        future.add_done_callback(_on_completion)
+        self._todo.add(future)
 
     @implements(Channel.send)
     async def send(self, message: Any):
         if self._closed.is_set():  # pragma: no cover
             raise ChannelClosed("Channel already closed, cannot send message")
-        # Put ray object ref to queue
-        await self._in_queue.put(
-            (
-                message,
-                self._peer_actor.__on_ray_recv__.remote(
-                    self.channel_id, serialize(message)
-                ),
-            )
+        # Put ray object ref to todo queue
+        task = self._peer_actor.__on_ray_recv__.remote(
+            self.channel_id, _ArgWrapper(message)
         )
+        self._submit_task(message, task)
+        await asyncio.sleep(0)
 
     @implements(Channel.recv)
     async def recv(self):
         if self._closed.is_set():  # pragma: no cover
             raise ChannelClosed("Channel already closed, cannot recv message")
         try:
-            # Wait on ray object ref
-            message, object_ref = await self._in_queue.get()
-            with debug_async_timeout(
-                "ray_object_retrieval_timeout", "Client sent message is %s", message
-            ):
-                result = await object_ref
-            if isinstance(result, RayChannelException):
-                raise result.exc_value.with_traceback(result.exc_traceback)
-            return deserialize(*result)
+            # Wait first done.
+            future = await self._done.get()
+            return future.result()
         except ray.exceptions.RayActorError:
             if not self._closed.is_set():
                 # raise a EOFError as the SocketChannel does
@@ -157,7 +341,7 @@ class RayServerChannel(RayChannelBase):
     message's reply.
     """
 
-    __slots__ = "_out_queue", "_msg_recv_counter", "_msg_sent_counter"
+    __slots__ = "_in_queue", "_out_queue", "_msg_recv_counter", "_msg_sent_counter"
 
     def __init__(
         self,
@@ -167,6 +351,7 @@ class RayServerChannel(RayChannelBase):
         compression=None,
     ):
         super().__init__(local_address, None, channel_index, channel_id, compression)
+        self._in_queue = asyncio.Queue()
         self._out_queue = asyncio.Queue()
         self._msg_recv_counter = 0
         self._msg_sent_counter = 0
@@ -178,7 +363,7 @@ class RayServerChannel(RayChannelBase):
         # Current process is ray actor, we use ray call reply to send message to ray driver/actor.
         # Not that we can only send once for every read message in channel, otherwise
         # it will be taken as other message's reply.
-        await self._out_queue.put(serialize(message))
+        await self._out_queue.put(message)
         self._msg_sent_counter += 1
         assert (
             self._msg_sent_counter <= self._msg_recv_counter
@@ -189,24 +374,24 @@ class RayServerChannel(RayChannelBase):
         if self._closed.is_set():  # pragma: no cover
             raise ChannelClosed("Channel already closed, cannot write message")
         try:
-            return deserialize(*(await self._in_queue.get()))
+            return await self._in_queue.get()
         except RuntimeError:  # pragma: no cover
             if not self._closed.is_set():
                 raise
 
-    async def __on_ray_recv__(self, message):
+    async def __on_ray_recv__(self, message_wrapper):
         """This method will be invoked when current process is a ray actor rather than a ray driver"""
         self._msg_recv_counter += 1
-        await self._in_queue.put(message)
-        # Avoid hang when channel is closed after `self._out_queue.get()` is awaited.
-        done, _ = await asyncio.wait(
-            [self._out_queue.get(), self._closed.wait()],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        await self._in_queue.put(message_wrapper.message)
+        result_message = await self._out_queue.get()
         if self._closed.is_set():  # pragma: no cover
             raise ChannelClosed("Channel already closed")
-        if done:
-            return await done.pop()
+        return _ArgWrapper(result_message)
+
+    @implements(Channel.close)
+    async def close(self):
+        await super().close()
+        self._out_queue.put_nowait(None)
 
 
 @register_server
@@ -319,7 +504,7 @@ class RayServer(Server):
     async def __on_ray_recv__(self, channel_id: ChannelID, message):
         if self.stopped:
             raise ServerClosed(
-                f"Remote server {self.address} closed, but got message {deserialize(*message)} "
+                f"Remote server {self.address} closed, but got message {message} "
                 f"from channel {channel_id}"
             )
         channel = self._channels.get(channel_id)

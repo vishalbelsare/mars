@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import typing
+from typing import AsyncGenerator
 
-import numpy as np
-
-from .._utils cimport to_str
+from .._utils cimport to_str, new_random_id
+from .core cimport ActorRef, LocalActorRef
 
 
 cpdef bytes new_actor_id():
-    return np.random.bytes(32)
+    return new_random_id(32)
 
 
 def create_actor_ref(*args, **kwargs):
@@ -31,10 +30,10 @@ def create_actor_ref(*args, **kwargs):
     -------
     ActorRef
     """
-    from .core import ActorRef
 
     cdef str address
     cdef object uid
+    cdef ActorRef existing_ref
 
     address = to_str(kwargs.pop('address', None))
     uid = kwargs.pop('uid', None)
@@ -47,11 +46,14 @@ def create_actor_ref(*args, **kwargs):
             raise ValueError('address has been specified')
         address = to_str(args[0])
         uid = args[1]
-    elif len(args) == 1 and isinstance(args[0], ActorRef):
-        uid = args[0].uid
-        address = to_str(address or args[0].address)
     elif len(args) == 1:
-        uid = args[0]
+        tp0 = type(args[0])
+        if tp0 is ActorRef or tp0 is LocalActorRef:
+            existing_ref = <ActorRef>(args[0])
+            uid = existing_ref.uid
+            address = to_str(address or existing_ref.address)
+        else:
+            uid = args[0]
 
     if uid is None:
         raise ValueError('Actor uid should be provided')
@@ -67,7 +69,7 @@ cdef bint is_async_generator(obj):
     if tp in _is_async_generator_typecache:
         return True
 
-    if isinstance(obj, typing.AsyncGenerator):
+    if isinstance(obj, AsyncGenerator):
         if len(_is_async_generator_typecache) < 100:
             _is_async_generator_typecache.add(tp)
         return True

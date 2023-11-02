@@ -15,6 +15,7 @@
 from collections import OrderedDict
 from functools import reduce
 
+import numpy as np
 import pandas as pd
 
 from ..core import FuseChunkData, FuseChunk, ENTITY_TYPE, OutputType
@@ -26,6 +27,7 @@ from ..core.operand import (
     FuseChunkMixin,
 )
 from ..tensor.core import TENSOR_TYPE
+from ..tensor.datasource import tensor as astensor
 from ..tensor.operands import TensorOperandMixin
 from ..utils import calc_nsplits
 from .core import (
@@ -130,6 +132,10 @@ class DataFrameOperandMixin(TileableOperandMixin):
         return self.new_seriess(
             inputs, shape=shape, dtype=dtype, index_value=index_value, name=name, **kw
         )[0]
+
+    def new_df_or_series(self, inputs, **kw):
+        setattr(self, "_output_types", [OutputType.df_or_series])
+        return self.new_tileables(inputs, **kw)[0]
 
     def new_indexes(
         self,
@@ -434,13 +440,27 @@ class DataFrameOperandMixin(TileableOperandMixin):
     def get_fuse_op_cls(self, _):
         return DataFrameFuseChunk
 
+    @staticmethod
+    def _process_input(x):
+        from .initializer import DataFrame, Series
+
+        if isinstance(x, (DATAFRAME_TYPE, SERIES_TYPE)) or pd.api.types.is_scalar(x):
+            return x
+        elif isinstance(x, pd.Series):
+            return Series(x)
+        elif isinstance(x, pd.DataFrame):
+            return DataFrame(x)
+        elif isinstance(x, (list, tuple, np.ndarray, TENSOR_TYPE)):
+            return astensor(x)
+        raise NotImplementedError
+
 
 DataFrameOperand = Operand
 
 
 class DataFrameShuffleProxy(ShuffleProxy, DataFrameOperandMixin):
     def __init__(self, sparse=None, output_types=None, **kwargs):
-        super().__init__(_sparse=sparse, _output_types=output_types, **kwargs)
+        super().__init__(sparse=sparse, _output_types=output_types, **kwargs)
 
     @classmethod
     def execute(cls, ctx, op):

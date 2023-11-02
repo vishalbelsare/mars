@@ -277,6 +277,7 @@ class TensorPSRSOperandMixin(TensorOperandMixin, PSRSOperandMixin):
                 order=op.order,
                 kind=kind,
                 reducer_index=(i,),
+                n_reducers=len(partition_chunks),
                 dtype=partition_chunk.dtype,
                 gpu=partition_chunk.op.gpu,
                 need_align=need_align,
@@ -375,6 +376,7 @@ class TensorPSRSOperandMixin(TensorOperandMixin, PSRSOperandMixin):
                 stage=OperandStage.reduce,
                 axis=op.axis,
                 reducer_index=(i,),
+                n_reducers=len(align_map_chunks),
                 dtype=align_map_chunk.dtype,
                 gpu=align_map_chunk.op.gpu,
             )
@@ -469,8 +471,8 @@ class PSRSSortRegularSample(TensorOperand, TensorOperandMixin):
             _return_indices=return_indices,
             _n_partition=n_partition,
             _axis_offset=axis_offset,
-            _dtype=dtype,
-            _gpu=gpu,
+            dtype=dtype,
+            gpu=gpu,
             **kw
         )
 
@@ -561,7 +563,7 @@ class PSRSConcatPivot(TensorOperand, TensorOperandMixin):
 
     def __init__(self, axis=None, order=None, kind=None, dtype=None, gpu=None, **kw):
         super().__init__(
-            _axis=axis, _order=order, _kind=kind, _dtype=dtype, _gpu=gpu, **kw
+            _axis=axis, _order=order, _kind=kind, dtype=dtype, gpu=gpu, **kw
         )
 
     @property

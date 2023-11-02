@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 
+from ... import oscar as mo
 from ...services import NodeRole
 from ...utils import get_next_port
 from .cmdline import OscarCommandRunner
 from .local import start_supervisor, stop_supervisor
 from .pool import create_supervisor_actor_pool
+
+
+logger = logging.getLogger(__name__)
 
 
 class SupervisorCommandRunner(OscarCommandRunner):
@@ -32,6 +37,9 @@ class SupervisorCommandRunner(OscarCommandRunner):
     def config_args(self, parser):
         super().config_args(parser)
         parser.add_argument("-w", "--web-port", help="web port of the service")
+        parser.add_argument(
+            "--n-process", help="number of supervisor processes", default="1"
+        )
 
     def parse_args(self, parser, argv, environ=None):
         args = super().parse_args(parser, argv, environ=environ)
@@ -44,6 +52,7 @@ class SupervisorCommandRunner(OscarCommandRunner):
 
         web_config = self.config.get("web", {})
         if args.web_port is not None:
+            web_config["host"] = args.endpoint.split(":", 1)[0]
             web_config["port"] = int(args.web_port)
         self.config["web"] = web_config
 
@@ -52,19 +61,34 @@ class SupervisorCommandRunner(OscarCommandRunner):
     async def create_actor_pool(self):
         return await create_supervisor_actor_pool(
             self.args.endpoint,
-            n_process=0,
+            n_process=int(self.args.n_process),
             ports=self.ports,
             modules=self.args.load_modules,
             logging_conf=self.logging_conf,
-            subprocess_start_method="forkserver" if os.name == "nt" else "spawn",
+            subprocess_start_method="forkserver" if os.name != "nt" else "spawn",
+            metrics=self.config.get("metrics", {}),
         )
 
     async def start_services(self):
-        return await start_supervisor(
+        start_web = await start_supervisor(
             self.pool.external_address,
             self.args.supervisors,
             self.args.load_modules,
             self.config,
+        )
+        if start_web:
+            from ...services.web.supervisor import WebActor
+
+            web_actor = await mo.actor_ref(
+                WebActor.default_uid(), address=self.pool.external_address
+            )
+            web_address = await web_actor.get_web_address()
+        else:  # pragma: no cover
+            web_address = "<web not started>"
+        logger.warning(
+            "Supervisor started at %s, web address: %s",
+            self.pool.external_address,
+            web_address,
         )
 
     async def stop_services(self):

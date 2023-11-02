@@ -14,18 +14,16 @@
 
 import os
 import platform
-import re
 import shutil
 import subprocess
 import sys
 import warnings
-from sysconfig import get_config_var
-
-from pkg_resources import parse_version
-from setuptools import setup, Extension, Command
+from sysconfig import get_config_vars
 
 import numpy as np
 from Cython.Build import cythonize
+from pkg_resources import parse_version
+from setuptools import Command, Extension, setup
 from setuptools.command.develop import develop
 from setuptools.command.install import install
 from setuptools.command.sdist import sdist
@@ -47,43 +45,21 @@ except ImportError:
 # MACOSX_DEPLOYMENT_TARGET before calling setup.py
 if sys.platform == "darwin":
     if "MACOSX_DEPLOYMENT_TARGET" not in os.environ:
+        current_system = platform.mac_ver()[0]
+        python_target = get_config_vars().get(
+            "MACOSX_DEPLOYMENT_TARGET", current_system
+        )
         target_macos_version = "10.9"
-        parsed_macos_version = parse_version(target_macos_version)
 
-        current_system = parse_version(platform.mac_ver()[0])
-        python_target = parse_version(get_config_var("MACOSX_DEPLOYMENT_TARGET"))
-        if python_target < parsed_macos_version <= current_system:
+        parsed_python_target = parse_version(python_target)
+        parsed_current_system = parse_version(current_system)
+        parsed_macos_version = parse_version(target_macos_version)
+        if parsed_python_target <= parsed_macos_version <= parsed_current_system:
             os.environ["MACOSX_DEPLOYMENT_TARGET"] = target_macos_version
 
 
 repo_root = os.path.dirname(os.path.abspath(__file__))
 
-
-def execfile(fname, globs, locs=None):
-    locs = locs or globs
-    exec(compile(open(fname).read(), fname, "exec"), globs, locs)
-
-
-version_file_path = os.path.join(repo_root, "mars", "_version.py")
-version_ns = {"__file__": version_file_path}
-execfile(version_file_path, version_ns)
-version = version_ns["__version__"]
-# check version vs tag
-if (
-    os.environ.get("GIT_TAG")
-    and re.search(r"v\d", os.environ["GIT_TAG"])
-    and os.environ["GIT_TAG"] != "v" + version
-):
-    raise ValueError(
-        "Tag %r does not match source version %r" % (os.environ["GIT_TAG"], version)
-    )
-
-
-if os.path.exists(os.path.join(repo_root, ".git")):
-    git_info = version_ns["get_git_info"]()
-    if git_info:
-        with open(os.path.join(repo_root, "mars", ".git-branch"), "w") as git_file:
-            git_file.write(" ".join(git_info))
 
 cythonize_kw = dict(language_level=sys.version_info[0])
 cy_extension_kw = dict()
@@ -95,11 +71,20 @@ if os.environ.get("CYTHON_TRACE"):
     cythonize_kw["compiler_directives"] = {"linetrace": True}
 
 if "MSC" in sys.version:
-    extra_compile_args = ["/Ot", "/I" + os.path.join(repo_root, "misc")]
+    extra_compile_args = ["/std:c11", "/Ot", "/I" + os.path.join(repo_root, "misc")]
     cy_extension_kw["extra_compile_args"] = extra_compile_args
 else:
     extra_compile_args = ["-O3"]
+    if sys.platform != "darwin":
+        # for macOS, we assume that C++ 11 is enabled by default
+        extra_compile_args.append("-std=c++0x")
     cy_extension_kw["extra_compile_args"] = extra_compile_args
+
+
+# The pyx with C sources.
+ext_include_source_map = {
+    "mars/_utils.pyx": [["mars/lib/mmh3_src"], ["mars/lib/mmh3_src/MurmurHash3.cpp"]],
+}
 
 
 def _discover_pyx():
@@ -109,12 +94,19 @@ def _discover_pyx():
             if not fn.endswith(".pyx"):
                 continue
             full_fn = os.path.relpath(os.path.join(root, fn), repo_root)
+            include_dirs, source = ext_include_source_map.get(
+                full_fn.replace(os.path.sep, "/"), [[], []]
+            )
             mod_name = full_fn.replace(".pyx", "").replace(os.path.sep, ".")
-            exts[mod_name] = Extension(mod_name, [full_fn], **cy_extension_kw)
+            exts[mod_name] = Extension(
+                mod_name,
+                [full_fn] + source,
+                include_dirs=[np.get_include()] + include_dirs,
+                **cy_extension_kw,
+            )
     return exts
 
 
-cy_extension_kw["include_dirs"] = [np.get_include()]
 extensions_dict = _discover_pyx()
 cy_extensions = list(extensions_dict.values())
 
@@ -201,14 +193,21 @@ CustomDevelop.register_pre_command("build_web")
 CustomSDist.register_pre_command("build_web")
 
 
+# Resolve path issue of versioneer
+sys.path.append(repo_root)
+versioneer = __import__("versioneer")
+
+
 setup_options = dict(
-    version=version,
+    version=versioneer.get_version(),
     ext_modules=extensions,
-    cmdclass={
-        "build_web": BuildWeb,
-        "install": CustomInstall,
-        "develop": CustomDevelop,
-        "sdist": CustomSDist,
-    },
+    cmdclass=versioneer.get_cmdclass(
+        {
+            "build_web": BuildWeb,
+            "install": CustomInstall,
+            "develop": CustomDevelop,
+            "sdist": CustomSDist,
+        }
+    ),
 )
 setup(**setup_options)

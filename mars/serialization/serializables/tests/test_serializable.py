@@ -22,6 +22,7 @@ import pandas as pd
 import pytest
 
 from ....core import EntityData
+from ....utils import no_default
 from ... import serialize, deserialize
 from .. import (
     Serializable,
@@ -68,19 +69,26 @@ my_namedtuple = namedtuple("my_namedtuple", "a, b")
 
 
 @pytest.fixture(autouse=True)
-def set_environ():
-    from .. import field
+def set_environ(request):
+    from .. import core, field
 
-    _notset = field._notset
+    exist_env = os.environ.get("CI", no_default)
+    env_to_set = getattr(request, "param", None) or "true"
+
     try:
-        os.environ["CI"] = "true"
+        os.environ["CI"] = env_to_set
+        core.SerializableSerializer.unregister(core.Serializable)
+        importlib.reload(core)
         importlib.reload(field)
-        field._notset = _notset
         yield
     finally:
-        os.environ.pop("CI", None)
+        if exist_env is no_default:
+            os.environ.pop("CI", None)
+        else:
+            os.environ["CI"] = exist_env
+        core.SerializableSerializer.unregister(core.Serializable)
+        importlib.reload(core)
         importlib.reload(field)
-        field._notset = _notset
 
 
 class MyHasKey(EntityData):
@@ -145,7 +153,8 @@ class MySerializable(Serializable):
     )
 
 
-def test_serializable():
+@pytest.mark.parametrize("set_environ", ["false", "true"], indirect=True)
+def test_serializable(set_environ):
     my_serializable = MySerializable(
         _id="1",
         _any_val="any_value",
@@ -192,7 +201,7 @@ def test_serializable():
 
 def _assert_serializable_eq(my_serializable, my_serializable2):
     for field_name, field in my_serializable._FIELDS.items():
-        if field.tag not in my_serializable._FIELD_VALUES:
+        if not hasattr(my_serializable, field.tag):
             continue
         expect_value = getattr(my_serializable, field_name)
         actual_value = getattr(my_serializable2, field_name)

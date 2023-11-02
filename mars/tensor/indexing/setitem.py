@@ -162,6 +162,7 @@ class TensorIndexSetValue(TensorMapReduceOperand, TensorOperandMixin):
             )
             reducer_op = TensorIndexSetValue(
                 stage=OperandStage.reduce,
+                n_reducers=len(inp.chunks),
                 dtype=input_chunk.dtype,
                 shuffle_axes=shuffle_axes,
                 chunk_offsets=chunk_offsets,
@@ -197,13 +198,17 @@ class TensorIndexSetValue(TensorMapReduceOperand, TensorOperandMixin):
 
         if is_value_tensor and value.ndim > 0:
             if has_unknown_shape(indexed, value):
-                yield indexed.chunks + [indexed]
+                exec_chunks = indexed.chunks + op.input.chunks
+                for c in indexed.chunks:
+                    exec_chunks.extend(c.inputs)
+                yield exec_chunks + [indexed]
 
-            value = yield from recursive_tile(
-                broadcast_to(value, indexed.shape).astype(op.input.dtype, copy=False)
-            )
             nsplits = indexed.nsplits
-            value = yield from recursive_tile(value.rechunk(nsplits))
+            value = yield from recursive_tile(
+                broadcast_to(value, indexed.shape)
+                .astype(op.input.dtype, copy=False)
+                .rechunk(nsplits)
+            )
 
         chunk_mapping = {c.op.input.index: c for c in indexed.chunks}
         out_chunks = []
@@ -318,7 +323,7 @@ class TensorIndexSetValue(TensorMapReduceOperand, TensorOperandMixin):
             for axis in range(input_data.ndim):
                 if axis in op.shuffle_axes:
                     indexes.append(next(index_iter) - op.chunk_offsets[axis])
-            input_data[indexes] = value
+            input_data[tuple(indexes)] = value
 
         ctx[op.outputs[0].key] = input_data
 

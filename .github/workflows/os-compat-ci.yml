@@ -1,6 +1,15 @@
 name: Mars CI for OS compatibility
 
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - '*'
+  pull_request:
+    types: ['opened', 'reopened', 'synchronize']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -9,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macOS-latest, windows-latest]
-        python-version: [3.7, 3.8]
+        python-version: [3.9]
 
     steps:
     - name: Check out code
@@ -37,7 +46,6 @@ jobs:
 
         source ./ci/rewrite-cov-config.sh
 
-        pip install git+https://github.com/mars-project/pytest-asyncio.git
         pip install numpy scipy cython oss2
         pip install -e ".[dev,extra]"
         pip install virtualenv flaky

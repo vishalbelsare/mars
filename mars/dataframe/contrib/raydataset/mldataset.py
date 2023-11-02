@@ -20,8 +20,8 @@ from typing import Dict, Iterable, List, Tuple
 from ....utils import lazy_import
 
 ray = lazy_import("ray")
-parallel_it = lazy_import("ray.util.iter")
-ml_dataset = lazy_import("ray.util.data")
+parallel_it = lazy_import("ray.util.iter", rename="parallel_it")
+ml_dataset = lazy_import("ray.util.data", rename="ml_dataset")
 
 
 class ChunkRefBatch:
@@ -83,27 +83,6 @@ def _rechunk_if_needed(df, num_shards: int = None):
         raise Exception(f"rechunk failed df.shape {df.shape}") from e
 
 
-if ray:
-
-    class _MLDataset(ml_dataset.MLDataset):
-        def __init__(self, mars_dataframe, actor_sets, name: str, parent_iterators):
-            super().__init__(actor_sets, name, parent_iterators, 0, False)
-            # Hold mars dataframe to avoid mars dataframe and ray object gc.
-            # TODO(mubai) Use a separate operator for rechunk and avoiding gc.
-            self._mars_dataframe = mars_dataframe
-
-        def __getstate__(self):
-            state = self.__dict__.copy()
-            state.pop("_mars_dataframe", None)
-            return state
-
-        # The default __setstate__ will update _MLDataset's __dict__;
-
-
-else:
-    _MLDataset = None
-
-
 def to_ray_mldataset(df, num_shards: int = None):
     """Create a MLDataset from Mars DataFrame
 
@@ -125,11 +104,14 @@ def to_ray_mldataset(df, num_shards: int = None):
     #       chunk1 for addr1,
     #       chunk2 & chunk3 for addr2,
     #       chunk4 for addr1
-    fetched_infos: Dict[str, List] = df.fetch_infos(fields=["band", "object_id"])
-    chunk_addr_refs: List[Tuple[Tuple, "ray.ObjectRef"]] = [
-        (band, object_id)
-        for band, object_id in zip(fetched_infos["band"], fetched_infos["object_id"])
-    ]
+    fetched_infos: Dict[str, List] = df.fetch_infos(fields=["bands", "object_refs"])
+    chunk_addr_refs: List[Tuple[Tuple, "ray.ObjectRef"]] = []
+    for bands, object_refs in zip(fetched_infos["bands"], fetched_infos["object_refs"]):
+        chunk_addr_ref = (
+            (bands[0], object_refs[0]) if bands else ("ray_dag_0", object_refs[0])
+        )
+        chunk_addr_refs.append(chunk_addr_ref)
+
     group_to_obj_refs: Dict[str, List[ray.ObjectRef]] = _group_chunk_refs(
         chunk_addr_refs, num_shards
     )
@@ -140,4 +122,16 @@ def to_ray_mldataset(df, num_shards: int = None):
     worker_cls = ray.remote(num_cpus=0)(parallel_it.ParallelIteratorWorker)
     actors = [worker_cls.remote(g, False) for g in record_batches]
     it = parallel_it.from_actors(actors, "from_mars")
-    return _MLDataset(df, it.actor_sets, it.name, it.parent_iterators)
+    dataset = ml_dataset.from_parallel_iter(it, need_convert=False, batch_size=0)
+    # Hold mars dataframe to avoid mars dataframe and ray object gc.
+    dataset.dataframe = df
+
+    def __getstate__():
+        state = dataset.__dict__.copy()
+        state.pop("dataframe", None)
+        return state
+
+    if not hasattr(dataset, "__getstate__"):
+        # `dataframe` is not serializable by ray.
+        dataset.__getstate__ = __getstate__
+    return dataset

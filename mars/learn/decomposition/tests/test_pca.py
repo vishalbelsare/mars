@@ -235,12 +235,12 @@ def test_singular_values(setup):
     X_pca = pca.transform(X)
     X_rpca = rpca.transform(X)
     assert_array_almost_equal(
-        mt.sum(pca.singular_values_ ** 2.0).to_numpy(),
+        mt.sum(pca.singular_values_**2.0).to_numpy(),
         (mt.linalg.norm(X_pca, "fro") ** 2.0).to_numpy(),
         12,
     )
     assert_array_almost_equal(
-        mt.sum(rpca.singular_values_ ** 2.0).to_numpy(),
+        mt.sum(rpca.singular_values_**2.0).to_numpy(),
         (mt.linalg.norm(X_rpca, "fro") ** 2.0).to_numpy(),
         0,
     )
@@ -248,12 +248,12 @@ def test_singular_values(setup):
     # Compare to the 2-norms of the score vectors
     assert_array_almost_equal(
         pca.singular_values_.fetch(),
-        mt.sqrt(mt.sum(X_pca ** 2.0, axis=0)).to_numpy(),
+        mt.sqrt(mt.sum(X_pca**2.0, axis=0)).to_numpy(),
         12,
     )
     assert_array_almost_equal(
         rpca.singular_values_.fetch(),
-        mt.sqrt(mt.sum(X_rpca ** 2.0, axis=0)).to_numpy(),
+        mt.sqrt(mt.sum(X_rpca**2.0, axis=0)).to_numpy(),
         2,
     )
 
@@ -268,7 +268,7 @@ def test_singular_values(setup):
     rpca = PCA(n_components=3, svd_solver="randomized", random_state=rng)
     X_pca = pca.fit_transform(X)
 
-    X_pca /= mt.sqrt(mt.sum(X_pca ** 2.0, axis=0))
+    X_pca /= mt.sqrt(mt.sum(X_pca**2.0, axis=0))
     X_pca[:, 0] *= 3.142
     X_pca[:, 1] *= 2.718
 
@@ -289,7 +289,7 @@ def test_pca_check_projection(setup):
 
     for solver in solver_list:
         Yt = PCA(n_components=2, svd_solver=solver).fit(X).transform(Xt)
-        Yt /= mt.sqrt((Yt ** 2).sum())
+        Yt /= mt.sqrt((Yt**2).sum())
 
         assert_almost_equal(mt.abs(Yt[0][0]).to_numpy(), 1.0, 1)
 
@@ -329,7 +329,6 @@ def test_pca_validation(setup):
         # We conduct the same test on X.T so that it is invariant to axis.
         for data in [X, X.T]:
             for n_components in [-1, 3]:
-
                 if solver == "auto":
                     solver_reported = "full"
                 else:
@@ -379,7 +378,7 @@ def test_randomized_pca_check_projection(setup):
         .fit(X)
         .transform(Xt)
     )
-    Yt /= np.sqrt((Yt ** 2).sum())
+    Yt /= np.sqrt((Yt**2).sum())
 
     assert_almost_equal(mt.abs(Yt[0][0]).to_numpy(), 1.0, 1)
 
@@ -435,7 +434,7 @@ def test_n_components_mle(setup):
             n_components_dict[solver] = pca.n_components_
         else:  # arpack/randomized solver
             error_message = (
-                "n_components='mle' cannot be a string with " f"svd_solver='{solver}'"
+                f"n_components='mle' cannot be a string with svd_solver='{solver}'"
             )
             assert_raise_message(ValueError, error_message, pca.fit, X)
     assert n_components_dict["auto"] == n_components_dict["full"]
@@ -525,7 +524,7 @@ def test_pca_score(setup):
         pca = PCA(n_components=2, svd_solver=solver)
         pca.fit(X)
         ll1 = pca.score(X)
-        h = -0.5 * mt.log(2 * mt.pi * mt.exp(1) * 0.1 ** 2) * p
+        h = -0.5 * mt.log(2 * mt.pi * mt.exp(1) * 0.1**2) * p
         np.testing.assert_almost_equal((ll1 / h).to_numpy(), 1, 0)
 
 

@@ -35,13 +35,11 @@ try:
     import fastparquet
 except ImportError:
     fastparquet = None
-try:
-    import vineyard
-except ImportError:
-    vineyard = None
 
 from .... import dataframe as md
+from ....tests.core import flaky
 from ... import DataFrame
+from ...utils import patch_sa_engine_execute
 
 
 def test_to_csv_execution(setup):
@@ -133,6 +131,7 @@ def test_to_sql():
         index=index,
     )
 
+    patch_sa_engine_execute()
     with tempfile.TemporaryDirectory() as d:
         table_name1 = "test_table"
         table_name2 = "test_table2"
@@ -165,6 +164,7 @@ def test_to_sql():
 
 
 @pytest.mark.skipif(pa is None, reason="pyarrow not installed")
+@flaky(max_runs=3)
 def test_to_parquet_arrow_execution(setup):
     raw = pd.DataFrame(
         {
@@ -237,7 +237,7 @@ def test_vineyard_execution(setup):
         "check_index_value": False,
     }
 
-    with vineyard.deploy.local.start_vineyardd() as (_, vineyard_socket):
+    with vineyard.deploy.local.start_vineyardd() as (_, vineyard_socket, _):
         raw = pd.DataFrame({"a": np.arange(0, 55), "b": np.arange(55, 110)})
         a = md.DataFrame(raw, chunk_size=15)
         a.execute()  # n.b.: pre-execute

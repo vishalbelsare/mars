@@ -30,8 +30,8 @@ from .base import StorageBackend, StorageLevel, ObjectInfo, register_storage_bac
 from .core import BufferWrappedFileObject, StorageFileObject
 from .errors import DataNotExist
 
-plasma = lazy_import("pyarrow.plasma", globals=globals(), rename="plasma")
-if sys.platform.startswith("win"):
+plasma = lazy_import("pyarrow.plasma", rename="plasma")
+if sys.platform.startswith("win") or pa.__version__ >= "12.0.0":
     plasma = None
 
 PAGE_SIZE = 64 * 1024
@@ -221,7 +221,7 @@ class PlasmaStorage(StorageBackend):
     @implements(StorageBackend.get)
     async def get(self, object_id, **kwargs) -> object:
         if kwargs:  # pragma: no cover
-            raise NotImplementedError('Got unsupported args: {",".join(kwargs)}')
+            raise NotImplementedError(f'Got unsupported args: {",".join(kwargs)}')
 
         if not self._client.contains(object_id):  # pragma: no cover
             raise DataNotExist(f"Data {object_id} not exists")

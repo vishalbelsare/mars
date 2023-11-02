@@ -34,7 +34,6 @@ class SparseNDArray:
     __array_priority__ = 21
 
     def __new__(cls, *args, **kwargs):
-
         shape = kwargs.get("shape", None)
         if shape is not None and len(shape) == 1:
             from .vector import SparseVector
@@ -46,9 +45,13 @@ class SparseNDArray:
             return object.__new__(SparseMatrix)
 
         else:
-            from .coo import COONDArray
-
-            return object.__new__(COONDArray)
+            if cls is not SparseNDArray:
+                return object.__new__(cls)
+            else:
+                raise ValueError(
+                    f"The construct params of {cls.__name__} are invalid: "
+                    f"args={args}, kwargs={kwargs}"
+                )
 
     @property
     def raw(self):
@@ -228,6 +231,12 @@ class SparseArray(SparseNDArray):
             return lambda: SparseNDArray(self.spmatrix.get(), shape=self.shape)
 
         return super().__getattribute__(attr)
+
+    def __getstate__(self):
+        return self.spmatrix
+
+    def __setstate__(self, state):
+        self.spmatrix = state
 
     def astype(self, dtype, **_):
         dtype = np.dtype(dtype)
@@ -490,7 +499,14 @@ class SparseArray(SparseNDArray):
         except TypeError:
             return NotImplemented
         if get_array_module(naked_other).isscalar(naked_other):
-            x = self.spmatrix.power(naked_other)
+            try:
+                x = self.spmatrix.power(naked_other)
+            except ValueError as e:  # pragma: no cover
+                # https://github.com/mars-project/mars/issues/3268
+                # https://github.com/scipy/scipy/issues/8678
+                assert "WRITEBACKIFCOPY" in e.args[0]
+                self.spmatrix = self.spmatrix.copy()
+                x = self.spmatrix.power(naked_other)
         else:
             if issparse(naked_other):
                 naked_other = other.toarray()
@@ -721,7 +737,21 @@ class SparseArray(SparseNDArray):
     poch = partialmethod(_scipy_binary, "poch")
 
     erf = partialmethod(_scipy_unary, "erf")
+    erfc = partialmethod(_scipy_unary, "erfc")
+    erfcx = partialmethod(_scipy_unary, "erfcx")
+    erfi = partialmethod(_scipy_unary, "erfi")
+    erfinv = partialmethod(_scipy_unary, "erfinv")
+    erfcinv = partialmethod(_scipy_unary, "erfcinv")
+    wofz = partialmethod(_scipy_unary, "wofz")
+    dawsn = partialmethod(_scipy_unary, "dawsn")
     entr = partialmethod(_scipy_unary, "entr")
+
+    ellipk = partialmethod(_scipy_unary, "ellipk")
+    ellipkm1 = partialmethod(_scipy_unary, "ellipkm1")
+    ellipkinc = partialmethod(_scipy_binary, "ellipkinc")
+    ellipe = partialmethod(_scipy_unary, "ellipe")
+    ellipeinc = partialmethod(_scipy_binary, "ellipeinc")
+    elliprc = partialmethod(_scipy_binary, "elliprc")
 
     rel_entr = partialmethod(_scipy_binary, "rel_entr")
     kl_div = partialmethod(_scipy_binary, "kl_div")
@@ -743,6 +773,10 @@ class SparseArray(SparseNDArray):
     hankel2e = partialmethod(_scipy_binary, "hankel2e")
 
     hyp0f1 = partialmethod(_scipy_binary, "hyp0f1")
+
+    airy = partialmethod(_scipy_unary, "airy")
+    airye = partialmethod(_scipy_unary, "airye")
+    itairy = partialmethod(_scipy_unary, "itairy")
 
     def __eq__(self, other):
         try:
@@ -1463,7 +1497,7 @@ class SparseArray(SparseNDArray):
         if issparse(naked_other):
             naked_other = other.toarray()
 
-        return SparseNDArray(self.spmatrix.multiply(2 ** naked_other))
+        return SparseNDArray(self.spmatrix.multiply(2**naked_other))
 
     def frexp(self, **kw):
         xp = get_array_module(self.spmatrix)
